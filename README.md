@@ -2,9 +2,9 @@
 
 # ⚡ OrgAI Gateway
 
-**一套组织内共享的 AI 账号池网关 — 把团队捐出的 Codex / Claude / Cursor 订阅，安全、智能地分发给每个人。**
+**一套组织内共享的 AI 账号池网关 — 把成员自愿捐出的 Codex / Claude / Cursor 账号汇成共享池，安全、智能地分发给团队每个人。**
 
-*A self-hosted gateway that pools your team's Codex / Claude / Cursor subscriptions and routes everyone's traffic across them — safely and intelligently.*
+*A self-hosted gateway that pools the Codex / Claude / Cursor accounts your members choose to donate, and routes everyone's traffic across them — safely and intelligently.*
 
 [![Rust](https://img.shields.io/badge/built%20with-Rust-000?logo=rust)](https://www.rust-lang.org/)
 [![Axum](https://img.shields.io/badge/axum-0.7-blue)](https://github.com/tokio-rs/axum)
