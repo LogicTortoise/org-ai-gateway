@@ -1,0 +1,2111 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OrgMesh - AI 网关</title>
+    <!-- NB: Tailwind comes from a CDN — on an offline/intranet deploy the page
+         degrades to unstyled HTML but stays functional. Vendor it if needed. -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { font-family: 'Inter', -apple-system, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif; }
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+
+        .nav-item {
+            transition: all 0.2s ease;
+        }
+        .nav-item.active {
+            background-color: #f3f4f6; /* gray-100 */
+            color: #111827; /* gray-900 */
+            font-weight: 600;
+        }
+        .nav-item.active svg {
+            color: #4f46e5; /* indigo-600 */
+        }
+        .nav-item:not(.active):hover {
+            background-color: #f9fafb; /* gray-50 */
+            color: #374151; /* gray-700 */
+        }
+        .tab-content {
+            animation: fadeIn 0.3s ease;
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(5px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .sidebar-collapsed {
+            width: 0 !important;
+            border-right-width: 0 !important;
+        }
+    </style>
+</head>
+<body class="bg-gray-50 text-gray-900 h-screen flex overflow-hidden">
+
+    <!-- Sidebar -->
+    <aside id="sidebar" class="w-64 bg-white border-r border-gray-200 flex flex-col flex-shrink-0 z-20 transition-all duration-300 overflow-hidden">
+        <div class="h-16 flex items-center px-4 border-b border-gray-200">
+            <svg class="w-5 h-5 text-indigo-600 mr-2 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
+            <span class="text-base font-bold text-gray-900 tracking-tight truncate">OrgAI Gateway</span>
+            <span class="ml-auto text-[10px] font-medium bg-indigo-50 text-indigo-600 px-1.5 py-0.5 rounded-full flex-shrink-0">v0.1.0</span>
+        </div>
+
+        <nav class="flex-1 overflow-y-auto py-6 px-4 space-y-8">
+            <div>
+                <div class="px-2 mb-3 text-xs font-semibold text-gray-400 uppercase tracking-wider" data-i18n="navSharer">分享者</div>
+                <div class="space-y-1">
+                    <a href="#" onclick="switchTab('upstreams')" id="nav-upstreams" class="nav-item active flex items-center px-3 py-2 text-sm font-medium text-gray-600 rounded-md">
+                        <svg class="w-5 h-5 mr-3 text-gray-400 transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 002-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>
+                        <span data-i18n="navAccounts">账号池管理</span>
+                    </a>
+                    <a href="#" onclick="switchTab('stats')" id="nav-stats" class="nav-item flex items-center px-3 py-2 text-sm font-medium text-gray-600 rounded-md">
+                        <svg class="w-5 h-5 mr-3 text-gray-400 transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"></path></svg>
+                        <span data-i18n="navStats">使用量统计</span>
+                    </a>
+                    <a href="#" onclick="switchTab('capacity')" id="nav-capacity" class="nav-item flex items-center px-3 py-2 text-sm font-medium text-gray-600 rounded-md">
+                        <svg class="w-5 h-5 mr-3 text-gray-400 transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6"></path></svg>
+                        <span data-i18n="navCapacity">容量预测</span>
+                    </a>
+                </div>
+            </div>
+
+            <div>
+                <div class="px-2 mb-3 text-xs font-semibold text-gray-400 uppercase tracking-wider" data-i18n="navUser">使用者</div>
+                <div class="space-y-1">
+                    <a href="#" onclick="switchTab('playground')" id="nav-playground" class="nav-item flex items-center px-3 py-2 text-sm font-medium text-gray-600 rounded-md">
+                        <svg class="w-5 h-5 mr-3 text-gray-400 transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                        <span data-i18n="navPlayground">请求测试</span>
+                    </a>
+                    <a href="#" onclick="switchTab('setup')" id="nav-setup" class="nav-item flex items-center px-3 py-2 text-sm font-medium text-gray-600 rounded-md">
+                        <svg class="w-5 h-5 mr-3 text-gray-400 transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4"></path></svg>
+                        <span data-i18n="navSetup">本地配置</span>
+                    </a>
+                    <a href="#" onclick="switchTab('apikeys')" id="nav-apikeys" class="nav-item flex items-center px-3 py-2 text-sm font-medium text-gray-600 rounded-md">
+                        <svg class="w-5 h-5 mr-3 text-gray-400 transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z"></path></svg>
+                        <span data-i18n="navApiKeys">API 密钥</span>
+                    </a>
+                </div>
+            </div>
+
+            <div>
+                <div class="px-2 mb-3 text-xs font-semibold text-gray-400 uppercase tracking-wider" data-i18n="navDeploy">部署</div>
+                <div class="space-y-1">
+                    <a href="#" onclick="switchTab('onboarding')" id="nav-onboarding" class="nav-item flex items-center px-3 py-2 text-sm font-medium text-gray-600 rounded-md">
+                        <svg class="w-5 h-5 mr-3 text-gray-400 transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253"></path></svg>
+                        <span data-i18n="navOnboarding">接入说明</span>
+                    </a>
+                </div>
+            </div>
+        </nav>
+
+        <div class="p-4 border-t border-gray-200">
+            <button id="checkHealth" class="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-gray-50 hover:bg-gray-100 text-gray-700 text-sm font-medium rounded-md border border-gray-200 transition">
+                <span class="w-2 h-2 rounded-full bg-green-500"></span> <span data-i18n="sysStatus">系统状态</span>
+            </button>
+        </div>
+    </aside>
+
+    <!-- Main Content -->
+    <main class="flex-1 flex flex-col overflow-hidden relative bg-gray-50">
+
+        <!-- Global Header -->
+        <header class="h-16 bg-white border-b border-gray-200 flex items-center justify-between px-8 flex-shrink-0 z-10">
+            <div class="flex items-center gap-4">
+                <button onclick="toggleSidebar()" class="text-gray-400 hover:text-gray-600 focus:outline-none transition p-1 -ml-2 rounded-md hover:bg-gray-100">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"></path></svg>
+                </button>
+                <h2 id="pageTitle" class="text-xl font-semibold text-gray-800" data-i18n="navAccounts">账号池管理</h2>
+            </div>
+            <div class="flex items-center gap-4">
+                <button id="langToggle" onclick="toggleLang()" class="text-sm font-medium text-gray-500 hover:text-indigo-600 border border-gray-300 rounded-md px-2.5 py-1.5 transition shadow-sm" title="Language / 语言">EN</button>
+                <div class="flex items-center gap-3">
+                    <label class="text-sm font-medium text-gray-500" data-i18n="currentUser">当前用户</label>
+                    <div class="relative">
+                        <div class="absolute inset-y-0 left-0 pl-2.5 flex items-center pointer-events-none">
+                            <svg class="h-4 w-4 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"></path></svg>
+                        </div>
+                        <input type="text" id="globalUserId" value="koltyu" class="w-36 pl-8 pr-3 py-1.5 bg-white border border-gray-300 rounded-md text-sm font-medium text-gray-700 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition shadow-sm">
+                    </div>
+                </div>
+            </div>
+        </header>
+
+        <!-- Tab: Upstreams -->
+        <div id="tab-upstreams" class="tab-content flex-1 overflow-y-auto p-8">
+            <div class="flex justify-between items-end mb-6">
+                <div>
+                    <p class="text-sm text-gray-500" data-i18n="descUpstreams">导入本机 Codex / Claude / Cursor 登录态，检查账号就绪状态，并保持账号访问有效。</p>
+                </div>
+                <div class="flex items-center gap-3">
+                    <button id="connectLocalBtn" class="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-md shadow-sm text-sm font-medium flex items-center gap-2 transition">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"></path></svg>
+                        <span data-i18n="importCodex">导入 Codex</span>
+                    </button>
+                    <button id="connectClaudeLocalBtn" class="bg-purple-600 hover:bg-purple-700 text-white px-4 py-2 rounded-md shadow-sm text-sm font-medium flex items-center gap-2 transition">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"></path></svg>
+                        <span data-i18n="importClaude">导入 Claude</span>
+                    </button>
+                    <button id="connectCursorBtn" class="bg-teal-600 hover:bg-teal-700 text-white px-4 py-2 rounded-md shadow-sm text-sm font-medium flex items-center gap-2 transition">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"></path></svg>
+                        <span data-i18n="importCursor">导入 Cursor</span>
+                    </button>
+                </div>
+            </div>
+
+            <!-- Filters -->
+            <div class="flex gap-4 mb-6 bg-white p-4 rounded-xl border border-gray-200 shadow-sm">
+                <div class="flex-1 relative">
+                    <div class="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
+                        <svg class="h-4 w-4 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
+                    </div>
+                    <input id="searchInput" oninput="applyAccountFilters()" type="text" data-i18n-ph="searchPlaceholder" placeholder="搜索账号 / 所有者..." class="w-full pl-10 bg-gray-50 border border-gray-200 rounded-md px-4 py-2 text-sm focus:outline-none focus:bg-white focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition">
+                </div>
+                <select id="groupFilter" onchange="applyAccountFilters()" class="bg-gray-50 border border-gray-200 rounded-md px-4 py-2 text-sm focus:outline-none focus:bg-white focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition min-w-[160px]">
+                    <option value="" data-i18n="allPlatforms">所有平台</option>
+                    <option value="codex">Codex</option>
+                    <option value="claude">Claude</option>
+                    <option value="cursor">Cursor</option>
+                </select>
+                <select id="statusFilter" onchange="applyAccountFilters()" class="bg-gray-50 border border-gray-200 rounded-md px-4 py-2 text-sm focus:outline-none focus:bg-white focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition min-w-[160px]">
+                    <option value="" data-i18n="allStatuses">所有状态</option>
+                    <option value="active" data-i18n="statusActive">活跃 (有请求)</option>
+                    <option value="shared" data-i18n="statusShared">已共享</option>
+                    <option value="private" data-i18n="statusPrivate">私有</option>
+                </select>
+            </div>
+
+            <!-- Accounts Grid -->
+            <div id="accountsGrid" class="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-6">
+                <!-- Cards injected via JS -->
+            </div>
+        </div>
+
+        <!-- Tab: Stats -->
+        <div id="tab-stats" class="tab-content hidden flex-1 overflow-y-auto p-8">
+            <div class="mb-6">
+                <p class="text-sm text-gray-500" data-i18n="descStats">所有账号池的全局使用量和 Token 消耗指标。</p>
+            </div>
+            <div id="statsContent"></div>
+        </div>
+
+        <!-- Tab: Capacity -->
+        <div id="tab-capacity" class="tab-content hidden flex-1 overflow-y-auto p-8">
+            <div class="mb-6">
+                <p class="text-sm text-gray-500" data-i18n="descCapacity">账号池余量燃尽图与撞墙预测：按当前燃烧率，每个账号 / 整个池还能撑多久。</p>
+            </div>
+            <div id="capacityContent"></div>
+        </div>
+
+        <!-- Tab: Playground -->
+        <div id="tab-playground" class="tab-content hidden flex-1 overflow-y-auto p-8">
+            <div class="mb-8">
+                <p class="text-sm text-gray-500" data-i18n="descPlayground">直接通过网关测试请求路由和模型响应。</p>
+            </div>
+
+            <div class="max-w-7xl grid grid-cols-2 gap-24">
+                <!-- Left: Form -->
+                <div class="bg-white border border-gray-200 rounded-xl p-8 shadow-sm">
+                    <form id="gatewayForm" class="space-y-6">
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-2" data-i18n="preferredProvider">首选提供商</label>
+                            <select id="provider" onchange="onProviderChange()" class="w-full border border-gray-300 rounded-md px-3 py-2.5 text-sm focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 bg-white shadow-sm transition">
+                                <option value="codex">Codex</option>
+                                <option value="claude">Claude</option>
+                                <option value="cursor">Cursor</option>
+                            </select>
+                        </div>
+
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-2 flex justify-between items-center">
+                                <span data-i18n="model">模型</span>
+                                <a href="#" id="refreshModels" class="text-indigo-600 hover:text-indigo-700 text-xs flex items-center gap-1">
+                                    <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+                                    <span data-i18n="refresh">刷新</span>
+                                </a>
+                            </label>
+                            <select id="model" class="w-full border border-gray-300 rounded-md px-3 py-2.5 text-sm focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 bg-white shadow-sm transition">
+                                <option value="gpt-5.5">gpt-5.5</option>
+                            </select>
+                        </div>
+
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-2" data-i18n="promptLabel">提示词 (Prompt)</label>
+                            <textarea id="prompt" rows="8" class="w-full border border-gray-300 rounded-md px-4 py-3 text-sm focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 font-mono shadow-sm transition resize-none" required>写一个计算斐波那契数列的 Python 脚本。</textarea>
+                        </div>
+
+                        <button type="submit" class="w-full bg-indigo-600 text-white font-medium py-3 rounded-md hover:bg-indigo-700 transition shadow-sm flex justify-center items-center gap-2">
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"></path></svg>
+                            <span data-i18n="sendRequest">发送请求</span>
+                        </button>
+                    </form>
+                </div>
+
+                <!-- Right: Terminal. self-start + sticky keep it from stretching
+                     the grid row when the reply is long — the output pane
+                     scrolls inside its own max-height instead. -->
+                <div class="self-start sticky top-0">
+                    <div class="bg-gray-900 rounded-xl overflow-hidden shadow-sm flex flex-col min-h-[400px] max-h-[calc(100vh-10rem)]">
+                        <div class="h-12 bg-gray-800 border-b border-gray-700 flex items-center px-4 gap-2 flex-shrink-0">
+                            <div class="flex gap-1.5">
+                                <span class="w-3 h-3 rounded-full bg-red-500"></span>
+                                <span class="w-3 h-3 rounded-full bg-yellow-500"></span>
+                                <span class="w-3 h-3 rounded-full bg-green-500"></span>
+                            </div>
+                        </div>
+                        <div id="responseOutput" class="flex-1 p-6 text-green-400 font-mono text-sm overflow-auto whitespace-pre-wrap leading-relaxed"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Tab: Local Setup -->
+        <div id="tab-setup" class="tab-content hidden flex-1 overflow-y-auto p-8">
+            <div class="mb-8">
+                <p class="text-sm text-gray-500" data-i18n="descSetup">配置你的本地 Codex CLI 或 Claude，使其通过共享账号池路由请求。</p>
+            </div>
+
+            <div class="max-w-7xl grid grid-cols-2 gap-24">
+                <div class="space-y-6">
+                    <div class="bg-white border border-gray-200 rounded-xl p-6 shadow-sm">
+                        <div class="flex items-center gap-3 mb-2">
+                            <div class="p-2 bg-blue-50 text-blue-600 rounded-lg">
+                                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4"></path></svg>
+                            </div>
+                            <h3 class="text-lg font-semibold text-gray-900" data-i18n="codexConfig">Codex 配置</h3>
+                        </div>
+
+                        <div class="flex gap-3 ml-12">
+                            <button id="applyCodex" class="bg-blue-600 hover:bg-blue-700 text-white font-medium py-2 px-4 rounded-md shadow-sm transition text-sm" data-i18n="useSharedPool">
+                                使用共享池
+                            </button>
+                            <button id="restoreCodex" class="bg-white border border-gray-300 text-gray-700 hover:bg-gray-50 font-medium py-2 px-4 rounded-md shadow-sm transition text-sm" data-i18n="usePersonal">
+                                使用个人账号
+                            </button>
+                        </div>
+                    </div>
+
+                    <div class="bg-white border border-gray-200 rounded-xl p-6 shadow-sm">
+                        <div class="flex items-center gap-3 mb-2">
+                            <div class="p-2 bg-purple-50 text-purple-600 rounded-lg">
+                                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
+                            </div>
+                            <h3 class="text-lg font-semibold text-gray-900" data-i18n="claudeConfig">Claude 配置</h3>
+                        </div>
+                        <div class="flex gap-3 ml-12">
+                            <button id="applyClaude" class="bg-purple-600 hover:bg-purple-700 text-white font-medium py-2 px-4 rounded-md shadow-sm transition text-sm" data-i18n="useSharedPool">
+                                使用共享池
+                            </button>
+                            <button id="restoreClaude" class="bg-white border border-gray-300 text-gray-700 hover:bg-gray-50 font-medium py-2 px-4 rounded-md shadow-sm transition text-sm" data-i18n="usePersonal">
+                                使用个人账号
+                            </button>
+                        </div>
+                    </div>
+
+                    <div class="bg-white border border-gray-200 rounded-xl p-6 shadow-sm">
+                        <div class="flex items-center gap-3 mb-2">
+                            <div class="p-2 bg-teal-50 text-teal-600 rounded-lg">
+                                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 15l-2 5L9 9l11 4-5 2zm0 0l5 5M7.188 2.239l.777 2.897M5.136 7.965l-2.898-.777M13.95 4.05l-2.122 2.122m-5.657 5.656l-2.12 2.122"></path></svg>
+                            </div>
+                            <h3 class="text-lg font-semibold text-gray-900" data-i18n="cursorConfig">Cursor 配置</h3>
+                        </div>
+                        <p class="text-sm text-gray-500 mb-6 ml-12" data-i18n-html="cursorNote">应用后需<strong>完全退出并重新打开 Cursor</strong>。</p>
+
+                        <div class="flex gap-3 ml-12">
+                            <button id="applyCursor" class="bg-teal-600 hover:bg-teal-700 text-white font-medium py-2 px-4 rounded-md shadow-sm transition text-sm" data-i18n="useSharedPool">
+                                使用共享池
+                            </button>
+                            <button id="restoreCursor" class="bg-white border border-gray-300 text-gray-700 hover:bg-gray-50 font-medium py-2 px-4 rounded-md shadow-sm transition text-sm" data-i18n="usePersonal">
+                                使用个人账号
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                <div>
+                    <div class="bg-gray-900 rounded-xl overflow-hidden shadow-sm h-full flex flex-col min-h-[400px]">
+                        <div class="h-12 bg-gray-800 border-b border-gray-700 flex items-center px-4 gap-2 flex-shrink-0">
+                            <div class="flex gap-1.5">
+                                <span class="w-3 h-3 rounded-full bg-red-500"></span>
+                                <span class="w-3 h-3 rounded-full bg-yellow-500"></span>
+                                <span class="w-3 h-3 rounded-full bg-green-500"></span>
+                            </div>
+                        </div>
+                        <pre id="setupOutput" class="flex-1 p-6 text-gray-300 font-mono text-sm overflow-auto whitespace-pre-wrap leading-relaxed"></pre>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Tab: API Keys (open-API credentials; rendered by loadApiKeys) -->
+        <div id="tab-apikeys" class="tab-content hidden flex-1 overflow-y-auto p-8">
+            <div class="max-w-5xl mx-auto">
+                <div class="flex justify-between items-end mb-6">
+                    <p class="text-sm text-gray-500" data-i18n="descApiKeys">签发网关 API 密钥，让外部程序/脚本用 <code>Authorization: Bearer oag_...</code> 直接调用共享池，无需走团队登录。</p>
+                    <div class="flex items-center gap-2 flex-shrink-0">
+                        <input id="apiKeyLabel" type="text" data-i18n-ph="apiKeyLabelPh" placeholder="用途备注（如 ci-bot）" class="bg-gray-50 border border-gray-200 rounded-md px-3 py-2 text-sm focus:outline-none focus:bg-white focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition w-48">
+                        <button id="createApiKeyBtn" onclick="createApiKey()" class="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-md shadow-sm text-sm font-medium flex items-center gap-2 transition whitespace-nowrap">
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"></path></svg>
+                            <span data-i18n="createApiKey">创建密钥</span>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- One-time plaintext reveal (hidden until a key is created) -->
+                <div id="apiKeyReveal" class="hidden bg-emerald-50 border border-emerald-200 rounded-xl p-5 mb-6">
+                    <div class="flex items-center gap-2 mb-2 text-emerald-800 font-semibold text-sm">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path></svg>
+                        <span data-i18n="apiKeyCreated">密钥已创建 — 只显示这一次，请立即复制</span>
+                    </div>
+                    <div class="relative group bg-gray-900 rounded-lg">
+                        <button onclick="copyOnb(this)" class="absolute top-2 right-2 text-xs text-gray-400 hover:text-white bg-gray-800 hover:bg-gray-700 px-2 py-1 rounded transition" data-i18n="copy">复制</button>
+                        <pre id="apiKeyRevealValue" class="p-4 pr-16 text-emerald-300 font-mono text-[13px] overflow-x-auto whitespace-pre-wrap break-all"></pre>
+                    </div>
+                </div>
+
+                <div id="apiKeysTable" class="bg-white border border-gray-200 rounded-xl shadow-sm overflow-hidden"></div>
+            </div>
+        </div>
+
+        <!-- Tab: Onboarding / Integration guide (rendered by renderOnboarding) -->
+        <div id="tab-onboarding" class="tab-content hidden flex-1 overflow-y-auto p-8">
+            <div id="onboardingBody" class="max-w-5xl mx-auto"></div>
+        </div>
+
+    </main>
+
+    <!-- Notification Toast -->
+    <div id="toast" class="fixed bottom-6 right-6 transform translate-y-20 opacity-0 transition-all duration-300 bg-gray-900 text-white px-4 py-3 rounded-lg shadow-xl text-sm font-medium z-50 flex items-center gap-3">
+        <span id="toastIcon"></span>
+        <span id="toastMsg"></span>
+    </div>
+
+    <!-- Chart Tooltip -->
+    <div id="chartTooltip" class="fixed hidden z-50 bg-gray-900 text-white text-xs rounded-lg shadow-xl p-3 pointer-events-none transform -translate-x-1/2 -translate-y-full mt-[-15px] min-w-[140px]">
+        <div id="ctDate" class="font-semibold text-gray-300 mb-2 border-b border-gray-700 pb-1"></div>
+        <div class="space-y-1">
+            <div class="flex justify-between items-center gap-4">
+                <span class="text-gray-400 flex items-center gap-1.5"><span class="w-2 h-2 rounded-sm bg-emerald-500"></span><span data-i18n="tipReq">请求</span></span>
+                <span id="ctReq" class="font-medium text-emerald-400"></span>
+            </div>
+            <div class="flex justify-between items-center gap-4">
+                <span class="text-gray-400 flex items-center gap-1.5"><span class="w-2 h-2 rounded-sm bg-indigo-500"></span><span data-i18n="tipIn">Token 入</span></span>
+                <span id="ctIn" class="font-medium text-indigo-400"></span>
+            </div>
+            <div class="flex justify-between items-center gap-4">
+                <span class="text-gray-400 flex items-center gap-1.5"><span class="w-2 h-2 rounded-sm bg-sky-400"></span><span data-i18n="tipOut">Token 出</span></span>
+                <span id="ctOut" class="font-medium text-sky-400"></span>
+            </div>
+        </div>
+        <div class="absolute w-3 h-3 bg-gray-900 transform rotate-45 left-1/2 -translate-x-1/2 -bottom-1.5"></div>
+    </div>
+
+    <script>
+        // ============================ i18n ============================
+        // Single-file app: a flat zh/en dictionary + t(). Values are either a
+        // string or a function (for parameterized messages). Default is zh,
+        // persisted in localStorage; switching re-applies static labels and
+        // re-renders the active data tab.
+        const I18N = {
+            zh: {
+                docTitle: 'OrgMesh - AI 网关',
+                navSharer: '分享者', navUser: '使用者',
+                navAccounts: '账号池管理', navStats: '使用量统计', navCapacity: '容量预测',
+                navPlayground: '请求测试', navSetup: '本地配置',
+                navDeploy: '部署', navOnboarding: '接入说明', navApiKeys: 'API 密钥',
+                copy: '复制', copied: '已复制', copyFailed: '复制失败',
+                descApiKeys: '签发网关 API 密钥，让外部程序/脚本用 Authorization: Bearer oag_... 直接调用共享池，无需走团队登录。',
+                createApiKey: '创建密钥', apiKeyLabelPh: '用途备注（如 ci-bot）',
+                apiKeyCreated: '密钥已创建 — 只显示这一次，请立即复制',
+                apiKeyCreatedToast: '密钥已创建，请立即复制保存', apiKeyRevokedToast: '密钥已吊销',
+                apiKeyRevokeConfirm: '吊销后使用该密钥的程序将立即失效，确定吊销？',
+                apiKeysEmpty: '还没有 API 密钥，点右上角「创建密钥」生成一个。',
+                apiKeyActive: '生效中', apiKeyRevoked: '已吊销', apiKeyRevokeBtn: '吊销',
+                thLabel: '备注', thKey: '密钥', thCreated: '创建时间', thStatus: '状态', thAction: '操作',
+                sysStatus: '系统状态', currentUser: '当前用户',
+                descUpstreams: '导入本机 Codex / Claude / Cursor 登录态，检查账号就绪状态，并保持账号访问有效。',
+                importCodex: '导入 Codex', importClaude: '导入 Claude', importCursor: '导入 Cursor',
+                searchPlaceholder: '搜索账号 / 所有者...',
+                allPlatforms: '所有平台', allStatuses: '所有状态',
+                statusActive: '活跃 (有请求)', statusShared: '已共享', statusPrivate: '私有',
+                descStats: '所有账号池的全局使用量和 Token 消耗指标。',
+                descCapacity: '账号池余量燃尽图与撞墙预测：按当前燃烧率，每个账号 / 整个池还能撑多久。',
+                descPlayground: '直接通过网关测试请求路由和模型响应。',
+                preferredProvider: '首选提供商', model: '模型', refresh: '刷新',
+                promptLabel: '提示词 (Prompt)', sendRequest: '发送请求',
+                defaultPrompt: '写一个计算斐波那契数列的 Python 脚本。',
+                descSetup: '配置你的本地 Codex CLI 或 Claude，使其通过共享账号池路由请求。',
+                codexConfig: 'Codex 配置', claudeConfig: 'Claude 配置', cursorConfig: 'Cursor 配置',
+                useSharedPool: '使用共享池', usePersonal: '使用个人账号',
+                cursorNote: '应用后需<strong>完全退出并重新打开 Cursor</strong>。',
+                tipReq: '请求', tipIn: 'Token 入', tipOut: 'Token 出',
+                // units / helpers
+                nTimes: (n) => `${n} 次`,
+                nItems: (n) => `共 ${n} 项`,
+                unitWeek: '周', unitDay: '天', resetDone: '已重置', now: '现在', dash: '—',
+                // toasts / generic
+                copied: '已复制代码', copyFailed: '复制失败',
+                sysOk: '系统运行正常', sysErr: '系统报告错误', connFailed: '连接失败',
+                loadFailed: '加载失败', actionFailed: '操作失败',
+                errorPrefix: (m) => `错误: ${m}`,
+                // account cards
+                never: '从未', credsDead: '凭据已失效',
+                credsDeadHint: 'Token 已过期且无法自动刷新，请重新导入该账号',
+                primaryWindow: '主窗口', secondaryWindow: '次窗口',
+                noRateWindow: '暂未拿到上游限流窗口',
+                noRateWindowHint: '先经网关发起一次真实请求，限流条会自动更新',
+                requests: '请求', successRate: '成功率', errors: '错误',
+                totalUsage: '累计使用',
+                setPrivate: '设为私有', setShared: '设为共享', setShareLimit: '设置共享额度',
+                removeAccount: '移除账号',
+                shared: '已共享', private: '私有',
+                protected: '已保护', protectedTip: '主人近 7 天用量较高，已暂停向其他用户分配此账号',
+                lastUsedPrefix: (s) => `最近使用: ${s}`,
+                loadingAccounts: '正在加载账号...', noMatchingAccounts: '没有匹配的账号。',
+                setToShared: '已设为共享', setToPrivate: '已设为私有',
+                shareLimitPrompt: '其他用户最多可把该账号用到多少 %（1-99）？\n留空或填 100 表示不限制。',
+                shareLimitBadNum: '请输入 1-99 之间的数字',
+                shareLimitSet: (p) => `共享额度已设为 ${p}%`, shareLimitCleared: '已取消共享额度限制',
+                removeConfirm: (l) => `确定移除账号「${l}」? 此操作不可撤销。`,
+                accountRemoved: '账号已移除', removeFailed: '移除失败',
+                // stats page
+                aggregating: '正在聚合统计...',
+                colName: '名称', colRequests: '请求数', colTokenIn: '入 Token', colTokenOut: '出 Token',
+                noData: '暂无数据',
+                byProvider: '按 Provider', cacheHit: '缓存命中',
+                statAccountHealth: '账号健康 · Account Health',
+                visibleAccounts: (n) => `(${n} 个可见账号)`,
+                hHealthy: '健康', hCooldown: '冷却中', hDegraded: '降级', hDisabled: '已禁用', hDead: '失效',
+                colAccount: '账号', colStatus: '状态',
+                colFailPenalty: '失败惩罚', colCooldownLeft: '冷却剩余', colFallback: '兜底权限',
+                tipFailPenalty: '账号最近失败累积的惩罚分，越高越不容易被选中；每 5 分钟自动衰减，0 = 完全健康',
+                tipCooldownLeft: '账号被限流后的冷却剩余时间，到点后自动恢复',
+                tipFallback: '是否有 cyber-policy 兜底权限：普通账号被拒时可热切换到此账号重试（仅 Codex）',
+                poolEmpty: '账号池为空',
+                dailyUsage30d: '每日用量 · 近 30 天', noUsage30d: '近 30 天暂无用量数据',
+                totalRequests: '总请求数',
+                successFailDetail: (s, e) => `成功 ${s} · 失败 ${e}`,
+                inputTokens: '输入 Token', outputTokens: '输出 Token', cachedTokens: '缓存 Token',
+                hitRate: (p) => `命中率 ${p}%`,
+                byModel: '按模型', byUser: '按用户', byAccount: '按账号',
+                recentRequests: '最近请求',
+                colTime: '时间', colRequester: '请求人', colAccountUsed: '使用账号',
+                colInputTok: '输入Token', colOutputTok: '输出Token',
+                noRecords: '暂无记录',
+                generatedAt: (s) => `生成于 ${s}`,
+                // capacity page
+                computingCapacity: '正在计算余量模型...',
+                poolEmptyImport: '账号池为空，先导入账号。',
+                generatedAtRetention: (s, h) => `生成于 ${s} · 历史窗口 ${h}h`,
+                win5h: '5h 窗口', winWeek: '周窗口', winMonthQuota: '30天额度',
+                notEnoughHistory: '历史样本不足，先经网关跑一些流量（或等待几个探测周期）',
+                schedExcludeLine: '调度排除线',
+                leftSuffix: (label) => `${label}剩余`,
+                tipExhaustBeforeReset: '按当前燃烧率，将在窗口重置前耗尽',
+                exhaustIn: (m) => `${m}后耗尽`,
+                tipResetFirst: '按当前燃烧率的理论耗尽时间，但窗口会先重置',
+                resetFirst: '重置先到', noBurn: '无消耗',
+                resetPrefix: (s) => `重置 ${s}`,
+                cHealthy: '健康', cCooldown: '冷却', cDegraded: '降级', cDisabled: '禁用', cDead: '失效',
+                hittingWall: '将撞墙', excluded: '已排除',
+                sharedSuffix: ' · 共享', privateSuffix: ' · 私有',
+                wallExhaustHint: '按当前燃烧率，全池将在此时间耗尽',
+                accountsWillHitWall: (n) => `${n} 个账号将撞墙`,
+                earliestHint: (label, m) => `最早：${label} ${m}后 · 池整体可撑到重置`,
+                noWallRisk: '无撞墙风险', allWindowsResetFirst: '按当前燃烧率，所有窗口都会先重置',
+                wallPrediction: '撞墙预测',
+                avgUsage: (label) => `${label} 平均用量`,
+                burnRate: (b) => `燃烧率 ${b}`,
+                tokenUsage: 'Token 消耗',
+                last1h: (v) => `近 1 小时 ${v}`,
+                poolBurndown: '池余量燃尽图',
+                usableCount: (u, t) => `可用 ${u}/${t}`,
+                atRiskSuffix: (n) => ` · ${n} 个有风险`,
+                // import buttons
+                importing: '导入中...',
+                codexImported: 'Codex 账号导入成功', claudeImported: 'Claude 账号导入成功', cursorImported: 'Cursor 账号导入成功',
+                importFailed: '导入失败',
+                // models / playground
+                loading: '加载中...',
+                fallbackSuffix: (f) => `${f} (回退)`,
+                modelsRefreshed: '模型已刷新', fetchModelsFailed: '获取模型失败', networkError: '网络错误',
+                sendingRequest: '发送请求中...',
+                rawJson: '原始 JSON',
+                chipProvider: '提供商', chipModel: '模型', chipAccount: '账号归属', chipRequest: '请求',
+                noOutput: '(无输出)', copy: '复制',
+                // setup apply/restore
+                switchingShared: '正在切换到共享池...', switchedShared: '已切换到共享池',
+                switchingPersonal: '正在使用个人账号...', switchedPersonal: '已使用个人账号',
+                switchingSharedClaude: '正在切换到共享池 (Claude)...', switchedSharedClaude: 'Claude 已切换到共享池',
+                switchingPersonalClaude: '正在使用个人账号 (Claude)...', switchedPersonalClaude: 'Claude 已使用个人账号',
+                switchingSharedCursor: '正在切换到共享池 (Cursor)...', switchedSharedCursor: 'Cursor 已切换到共享池（需重启 Cursor）',
+                switchingPersonalCursor: '正在使用个人账号 (Cursor)...', switchedPersonalCursor: 'Cursor 已使用个人账号（需重启 Cursor）',
+            },
+            en: {
+                docTitle: 'OrgMesh - AI Gateway',
+                navSharer: 'Sharers', navUser: 'Users',
+                navAccounts: 'Account Pool', navStats: 'Usage Stats', navCapacity: 'Capacity Forecast',
+                navPlayground: 'Playground', navSetup: 'Local Setup',
+                navDeploy: 'Deploy', navOnboarding: 'Integration', navApiKeys: 'API Keys',
+                copy: 'Copy', copied: 'Copied', copyFailed: 'Copy failed',
+                descApiKeys: 'Issue gateway API keys so external programs/scripts can call the shared pool with Authorization: Bearer oag_... — no team login required.',
+                createApiKey: 'Create key', apiKeyLabelPh: 'label (e.g. ci-bot)',
+                apiKeyCreated: 'Key created — shown only once, copy it now',
+                apiKeyCreatedToast: 'Key created — copy it now', apiKeyRevokedToast: 'Key revoked',
+                apiKeyRevokeConfirm: 'Revoking immediately breaks any program using this key. Revoke it?',
+                apiKeysEmpty: 'No API keys yet. Click “Create key” to generate one.',
+                apiKeyActive: 'Active', apiKeyRevoked: 'Revoked', apiKeyRevokeBtn: 'Revoke',
+                thLabel: 'Label', thKey: 'Key', thCreated: 'Created', thStatus: 'Status', thAction: 'Action',
+                sysStatus: 'System Status', currentUser: 'Current user',
+                descUpstreams: 'Import local Codex / Claude / Cursor sessions, check account readiness, and keep account access valid.',
+                importCodex: 'Import Codex', importClaude: 'Import Claude', importCursor: 'Import Cursor',
+                searchPlaceholder: 'Search account / owner...',
+                allPlatforms: 'All platforms', allStatuses: 'All statuses',
+                statusActive: 'Active (has requests)', statusShared: 'Shared', statusPrivate: 'Private',
+                descStats: 'Global usage and token-consumption metrics across all account pools.',
+                descCapacity: 'Pool burn-down chart and wall prediction: how long each account / the whole pool can last at the current burn rate.',
+                descPlayground: 'Test request routing and model responses directly through the gateway.',
+                preferredProvider: 'Preferred provider', model: 'Model', refresh: 'Refresh',
+                promptLabel: 'Prompt', sendRequest: 'Send request',
+                defaultPrompt: 'Write a Python script that computes the Fibonacci sequence.',
+                descSetup: 'Configure your local Codex CLI or Claude to route requests through the shared account pool.',
+                codexConfig: 'Codex setup', claudeConfig: 'Claude setup', cursorConfig: 'Cursor setup',
+                useSharedPool: 'Use shared pool', usePersonal: 'Use personal account',
+                cursorNote: 'After applying, you must <strong>fully quit and reopen Cursor</strong>.',
+                tipReq: 'Requests', tipIn: 'Token in', tipOut: 'Token out',
+                nTimes: (n) => `${n}`,
+                nItems: (n) => `${n} items`,
+                unitWeek: 'w', unitDay: 'd', resetDone: 'reset', now: 'now', dash: '—',
+                copied: 'Code copied', copyFailed: 'Copy failed',
+                sysOk: 'System healthy', sysErr: 'System reported an error', connFailed: 'Connection failed',
+                loadFailed: 'Load failed', actionFailed: 'Action failed',
+                errorPrefix: (m) => `Error: ${m}`,
+                never: 'Never', credsDead: 'Credentials dead',
+                credsDeadHint: 'Token expired and could not auto-refresh — re-import this account',
+                primaryWindow: 'Primary window', secondaryWindow: 'Secondary window',
+                noRateWindow: 'No upstream rate-limit window yet',
+                noRateWindowHint: 'Send a real request through the gateway and the bars will update automatically',
+                requests: 'Requests', successRate: 'Success rate', errors: 'Errors',
+                totalUsage: 'Total usage',
+                setPrivate: 'Set private', setShared: 'Set shared', setShareLimit: 'Set share limit',
+                removeAccount: 'Remove account',
+                shared: 'Shared', private: 'Private',
+                protected: 'Protected', protectedTip: "Owner's 7-day usage is high; sharing this account is paused",
+                lastUsedPrefix: (s) => `Last used: ${s}`,
+                loadingAccounts: 'Loading accounts...', noMatchingAccounts: 'No matching accounts.',
+                setToShared: 'Set to shared', setToPrivate: 'Set to private',
+                shareLimitPrompt: 'Up to what % can other users use this account (1-99)?\nLeave blank or enter 100 for no limit.',
+                shareLimitBadNum: 'Enter a number between 1 and 99',
+                shareLimitSet: (p) => `Share limit set to ${p}%`, shareLimitCleared: 'Share limit cleared',
+                removeConfirm: (l) => `Remove account "${l}"? This cannot be undone.`,
+                accountRemoved: 'Account removed', removeFailed: 'Remove failed',
+                aggregating: 'Aggregating stats...',
+                colName: 'Name', colRequests: 'Requests', colTokenIn: 'Token in', colTokenOut: 'Token out',
+                noData: 'No data',
+                byProvider: 'By provider', cacheHit: 'Cache hit',
+                statAccountHealth: 'Account Health',
+                visibleAccounts: (n) => `(${n} visible accounts)`,
+                hHealthy: 'Healthy', hCooldown: 'Cooldown', hDegraded: 'Degraded', hDisabled: 'Disabled', hDead: 'Dead',
+                colAccount: 'Account', colStatus: 'Status',
+                colFailPenalty: 'Fail penalty', colCooldownLeft: 'Cooldown left', colFallback: 'Fallback',
+                tipFailPenalty: 'Penalty accumulated from recent failures; higher = less likely to be picked. Decays every 5 min; 0 = fully healthy',
+                tipCooldownLeft: 'Remaining cooldown after the account was rate-limited; auto-recovers when it elapses',
+                tipFallback: 'Whether the account has cyber-policy fallback access: when a normal account is refused, the gateway can hot-swap to this one and retry (Codex only)',
+                poolEmpty: 'Account pool is empty',
+                dailyUsage30d: 'Daily usage · last 30 days', noUsage30d: 'No usage data in the last 30 days',
+                totalRequests: 'Total requests',
+                successFailDetail: (s, e) => `Success ${s} · Failed ${e}`,
+                inputTokens: 'Input tokens', outputTokens: 'Output tokens', cachedTokens: 'Cached tokens',
+                hitRate: (p) => `Hit rate ${p}%`,
+                byModel: 'By model', byUser: 'By user', byAccount: 'By account',
+                recentRequests: 'Recent requests',
+                colTime: 'Time', colRequester: 'Requester', colAccountUsed: 'Account used',
+                colInputTok: 'Input tokens', colOutputTok: 'Output tokens',
+                noRecords: 'No records',
+                generatedAt: (s) => `Generated at ${s}`,
+                computingCapacity: 'Computing capacity model...',
+                poolEmptyImport: 'Pool is empty — import accounts first.',
+                generatedAtRetention: (s, h) => `Generated at ${s} · history window ${h}h`,
+                win5h: '5h window', winWeek: 'Weekly window', winMonthQuota: '30-day quota',
+                notEnoughHistory: 'Not enough history — send some traffic through the gateway (or wait a few probe cycles)',
+                schedExcludeLine: 'Scheduler exclude line',
+                leftSuffix: (label) => `${label} left`,
+                tipExhaustBeforeReset: 'At the current burn rate, will exhaust before the window resets',
+                exhaustIn: (m) => `exhausts in ${m}`,
+                tipResetFirst: 'Theoretical exhaust time at the current burn rate, but the window resets first',
+                resetFirst: 'Reset comes first', noBurn: 'No usage',
+                resetPrefix: (s) => `Reset ${s}`,
+                cHealthy: 'Healthy', cCooldown: 'Cooldown', cDegraded: 'Degraded', cDisabled: 'Disabled', cDead: 'Dead',
+                hittingWall: 'Hitting wall', excluded: 'Excluded',
+                sharedSuffix: ' · Shared', privateSuffix: ' · Private',
+                wallExhaustHint: 'At the current burn rate, the whole pool exhausts at this time',
+                accountsWillHitWall: (n) => `${n} accounts will hit the wall`,
+                earliestHint: (label, m) => `Earliest: ${label} in ${m} · pool overall lasts to reset`,
+                noWallRisk: 'No wall risk', allWindowsResetFirst: 'At the current burn rate, all windows reset first',
+                wallPrediction: 'Wall prediction',
+                avgUsage: (label) => `${label} avg usage`,
+                burnRate: (b) => `Burn rate ${b}`,
+                tokenUsage: 'Token usage',
+                last1h: (v) => `Last 1h ${v}`,
+                poolBurndown: 'Pool burn-down chart',
+                usableCount: (u, t) => `Usable ${u}/${t}`,
+                atRiskSuffix: (n) => ` · ${n} at risk`,
+                importing: 'Importing...',
+                codexImported: 'Codex account imported', claudeImported: 'Claude account imported', cursorImported: 'Cursor account imported',
+                importFailed: 'Import failed',
+                loading: 'Loading...',
+                fallbackSuffix: (f) => `${f} (fallback)`,
+                modelsRefreshed: 'Models refreshed', fetchModelsFailed: 'Failed to fetch models', networkError: 'Network error',
+                sendingRequest: 'Sending request...',
+                rawJson: 'Raw JSON',
+                chipProvider: 'Provider', chipModel: 'Model', chipAccount: 'Account', chipRequest: 'Request',
+                noOutput: '(no output)', copy: 'Copy',
+                switchingShared: 'Switching to shared pool...', switchedShared: 'Switched to shared pool',
+                switchingPersonal: 'Switching to personal account...', switchedPersonal: 'Using personal account',
+                switchingSharedClaude: 'Switching to shared pool (Claude)...', switchedSharedClaude: 'Claude switched to shared pool',
+                switchingPersonalClaude: 'Switching to personal account (Claude)...', switchedPersonalClaude: 'Claude using personal account',
+                switchingSharedCursor: 'Switching to shared pool (Cursor)...', switchedSharedCursor: 'Cursor switched to shared pool (restart Cursor)',
+                switchingPersonalCursor: 'Switching to personal account (Cursor)...', switchedPersonalCursor: 'Cursor using personal account (restart Cursor)',
+            },
+        };
+
+        let LANG = localStorage.getItem('oag.lang') || 'zh';
+        function t(key, ...args) {
+            const table = I18N[LANG] || I18N.zh;
+            let val = table[key];
+            if (val === undefined) val = I18N.zh[key];
+            if (val === undefined) return key;
+            return typeof val === 'function' ? val(...args) : val;
+        }
+        window.__currentTab = 'upstreams';
+
+        function applyStaticI18n() {
+            document.documentElement.lang = LANG === 'zh' ? 'zh-CN' : 'en';
+            document.title = t('docTitle');
+            document.querySelectorAll('[data-i18n]').forEach(el => { el.textContent = t(el.dataset.i18n); });
+            document.querySelectorAll('[data-i18n-ph]').forEach(el => { el.placeholder = t(el.dataset.i18nPh); });
+            document.querySelectorAll('[data-i18n-title]').forEach(el => { el.title = t(el.dataset.i18nTitle); });
+            document.querySelectorAll('[data-i18n-html]').forEach(el => { el.innerHTML = t(el.dataset.i18nHtml); });
+            // pageTitle tracks the active tab, not a fixed data-i18n key.
+            const titles = { upstreams: 'navAccounts', stats: 'navStats', capacity: 'navCapacity', playground: 'navPlayground', setup: 'navSetup', apikeys: 'navApiKeys', onboarding: 'navOnboarding' };
+            document.getElementById('pageTitle').textContent = t(titles[window.__currentTab] || 'navAccounts');
+        }
+
+        function updateLangButton() {
+            // Button shows the language you'd switch TO.
+            document.getElementById('langToggle').textContent = LANG === 'zh' ? 'EN' : '中';
+        }
+
+        function rerenderCurrent() {
+            const tab = window.__currentTab;
+            if (tab === 'upstreams') loadAccounts();
+            else if (tab === 'stats') loadStats();
+            else if (tab === 'capacity') loadCapacity();
+            else if (tab === 'apikeys') loadApiKeys();
+            else if (tab === 'onboarding') renderOnboarding();
+            // playground/setup: static labels already refreshed; dynamic output is user-triggered.
+        }
+
+        // Swap the playground's example prompt to the active language, but only
+        // when it still holds an unmodified default (zh or en) — never clobber
+        // text the user has typed.
+        function syncDefaultPrompt() {
+            const el = document.getElementById('prompt');
+            if (!el) return;
+            const cur = el.value.trim();
+            if (cur === '' || cur === I18N.zh.defaultPrompt || cur === I18N.en.defaultPrompt) {
+                el.value = t('defaultPrompt');
+            }
+        }
+
+        function toggleLang() {
+            LANG = LANG === 'zh' ? 'en' : 'zh';
+            localStorage.setItem('oag.lang', LANG);
+            applyStaticI18n();
+            updateLangButton();
+            syncDefaultPrompt();
+            rerenderCurrent();
+        }
+
+        function showChartTooltip(e, key, req, inTok, outTok) {
+            const tt = document.getElementById('chartTooltip');
+            document.getElementById('ctDate').textContent = key;
+            document.getElementById('ctReq').textContent = t('nTimes', req);
+            document.getElementById('ctIn').textContent = parseInt(inTok).toLocaleString();
+            document.getElementById('ctOut').textContent = parseInt(outTok).toLocaleString();
+
+            tt.style.left = e.clientX + 'px';
+            tt.style.top = e.clientY + 'px';
+            tt.classList.remove('hidden');
+        }
+        function hideChartTooltip() {
+            document.getElementById('chartTooltip').classList.add('hidden');
+        }
+        // --- API keys (open-API credentials) --------------------------------
+        async function loadApiKeys() {
+            const wrap = document.getElementById('apiKeysTable');
+            try {
+                const res = await fetch('/v1/apikeys', { headers: { 'Authorization': `Bearer ${gatewayToken()}` } });
+                const data = await res.json();
+                if (!res.ok) { wrap.innerHTML = `<div class="p-6 text-sm text-red-600">${data.error || t('importFailed')}</div>`; return; }
+                const keys = data.api_keys || [];
+                if (!keys.length) {
+                    wrap.innerHTML = `<div class="p-10 text-center text-sm text-gray-400">${t('apiKeysEmpty')}</div>`;
+                    return;
+                }
+                const rows = keys.map(k => {
+                    const when = new Date(k.created_at).toLocaleString();
+                    const status = k.revoked
+                        ? `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-gray-100 text-gray-500">${t('apiKeyRevoked')}</span>`
+                        : `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-emerald-50 text-emerald-700">${t('apiKeyActive')}</span>`;
+                    const action = k.revoked
+                        ? `<span class="text-gray-300 text-sm">—</span>`
+                        : `<button onclick="revokeApiKey('${k.id}')" class="text-red-600 hover:text-red-700 text-sm font-medium">${t('apiKeyRevokeBtn')}</button>`;
+                    return `<tr class="${k.revoked ? 'opacity-50' : ''}">
+                        <td class="px-5 py-3 text-sm font-medium text-gray-800">${escapeHtml(k.label)}</td>
+                        <td class="px-5 py-3 text-sm font-mono text-gray-500">${escapeHtml(k.display)}</td>
+                        <td class="px-5 py-3 text-sm text-gray-500">${when}</td>
+                        <td class="px-5 py-3">${status}</td>
+                        <td class="px-5 py-3 text-right">${action}</td>
+                    </tr>`;
+                }).join('');
+                wrap.innerHTML = `<table class="w-full">
+                    <thead class="bg-gray-50 border-b border-gray-200">
+                        <tr class="text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">
+                            <th class="px-5 py-3">${t('thLabel')}</th>
+                            <th class="px-5 py-3">${t('thKey')}</th>
+                            <th class="px-5 py-3">${t('thCreated')}</th>
+                            <th class="px-5 py-3">${t('thStatus')}</th>
+                            <th class="px-5 py-3 text-right">${t('thAction')}</th>
+                        </tr>
+                    </thead>
+                    <tbody class="divide-y divide-gray-100">${rows}</tbody>
+                </table>`;
+            } catch (e) {
+                wrap.innerHTML = `<div class="p-6 text-sm text-red-600">${e.message}</div>`;
+            }
+        }
+
+        function escapeHtml(s) {
+            return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        }
+
+        async function createApiKey() {
+            const btn = document.getElementById('createApiKeyBtn');
+            const label = document.getElementById('apiKeyLabel').value.trim();
+            btn.disabled = true;
+            try {
+                const res = await fetch('/v1/apikeys', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${gatewayToken()}` },
+                    body: JSON.stringify({ label })
+                });
+                const data = await res.json();
+                if (!res.ok) { showToast(data.error || t('importFailed'), 'error'); return; }
+                document.getElementById('apiKeyLabel').value = '';
+                const reveal = document.getElementById('apiKeyReveal');
+                document.getElementById('apiKeyRevealValue').textContent = data.key;
+                reveal.classList.remove('hidden');
+                showToast(t('apiKeyCreatedToast'));
+                loadApiKeys();
+            } catch (e) {
+                showToast(e.message, 'error');
+            } finally {
+                btn.disabled = false;
+            }
+        }
+
+        async function revokeApiKey(id) {
+            if (!confirm(t('apiKeyRevokeConfirm'))) return;
+            try {
+                const res = await fetch('/v1/apikeys/' + encodeURIComponent(id), {
+                    method: 'DELETE',
+                    headers: { 'Authorization': `Bearer ${gatewayToken()}` }
+                });
+                const data = await res.json();
+                if (!res.ok) { showToast(data.error || t('importFailed'), 'error'); return; }
+                showToast(t('apiKeyRevokedToast'));
+                loadApiKeys();
+            } catch (e) {
+                showToast(e.message, 'error');
+            }
+        }
+
+        // --- Onboarding / Integration guide ---------------------------------
+        // A static, self-describing page rendered from the current language and
+        // the gateway's own origin, so the snippets are copy-paste ready with no
+        // placeholder URLs. Covers the three integration surfaces discussed:
+        // team auth edge (admin), donate (sharer inflow), consume (user outflow).
+        function copyOnb(btn) {
+            const pre = btn.parentElement.querySelector('pre');
+            if (!pre) return;
+            navigator.clipboard.writeText(pre.innerText).then(() => {
+                const old = btn.textContent;
+                btn.textContent = t('copied');
+                setTimeout(() => { btn.textContent = old; }, 1500);
+            }).catch(() => showToast(t('copyFailed'), 'error'));
+        }
+
+        function renderOnboarding() {
+            const base = window.location.origin;          // e.g. https://gw.company.com
+            const v1 = base + '/v1';
+            const zh = LANG === 'zh';
+
+            // code block with a copy button
+            const code = (text) => `<div class="relative group bg-gray-900 rounded-lg my-3">
+                <button onclick="copyOnb(this)" class="absolute top-2 right-2 text-xs text-gray-400 hover:text-white bg-gray-800 hover:bg-gray-700 px-2 py-1 rounded transition opacity-0 group-hover:opacity-100">${t('copy')}</button>
+                <pre class="p-4 pr-16 text-gray-200 font-mono text-[13px] leading-relaxed overflow-x-auto whitespace-pre-wrap">${text.replace(/&/g,'&amp;').replace(/</g,'&lt;')}</pre>
+            </div>`;
+
+            const card = (n, title, desc, inner) => `<section class="bg-white border border-gray-200 rounded-xl p-6 shadow-sm mb-6">
+                <div class="flex items-center gap-3 mb-1">
+                    <span class="flex items-center justify-center w-7 h-7 rounded-full bg-indigo-50 text-indigo-600 text-sm font-bold flex-shrink-0">${n}</span>
+                    <h3 class="text-lg font-semibold text-gray-900">${title}</h3>
+                </div>
+                <p class="text-sm text-gray-500 ml-10 mb-4">${desc}</p>
+                <div class="ml-10">${inner}</div>
+            </section>`;
+
+            const note = (html) => `<div class="text-sm text-gray-600 bg-amber-50 border border-amber-200 rounded-lg px-4 py-3 my-3">${html}</div>`;
+            const li = (items) => `<ul class="list-disc pl-5 space-y-1.5 text-sm text-gray-700 my-3">${items.map(i=>`<li>${i}</li>`).join('')}</ul>`;
+
+            const intro = `<div class="bg-gradient-to-r from-indigo-600 to-violet-600 rounded-xl p-6 text-white mb-6 shadow-sm">
+                <h2 class="text-xl font-bold mb-1">${zh?'接入说明':'Integration Guide'}</h2>
+                <p class="text-indigo-100 text-sm mb-4">${zh
+                    ?'本网关只负责<strong class="text-white">账号池 + 调度 + 转发</strong>，不提供登录系统。登录与鉴权由团队自己的边缘提供；捐号（流入）与调用（流出）共用同一道边缘。'
+                    :'This gateway only handles the <strong class="text-white">account pool + scheduling + relay</strong> — it has no login system. Authentication is provided by your team\'s own edge; donation (inflow) and consumption (outflow) share that same edge.'}</p>
+                <div class="bg-white/10 rounded-lg px-4 py-3 text-sm font-mono flex items-center gap-2">
+                    <span class="text-indigo-200">${zh?'网关地址':'Gateway URL'}:</span>
+                    <span class="font-semibold">${base}</span>
+                </div>
+            </div>`;
+
+            // 1) Admin — wire the team auth edge
+            const adminInner = `
+                <p class="text-sm text-gray-700 mb-2">${zh?'网关侧设置环境变量：':'Set these env vars on the gateway:'}</p>
+                ${li([
+                    `<code class="text-indigo-600">GATEWAY_EDGE_SECRET</code> — ${zh?'边缘共享密钥，设置即启用「可信头」模式':'edge shared secret; setting it enables trusted-header mode'}`,
+                    `<code class="text-indigo-600">GATEWAY_EDGE_SECRET_HEADER</code> / <code class="text-indigo-600">GATEWAY_USER_ID_HEADER</code> — ${zh?'头名映射，适配现有边缘（默认 x-gateway-auth / x-user-id）':'header-name mapping for your existing edge (default x-gateway-auth / x-user-id)'}`,
+                    `<code class="text-indigo-600">GATEWAY_TRUST_USER_HEADER=true</code> — ${zh?'完全内网时免密钥直接信任身份头（启动会打 warning）':'fully-internal only: trust the identity header without a secret (logs a warning at startup)'}`,
+                ])}
+                ${code('# '+(zh?'网关侧生成密钥':'generate a secret on the gateway')+'\nexport GATEWAY_EDGE_SECRET=$(openssl rand -hex 32)')}
+                <p class="text-sm text-gray-700 mt-4 mb-1">${zh?'团队边缘（验完自己的登录后）转发时带两个头，零 SDK：':'Your edge forwards two headers after authenticating the user — zero SDK:'}</p>
+                ${code('# nginx ('+(zh?'auth_request 验完身份后':'after auth_request')+')\nproxy_set_header X-Gateway-Auth "<'+ (zh?'共享密钥':'shared secret') +'>";\nproxy_set_header X-User-Id      $authenticated_user;')}
+                ${note(zh
+                    ?'安全前提：终端用户绝不能直连网关，只能经过可信外层（网关只监听内网 / 仅放行外层 IP）。否则 <code>X-User-Id</code> 可被伪造。与 oauth2-proxy / Envoy ext_authz / nginx auth_request 的 trusted-header 模式一致。'
+                    :'Security requirement: end users must never reach the gateway directly — only via the trusted edge (gateway binds to an internal network / allows only the edge IP). Otherwise <code>X-User-Id</code> can be forged. Same trusted-header model as oauth2-proxy / Envoy ext_authz / nginx auth_request.')}`;
+
+            // 2) Sharer — donate (inflow)
+            const donateInner = `
+                <p class="text-sm text-gray-700 mb-1">${zh?'分享者在<strong>自己机器</strong>上跑一行命令，脚本读取本机已登录的 Codex / Claude / Cursor 凭据并经 HTTPS 提交：':'A sharer runs one line on <strong>their own machine</strong>; the script reads the locally logged-in Codex / Claude / Cursor credentials and submits them over HTTPS:'}</p>
+                ${code(`curl -fsSL ${base}/donate.sh | sh`)}
+                <p class="text-sm text-gray-700 mt-3 mb-1">${zh?'指定身份 / 只捐某一家：':'Set the identity / donate just one provider:'}</p>
+                ${code(`curl -fsSL ${base}/donate.sh | USER_ID=koltyu sh -s -- claude`)}
+                <p class="text-sm text-gray-700 mt-3 mb-1">${zh?'若网关启用了可信边缘密钥，命令行请求带密钥穿过边缘：':'If the gateway uses an edge secret, the CLI request passes the secret through the edge:'}</p>
+                ${code(`curl -fsSL ${base}/donate.sh | EDGE_SECRET=<secret> USER_ID=koltyu sh`)}
+                ${note(zh
+                    ?'依赖：必备 <code>curl</code>；Cursor 需本机有 <code>sqlite3</code>。捐出的账号默认进共享池。命令行请求过不了「浏览器 cookie 式」SSO 边缘——用 <code>EDGE_SECRET</code> 或走内网入口。'
+                    :'Requires <code>curl</code>; Cursor also needs <code>sqlite3</code>. Donated accounts join the shared pool by default. CLI requests can\'t pass a browser-cookie SSO edge — use <code>EDGE_SECRET</code> or an internal entry point.')}`;
+
+            // 3) User — consume (outflow)
+            const useInner = `
+                <p class="text-sm text-gray-700 mb-1">${zh?'把客户端的 base_url 指向网关，并带上身份（经边缘注入，或本地 Bearer）：':'Point the client base_url at the gateway and carry an identity (injected by the edge, or a local Bearer):'}</p>
+                ${code('# Codex CLI — ~/.codex/config.toml\nmodel_provider = "org-ai-gateway"\n[model_providers.org-ai-gateway]\nname = "Codex via org-ai-gateway"\nbase_url = "'+v1+'"\nwire_api = "responses"\nrequires_openai_auth = true')}
+                ${code('# Claude Code\nexport ANTHROPIC_BASE_URL='+base+'\n# '+(zh?'无边缘时用自报身份':'self-asserted identity when there is no edge')+'\nexport ANTHROPIC_AUTH_TOKEN="user:koltyu"')}
+                <p class="text-sm text-gray-700 mt-3 mb-1">${zh?'兼容端点（OpenAI / Anthropic 协议）：':'Compatible endpoints (OpenAI / Anthropic protocols):'}</p>
+                ${li([
+                    `<code>${v1}/responses</code> · <code>${v1}/chat/completions</code> · <code>${v1}/models</code>`,
+                    `<code>${v1}/messages</code> (Anthropic)`,
+                    `<code>${v1}/gateway/relay</code> (${zh?'统一入口':'unified entry'})`,
+                ])}
+                ${note(zh
+                    ?'身份决定记到谁的配额、以及能否用自己的私有账号。<strong>挂了边缘后，边缘注入的 <code>X-User-Id</code> 覆盖自报 Bearer</strong>；无身份的请求只能借共享池。'
+                    :'Identity decides whose quota is charged and whether a private account may be used. <strong>Behind an edge, the injected <code>X-User-Id</code> overrides the self-asserted Bearer</strong>; requests with no identity may only borrow the shared pool.')}
+                ${note(zh
+                    ?'第三方程序 / 脚本（无法走浏览器登录）请在 <a href="#" onclick="switchTab(\'apikeys\');return false;" class="text-indigo-600 underline font-medium">「API 密钥」</a> 页签发 <code>oag_</code> 密钥，用 <code>Authorization: Bearer oag_...</code> 调用——它可绕过团队 SSO 边缘，直接认作密钥归属人。'
+                    :'For third-party programs / scripts (which can\'t do browser login), issue an <code>oag_</code> key on the <a href="#" onclick="switchTab(\'apikeys\');return false;" class="text-indigo-600 underline font-medium">API Keys</a> tab and call with <code>Authorization: Bearer oag_...</code> — it bypasses the team SSO edge and authenticates as the key\'s owner.')}`;
+
+            document.getElementById('onboardingBody').innerHTML =
+                intro
+                + card('1', zh?'管理员 · 接入团队鉴权（可信边缘）':'Admin · Wire the team auth edge',
+                       zh?'把你已有的 SSO / OAuth / 自研登录挂在网关前面。这是部署期配置，不在 UI 里点。':'Put your existing SSO / OAuth / custom login in front of the gateway. This is deploy-time config, not a UI action.',
+                       adminInner)
+                + card('2', zh?'分享者 · 捐号（流入）':'Sharer · Donate accounts (inflow)',
+                       zh?'成员把自己已登录的账号捐进共享池。':'Members donate their logged-in accounts into the shared pool.',
+                       donateInner)
+                + card('3', zh?'使用者 · 接入调用（流出）':'User · Consume the pool (outflow)',
+                       zh?'成员把客户端指向网关，借池子里的账号调用 AI。':'Members point their client at the gateway and call AI through the pooled accounts.',
+                       useInner);
+        }
+
+        // --- Sidebar Logic ---
+        function toggleSidebar() {
+            document.getElementById('sidebar').classList.toggle('sidebar-collapsed');
+        }
+
+        // --- Tab Switching Logic ---
+        function switchTab(tabId) {
+            document.querySelectorAll('.tab-content').forEach(el => el.classList.add('hidden'));
+            document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
+
+            document.getElementById('tab-' + tabId).classList.remove('hidden');
+            document.getElementById('nav-' + tabId).classList.add('active');
+
+            window.__currentTab = tabId;
+            const titles = {
+                'upstreams': 'navAccounts',
+                'stats': 'navStats',
+                'capacity': 'navCapacity',
+                'playground': 'navPlayground',
+                'setup': 'navSetup',
+                'apikeys': 'navApiKeys',
+                'onboarding': 'navOnboarding'
+            };
+            document.getElementById('pageTitle').textContent = t(titles[tabId]);
+
+            if (tabId === 'upstreams') {
+                loadAccounts();
+            } else if (tabId === 'stats') {
+                loadStats();
+            } else if (tabId === 'capacity') {
+                loadCapacity();
+            } else if (tabId === 'playground') {
+                // Auto-load the model list on entry; skip the upstream roundtrip
+                // when the list is already loaded for the current provider.
+                const provider = document.getElementById('provider').value || 'codex';
+                if (window.__modelsLoadedFor !== provider) loadModels();
+            } else if (tabId === 'apikeys') {
+                loadApiKeys();
+            } else if (tabId === 'onboarding') {
+                renderOnboarding();
+            }
+        }
+
+        // --- Toast Notification ---
+        function showToast(msg, type = 'success') {
+            const toast = document.getElementById('toast');
+            document.getElementById('toastMsg').textContent = msg;
+            document.getElementById('toastIcon').innerHTML = type === 'success'
+                ? '<svg class="w-5 h-5 text-green-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>'
+                : '<svg class="w-5 h-5 text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>';
+
+            toast.classList.remove('translate-y-20', 'opacity-0');
+            setTimeout(() => {
+                toast.classList.add('translate-y-20', 'opacity-0');
+            }, 3000);
+        }
+
+        // --- Terminal Output Helpers ---
+        // Escapes only &/</> — the result is inserted as element content (never
+        // into attributes), so quotes can stay literal for the JSON highlighter.
+        function escapeHtml(s) {
+            return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        }
+
+        // Token-level JSON syntax highlighting (keys / strings / numbers /
+        // keywords). Input is raw JSON text; output is safe HTML.
+        function highlightJson(text) {
+            return escapeHtml(text).replace(
+                /("(?:\\.|[^"\\])*")(\s*:)?|\b(true|false|null)\b|-?\b\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\b/g,
+                (m, str, colon, kw) => {
+                    if (str) {
+                        return colon
+                            ? `<span class="text-sky-300">${str}</span>${colon}`
+                            : `<span class="text-emerald-300">${str}</span>`;
+                    }
+                    if (kw) return `<span class="text-fuchsia-300">${kw}</span>`;
+                    return `<span class="text-amber-300">${m}</span>`;
+                }
+            );
+        }
+
+        function renderTerminal(elementId, text, isError = false) {
+            const out = document.getElementById(elementId);
+            out.className = `flex-1 p-6 font-mono text-sm overflow-auto whitespace-pre-wrap leading-relaxed ${isError ? 'text-red-400' : 'text-green-400'}`;
+            const t = String(text).trim();
+            // JSON payloads get syntax colors; everything else stays plain text.
+            if (!isError && (t.startsWith('{') || t.startsWith('['))) {
+                out.innerHTML = highlightJson(String(text));
+            } else {
+                out.textContent = text;
+            }
+        }
+
+        // Copy button inside a rendered code block: the <pre> is the header's
+        // next sibling.
+        function oagCopyCode(btn) {
+            const code = btn.parentElement.nextElementSibling?.textContent ?? '';
+            navigator.clipboard.writeText(code).then(
+                () => showToast(t('copied')),
+                () => showToast(t('copyFailed'), 'error')
+            );
+        }
+
+        function codeBlockHtml(code, lang) {
+            return `<div class="my-3 rounded-lg overflow-hidden border border-gray-700 bg-gray-950 font-mono">`
+                + `<div class="flex items-center justify-between px-3 py-1.5 bg-gray-800/80 text-xs text-gray-400">`
+                + `<span>${escapeHtml(lang || 'code')}</span>`
+                + `<button type="button" onclick="oagCopyCode(this)" class="hover:text-gray-100 transition">${t('copy')}</button>`
+                + `</div>`
+                + `<pre class="p-3 overflow-x-auto text-[13px] leading-relaxed text-gray-100 whitespace-pre">${escapeHtml(code.replace(/\n$/, ''))}</pre>`
+                + `</div>`;
+        }
+
+        // Minimal dependency-free markdown: fenced code blocks, inline code,
+        // bold. Enough for model replies without pulling in a renderer (this
+        // page must keep working on offline deploys).
+        function renderMarkdownLite(text) {
+            return String(text).split('```').map((part, i) => {
+                if (i % 2 === 1) {
+                    // Code block; first line may name the language.
+                    let lang = '', code = part;
+                    const nl = part.indexOf('\n');
+                    if (nl !== -1 && /^[\w+-]{0,24}$/.test(part.slice(0, nl).trim())) {
+                        lang = part.slice(0, nl).trim();
+                        code = part.slice(nl + 1);
+                    }
+                    return codeBlockHtml(code, lang);
+                }
+                const prose = escapeHtml(part)
+                    .replace(/`([^`\n]+)`/g, '<code class="px-1 py-0.5 rounded bg-gray-800 text-amber-200 text-[13px] font-mono">$1</code>')
+                    .replace(/\*\*([^*\n]+)\*\*/g, '<strong class="text-white">$1</strong>');
+                return `<span class="whitespace-pre-wrap">${prose}</span>`;
+            }).join('');
+        }
+
+        // Pretty renderer for the request-test panel: metadata chips + the
+        // model reply as lightweight markdown, with the raw JSON tucked into a
+        // collapsible section.
+        function renderRelayResult(data, httpOk) {
+            const out = document.getElementById('responseOutput');
+            out.className = 'flex-1 p-6 text-sm overflow-auto leading-relaxed';
+            const rawDetails = `<details class="mb-4"><summary class="cursor-pointer text-xs text-gray-500 hover:text-gray-300 select-none">${t('rawJson')}</summary>`
+                + `<pre class="mt-2 p-3 rounded-lg bg-gray-950 border border-gray-800 overflow-x-auto text-xs leading-relaxed font-mono whitespace-pre">${highlightJson(JSON.stringify(data, null, 2))}</pre>`
+                + `</details>`;
+
+            if (!httpOk || data.error) {
+                const msg = typeof data.error === 'string' ? data.error : JSON.stringify(data.error ?? data, null, 2);
+                out.innerHTML = rawDetails
+                    + `<div class="flex items-start gap-2 text-red-400 font-mono whitespace-pre-wrap">`
+                    + `<svg class="w-4 h-4 mt-0.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>`
+                    + `<span>${escapeHtml(msg)}</span></div>`;
+                return;
+            }
+
+            const chips = [
+                [t('chipProvider'), data.routed_provider],
+                [t('chipModel'), data.model],
+                [t('chipAccount'), data.upstream_owner_user_id],
+                [t('chipRequest'), (data.request_id || '').slice(0, 8)],
+            ].filter(([, v]) => v).map(([k, v]) =>
+                `<span class="inline-flex items-center gap-1.5 px-2 py-1 rounded-md bg-gray-800 text-xs">`
+                + `<span class="text-gray-500">${k}</span><span class="text-gray-200 font-mono">${escapeHtml(String(v))}</span></span>`
+            ).join('');
+
+            out.innerHTML = `<div class="flex flex-wrap gap-2 mb-3">${chips}</div>`
+                + rawDetails
+                + `<div class="text-gray-100 text-sm">${renderMarkdownLite(data.output_text || t('noOutput'))}</div>`;
+        }
+
+        // --- API Calls ---
+        function getUserId() {
+            return document.getElementById('globalUserId').value || 'koltyu';
+        }
+
+        // Gateway bearer: the self-asserted `user:<id>` identity token.
+        function gatewayToken() {
+            return `user:${getUserId()}`;
+        }
+
+        // Identity field. Two modes:
+        //  - Behind a trusted edge (team SSO): the gateway already knows the
+        //    real user from the injected X-User-Id, so /v1/whoami reports it.
+        //    Lock the field to that name — no manual override.
+        //  - Local / self-asserted: keep the editable, localStorage-backed box.
+        (function initIdentityFields() {
+            const uid = document.getElementById('globalUserId');
+            uid.value = localStorage.getItem('oag.userId') || uid.value;
+            const persist = () => localStorage.setItem('oag.userId', uid.value);
+            uid.addEventListener('change', persist);
+
+            // Ask the gateway who it thinks we are. Best-effort: any failure
+            // leaves the editable fallback untouched.
+            fetch('/v1/whoami').then(r => r.ok ? r.json() : null).then(me => {
+                if (!me || !me.edge_authenticated || !me.user_id) return;
+                uid.removeEventListener('change', persist);
+                uid.value = me.user_id;
+                uid.readOnly = true;
+                uid.classList.add('bg-gray-100', 'cursor-not-allowed', 'text-gray-500');
+                uid.title = (document.documentElement.lang === 'en')
+                    ? 'Identity provided by your sign-in (trusted edge); not editable here.'
+                    : '身份由你的登录系统(可信边缘)提供,此处不可修改。';
+                // Drop any stale manually-typed id so it can't leak into requests.
+                localStorage.removeItem('oag.userId');
+            }).catch(() => {});
+        })();
+
+        document.getElementById('checkHealth').addEventListener('click', async () => {
+            try {
+                const res = await fetch('/health');
+                if (res.ok) showToast(t('sysOk'));
+                else showToast(t('sysErr'), 'error');
+            } catch (e) {
+                showToast(t('connFailed'), 'error');
+            }
+        });
+
+        // ---- formatting helpers ----
+        function fmtBytes(n){ n=Number(n)||0; if(n<1024) return n+' B'; if(n<1048576) return (n/1024).toFixed(1)+' KB'; return (n/1048576).toFixed(1)+' MB'; }
+        function fmtWindow(min){ if(!min) return ''; if(min%10080===0) return (min/10080)+t('unitWeek'); if(min%1440===0) return (min/1440)+t('unitDay'); if(min%60===0) return (min/60)+'h'; return min+'m'; }
+        function fmtReset(sec){ if(sec==null) return '—'; if(sec<=0) return t('resetDone'); const h=Math.floor(sec/3600), m=Math.floor((sec%3600)/60); if(h>=24){const d=Math.floor(h/24); return d+'d '+(h%24)+'h';} if(h>0) return h+'h '+m+'m'; return m+'m'; }
+        function pctColor(p){ if(p>=90) return 'bg-red-500'; if(p>=70) return 'bg-yellow-500'; return 'bg-indigo-500'; }
+        function limitBar(label, p, resetSec){
+            const has = (p!=null);
+            const val = has ? Math.max(0, Math.min(100, p)) : 0;
+            const col = has ? pctColor(p) : 'bg-gray-200';
+            return `<div>
+                <div class="flex justify-between text-xs mb-1.5">
+                    <span class="font-medium text-gray-600">${label}</span>
+                    <span class="font-medium ${has?'text-gray-900':'text-gray-400'}">${has? p+'%' : '—'}</span>
+                </div>
+                <div class="h-2 bg-gray-100 rounded-full overflow-hidden">
+                    <div class="h-full ${col} rounded-full transition-all duration-500" style="width:${val}%"></div>
+                </div>
+                <div class="flex justify-between text-[10px] text-gray-400 mt-1">
+                    <span>${t('resetPrefix', fmtReset(resetSec))}</span>
+                </div>
+            </div>`;
+        }
+
+        function renderAccountCard(acc){
+            const rl = acc.rate_limit;
+            const usage = acc.usage || {};
+            const provider = acc.provider || 'codex';
+            const providerNames = { codex: 'Codex', claude: 'Claude', cursor: 'Cursor' };
+            const badge = (rl && rl.plan_type) ? rl.plan_type : (providerNames[provider] || provider);
+            const badgeColor = provider === 'claude' ? 'bg-purple-100 text-purple-700'
+                : provider === 'cursor' ? 'bg-emerald-100 text-emerald-700'
+                : 'bg-blue-100 text-blue-700';
+            const lastUsed = usage.last_used ? new Date(usage.last_used).toLocaleString() : t('never');
+            const health = acc.health || {};
+            // Status dot reflects health first (dead/disabled/cooldown/degraded),
+            // falling back to activity.
+            const statusDot = health.status === 'dead' ? 'bg-red-500'
+                : health.status === 'disabled' ? 'bg-gray-400'
+                : (health.status === 'cooldown' || health.status === 'degraded') ? 'bg-amber-500'
+                : usage.requests ? 'bg-green-500' : 'bg-gray-300';
+
+            let limitsHtml;
+            if (health.status === 'dead') {
+                // Credentials are dead (token expired AND refresh failed) — make
+                // it obvious the owner must re-import, instead of showing the
+                // generic "no rate-limit window yet" placeholder.
+                limitsHtml = `<div class="mt-4 text-xs bg-red-50 rounded-md p-3 border border-red-100">
+                    <div class="text-red-600 text-center font-medium">${t('credsDead')}</div>
+                    <div class="text-[10px] text-red-400 text-center mt-1">${t('credsDeadHint')}</div>
+                </div>`;
+            } else if (rl && (rl.primary_used_percent!=null || rl.secondary_used_percent!=null)) {
+                const pLabel = fmtWindow(rl.primary_window_minutes) || t('primaryWindow');
+                const sLabel = fmtWindow(rl.secondary_window_minutes) || t('secondaryWindow');
+                // Only show the secondary window when the provider actually has
+                // one (Codex/Claude); Cursor meters a single monthly window.
+                const secondaryBar = (rl.secondary_used_percent != null)
+                    ? limitBar(sLabel, rl.secondary_used_percent, rl.secondary_reset_after_seconds)
+                    : '';
+                // Cursor carries a dollar breakdown (included + on-demand spend)
+                // in credits_balance; the percent bar is the included allowance,
+                // which can read 100% while on-demand keeps the account usable.
+                const creditsLine = rl.credits_balance
+                    ? `<div class="text-[11px] text-gray-500 mt-1">${rl.credits_balance}</div>`
+                    : '';
+                limitsHtml = `<div class="space-y-3 mt-4">
+                    ${limitBar(pLabel, rl.primary_used_percent, rl.primary_reset_after_seconds)}
+                    ${secondaryBar}
+                    ${creditsLine}
+                </div>`;
+            } else {
+                const req = usage.requests || 0;
+                const ok = usage.success || 0;
+                const err = usage.errors || 0;
+                const okRate = req ? Math.round((ok / req) * 100) : 0;
+                limitsHtml = `<div class="mt-4 text-xs bg-gray-50 rounded-md p-3 border border-gray-100">
+                    <div class="text-gray-500 text-center">${t('noRateWindow')}</div>
+                    <div class="text-[10px] text-gray-400 text-center mt-1">${t('noRateWindowHint')}</div>
+                    <div class="grid grid-cols-3 gap-2 mt-3 text-center">
+                        <div class="bg-white border border-gray-200 rounded py-1"><div class="text-[10px] text-gray-400">${t('requests')}</div><div class="text-gray-700 font-semibold">${req}</div></div>
+                        <div class="bg-white border border-gray-200 rounded py-1"><div class="text-[10px] text-gray-400">${t('successRate')}</div><div class="text-gray-700 font-semibold">${okRate}%</div></div>
+                        <div class="bg-white border border-gray-200 rounded py-1"><div class="text-[10px] text-gray-400">${t('errors')}</div><div class="text-gray-700 font-semibold">${err}</div></div>
+                    </div>
+                </div>`;
+            }
+
+            return `
+            <div class="bg-white border border-gray-200 rounded-xl shadow-sm hover:shadow-md transition duration-200 flex flex-col relative group">
+                <div class="p-5 border-b border-gray-100 flex justify-between items-start">
+                    <div>
+                        <div class="flex items-center gap-2 mb-1">
+                            <span class="w-2 h-2 rounded-full ${statusDot}"></span>
+                            <h3 class="font-semibold text-gray-900 text-base truncate max-w-[180px]" title="${acc.account_label}">${acc.account_label}</h3>
+                        </div>
+                        <span class="inline-block px-2 py-0.5 ${badgeColor} text-[10px] font-bold rounded-full uppercase tracking-wide">${badge}</span>
+                    </div>
+                    <div class="relative">
+                        <button onclick="toggleAccountMenu(event,'${acc.id}')" class="text-gray-400 hover:text-gray-600 p-1 rounded-md hover:bg-gray-50 transition">
+                            <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 20 20"><path d="M10 6a2 2 0 110-4 2 2 0 010 4zM10 12a2 2 0 110-4 2 2 0 010 4zM10 18a2 2 0 110-4 2 2 0 010 4z"></path></svg>
+                        </button>
+                        <div id="menu-${acc.id}" class="hidden absolute right-0 top-8 z-20 bg-white border border-gray-200 rounded-lg shadow-lg py-1 w-36 text-sm">
+                            <button onclick="toggleShare('${acc.id}',${acc.share_enabled})" class="block w-full text-left px-4 py-2 text-gray-700 hover:bg-gray-50 hover:text-indigo-600 transition">${acc.share_enabled?t('setPrivate'):t('setShared')}</button>
+                            <button onclick="setShareLimit('${acc.id}',${acc.share_limit_percent==null?'null':acc.share_limit_percent})" class="block w-full text-left px-4 py-2 text-gray-700 hover:bg-gray-50 hover:text-indigo-600 transition">${t('setShareLimit')}</button>
+                            <div class="h-px bg-gray-100 my-1"></div>
+                            <button onclick="removeAccount('${acc.id}', this.dataset.label)" data-label="${acc.account_label}" class="block w-full text-left px-4 py-2 text-red-600 hover:bg-red-50 transition">${t('removeAccount')}</button>
+                        </div>
+                    </div>
+                </div>
+                <div class="p-5 flex-1">
+                    <div class="flex justify-between items-end mb-2">
+                        <div class="text-xs font-medium text-gray-500">${t('totalUsage')}</div>
+                        <div class="text-sm font-semibold text-gray-700">${fmtBytes(usage.output_bytes)} / ${t('nTimes', usage.requests||0)}</div>
+                    </div>
+                    ${limitsHtml}
+                </div>
+                <div class="bg-gray-50/50 p-4 border-t border-gray-100 rounded-b-xl flex justify-between items-center text-xs">
+                    <div class="flex items-center gap-1.5">
+                        <svg class="w-4 h-4 ${acc.share_enabled ? 'text-green-500' : 'text-gray-400'}" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="${acc.share_enabled ? 'M8.684 13.342C8.886 12.938 9 12.482 9 12c0-.482-.114-.938-.316-1.342m0 2.684a3 3 0 110-2.684m0 2.684l6.632 3.316m-6.632-6l6.632-3.316m0 0a3 3 0 105.367-2.684 3 3 0 00-5.367 2.684zm0 9.316a3 3 0 105.368 2.684 3 3 0 00-5.368-2.684z' : 'M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z'}"></path></svg>
+                        <span class="font-medium ${acc.share_enabled ? 'text-green-700' : 'text-gray-500'}">${acc.share_enabled ? (t('shared') + (acc.share_limit_percent != null ? ` ≤${acc.share_limit_percent}%` : '')) : t('private')}</span>
+                        ${acc.owner_protected ? `<span class="px-1.5 py-0.5 bg-amber-100 text-amber-700 text-[10px] font-bold rounded-full" title="${t('protectedTip')}">${t('protected')}</span>` : ''}
+                    </div>
+                    <div class="text-gray-400 truncate max-w-[120px]" title="${t('lastUsedPrefix', lastUsed)}">${lastUsed}</div>
+                </div>
+            </div>`;
+        }
+
+        // Upstreams Page
+        async function loadAccounts() {
+            const grid = document.getElementById('accountsGrid');
+            grid.innerHTML = `<div class="col-span-full text-center text-gray-400 py-12">${t('loadingAccounts')}</div>`;
+            try {
+                const res = await fetch('/v1/provider/accounts', { headers: { 'Authorization': `Bearer ${gatewayToken()}` } });
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.error || t('loadFailed'));
+                const grouped = data.grouped_accounts || {};
+                // Flatten EVERY provider group (codex/claude/cursor/...), tagging
+                // each account with its real provider from the group key — the
+                // summary objects themselves don't carry one.
+                window.__allAccounts = Object.entries(grouped)
+                    .flatMap(([provider, accounts]) => (accounts || []).map(a => ({ ...a, provider })));
+                // Stable display order: the server groups accounts in a HashMap
+                // whose JSON key order is randomized per response, so without
+                // this the cards reshuffle on every refresh. Sort by a fixed
+                // provider order, then created_at, then id.
+                const providerRank = { codex: 0, claude: 1, cursor: 2 };
+                window.__allAccounts.sort((a, b) => {
+                    const pa = providerRank[a.provider] ?? 99;
+                    const pb = providerRank[b.provider] ?? 99;
+                    if (pa !== pb) return pa - pb;
+                    if (a.provider !== b.provider) return a.provider.localeCompare(b.provider);
+                    const ca = a.created_at || '', cb = b.created_at || '';
+                    if (ca !== cb) return ca < cb ? -1 : 1;
+                    return (a.id || '').localeCompare(b.id || '');
+                });
+                applyAccountFilters();
+            } catch (e) {
+                grid.innerHTML = `<div class="col-span-full text-center text-red-500 py-12">${t('errorPrefix', e.message)}</div>`;
+            }
+        }
+
+        function applyAccountFilters() {
+            const grid = document.getElementById('accountsGrid');
+            const q = (document.getElementById('searchInput')?.value || '').toLowerCase().trim();
+            const status = document.getElementById('statusFilter')?.value || '';
+            const group = document.getElementById('groupFilter')?.value || '';
+            let list = window.__allAccounts || [];
+            list = list.filter(a => {
+                if (group && (a.provider || '') !== group) return false;
+                if (status === 'shared' && !a.share_enabled) return false;
+                if (status === 'private' && a.share_enabled) return false;
+                if (status === 'active' && !(a.usage && a.usage.requests)) return false;
+                if (q && !(`${a.account_label} ${a.owner_user_id}`.toLowerCase().includes(q))) return false;
+                return true;
+            });
+            if (!list.length) {
+                grid.innerHTML = `<div class="col-span-full text-center text-gray-400 py-12 border-2 border-dashed border-gray-200 rounded-xl">${t('noMatchingAccounts')}</div>`;
+                return;
+            }
+            grid.innerHTML = list.map(renderAccountCard).join('');
+        }
+
+        // ---- account row menu actions ----
+        function toggleAccountMenu(e, id) {
+            e.stopPropagation();
+            document.querySelectorAll('[id^="menu-"]').forEach(m => { if (m.id !== 'menu-' + id) m.classList.add('hidden'); });
+            document.getElementById('menu-' + id)?.classList.toggle('hidden');
+        }
+        document.addEventListener('click', () => document.querySelectorAll('[id^="menu-"]').forEach(m => m.classList.add('hidden')));
+
+        async function toggleShare(id, current) {
+            try {
+                const res = await fetch(`/v1/provider/accounts/${id}/share`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${gatewayToken()}` },
+                    body: JSON.stringify({ share_enabled: !current })
+                });
+                const d = await res.json();
+                if (res.ok) { showToast(d.share_enabled ? t('setToShared') : t('setToPrivate')); loadAccounts(); }
+                else showToast(d.error || t('actionFailed'), 'error');
+            } catch (e) { showToast(e.message, 'error'); }
+        }
+
+        async function setShareLimit(id, current) {
+            const raw = prompt(t('shareLimitPrompt'), current == null ? '' : current);
+            if (raw === null) return;
+            const trimmed = raw.trim();
+            const body = { };
+            if (trimmed === '' || Number(trimmed) >= 100) {
+                body.clear_share_limit = true;
+            } else {
+                const v = Number(trimmed);
+                if (!isFinite(v) || v <= 0) { showToast(t('shareLimitBadNum'), 'error'); return; }
+                body.share_limit_percent = v;
+            }
+            try {
+                const res = await fetch(`/v1/provider/accounts/${id}/share`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${gatewayToken()}` },
+                    body: JSON.stringify(body)
+                });
+                const d = await res.json();
+                if (res.ok) { showToast(d.share_limit_percent != null ? t('shareLimitSet', d.share_limit_percent) : t('shareLimitCleared')); loadAccounts(); }
+                else showToast(d.error || t('actionFailed'), 'error');
+            } catch (e) { showToast(e.message, 'error'); }
+        }
+
+        async function removeAccount(id, label) {
+            if (!confirm(t('removeConfirm', label))) return;
+            try {
+                const res = await fetch(`/v1/provider/accounts/${id}`, {
+                    method: 'DELETE',
+                    headers: { 'Authorization': `Bearer ${gatewayToken()}` }
+                });
+                const d = await res.json();
+                if (res.ok) { showToast(t('accountRemoved')); loadAccounts(); }
+                else showToast(d.error || t('removeFailed'), 'error');
+            } catch (e) { showToast(e.message, 'error'); }
+        }
+
+        // ---- Stats Page ----
+        async function loadStats() {
+            const el = document.getElementById('statsContent');
+            el.innerHTML = `<div class="text-center text-gray-400 py-12">${t('aggregating')}</div>`;
+            try {
+                const authHeader = { 'Authorization': `Bearer ${gatewayToken()}` };
+                const [res, accRes] = await Promise.all([
+                    fetch('/v1/stats', { headers: authHeader }),
+                    fetch('/v1/provider/accounts', { headers: authHeader }).catch(() => null),
+                ]);
+                const d = await res.json();
+                if (!res.ok) throw new Error(d.error || t('loadFailed'));
+                const accData = accRes && accRes.ok ? await accRes.json() : { grouped_accounts: {} };
+
+                const fmtTok = (v) => {
+                    v = v || 0;
+                    if (v >= 1e9) return (v / 1e9).toFixed(1) + 'B';
+                    if (v >= 1e6) return (v / 1e6).toFixed(1) + 'M';
+                    if (v >= 1e3) return (v / 1e3).toFixed(1) + 'K';
+                    return String(v);
+                };
+
+                const card = (label, val, sub = '') => `
+                <div class="bg-white border border-gray-200 rounded-xl p-6 shadow-sm">
+                    <div class="text-sm font-medium text-gray-500 mb-2">${label}</div>
+                    <div class="text-3xl font-bold text-gray-900">${val}</div>
+                    ${sub ? `<div class="text-xs text-gray-400 mt-2">${sub}</div>` : ''}
+                </div>`;
+
+                const table = (title, rows) => `
+                <div class="bg-white border border-gray-200 rounded-xl shadow-sm overflow-hidden flex flex-col h-[400px]">
+                    <div class="px-4 py-3 border-b border-gray-100 bg-gray-50/50 flex-shrink-0 flex justify-between items-center">
+                        <h3 class="text-sm font-semibold text-gray-800">${title}</h3>
+                        <span class="text-xs text-gray-400">${t('nItems', rows.length)}</span>
+                    </div>
+                    <div class="p-0 flex-1 overflow-auto relative">
+                        ${rows.length ? `
+                        <table class="w-full text-sm text-left">
+                            <thead class="bg-gray-50/90 backdrop-blur-sm text-gray-400 text-xs uppercase sticky top-0 z-10 shadow-sm">
+                                <tr>
+                                    <th class="px-4 py-2 font-medium">${t('colName')}</th>
+                                    <th class="px-4 py-2 font-medium text-right">${t('colRequests')}</th>
+                                    <th class="px-4 py-2 font-medium text-right">${t('colTokenIn')}</th>
+                                    <th class="px-4 py-2 font-medium text-right">${t('colTokenOut')}</th>
+                                </tr>
+                            </thead>
+                            <tbody class="divide-y divide-gray-100">
+                                ${rows.map(r => `
+                                <tr class="hover:bg-gray-50 transition">
+                                    <td class="px-4 py-3 text-gray-700 font-medium truncate max-w-[100px]" title="${r.key}">${r.key}</td>
+                                    <td class="px-4 py-3 text-right text-gray-500 whitespace-nowrap">${t('nTimes', r.requests)}</td>
+                                    <td class="px-4 py-3 text-right text-gray-500 whitespace-nowrap">${(r.input_tokens||0).toLocaleString()}</td>
+                                    <td class="px-4 py-3 text-right text-gray-500 whitespace-nowrap">${(r.output_tokens||0).toLocaleString()}</td>
+                                </tr>`).join('')}
+                            </tbody>
+                        </table>` : `<div class="p-6 text-center text-gray-400 text-sm h-full flex items-center justify-center">${t('noData')}</div>`}
+                    </div>
+                </div>`;
+
+                // Denominator is the provider-normalized prompt-token total
+                // (input incl. cache reads + cache creation), so the rate is
+                // comparable across providers and never exceeds 100%.
+                const hitRate = (cached, prompt) => (prompt > 0 ? (cached / prompt * 100) : 0);
+
+                // By Provider: requests + cache hit rate per upstream provider.
+                const providerTable = () => {
+                    const rows = d.by_provider || [];
+                    return `
+                    <div class="bg-white border border-gray-200 rounded-xl shadow-sm overflow-hidden flex flex-col h-[400px]">
+                        <div class="px-4 py-3 border-b border-gray-100 bg-gray-50/50 flex-shrink-0 flex justify-between items-center">
+                            <h3 class="text-sm font-semibold text-gray-800">${t('byProvider')}</h3>
+                            <span class="text-xs text-gray-400">${t('nItems', rows.length)}</span>
+                        </div>
+                        <div class="p-0 flex-1 overflow-auto relative">
+                            ${rows.length ? `
+                            <table class="w-full text-sm text-left">
+                                <thead class="bg-gray-50/90 backdrop-blur-sm text-gray-400 text-xs uppercase sticky top-0 z-10 shadow-sm">
+                                    <tr>
+                                        <th class="px-4 py-2 font-medium">Provider</th>
+                                        <th class="px-4 py-2 font-medium text-right">${t('colRequests')}</th>
+                                        <th class="px-4 py-2 font-medium text-right">${t('cacheHit')}</th>
+                                    </tr>
+                                </thead>
+                                <tbody class="divide-y divide-gray-100">
+                                    ${rows.map(r => `
+                                    <tr class="hover:bg-gray-50 transition">
+                                        <td class="px-4 py-3 text-gray-700 font-medium">${r.key}</td>
+                                        <td class="px-4 py-3 text-right text-gray-500 whitespace-nowrap">${t('nTimes', r.requests)}</td>
+                                        <td class="px-4 py-3 text-right text-gray-500 whitespace-nowrap">${hitRate(r.cached_tokens||0, r.prompt_tokens||0).toFixed(0)}%</td>
+                                    </tr>`).join('')}
+                                </tbody>
+                            </table>` : `<div class="p-6 text-center text-gray-400 text-sm h-full flex items-center justify-center">${t('noData')}</div>`}
+                        </div>
+                    </div>`;
+                };
+
+                // Account health: status distribution + per-account penalty/cooldown detail.
+                const accountHealth = () => {
+                    const accounts = Object.values(accData.grouped_accounts || {}).flat();
+                    const counts = { healthy: 0, cooldown: 0, degraded: 0, disabled: 0, dead: 0 };
+                    accounts.forEach(a => { const s = (a.health && a.health.status) || 'healthy'; counts[s] = (counts[s] || 0) + 1; });
+                    const meta = {
+                        healthy:  { label: t('hHealthy'),  dot: 'bg-green-500',  text: 'text-green-700',  bg: 'bg-green-50' },
+                        cooldown: { label: t('hCooldown'), dot: 'bg-amber-500',  text: 'text-amber-700',  bg: 'bg-amber-50' },
+                        degraded: { label: t('hDegraded'), dot: 'bg-orange-500', text: 'text-orange-700', bg: 'bg-orange-50' },
+                        disabled: { label: t('hDisabled'), dot: 'bg-gray-400',   text: 'text-gray-600',   bg: 'bg-gray-50' },
+                        dead:     { label: t('hDead'),     dot: 'bg-red-500',    text: 'text-red-700',    bg: 'bg-red-50' },
+                    };
+                    const chips = Object.keys(meta).map(k => `
+                        <div class="flex items-center gap-2 px-3 py-2 rounded-lg ${meta[k].bg}">
+                            <span class="w-2 h-2 rounded-full ${meta[k].dot}"></span>
+                            <span class="text-sm ${meta[k].text}">${meta[k].label}</span>
+                            <span class="text-lg font-bold ${meta[k].text} ml-auto">${counts[k] || 0}</span>
+                        </div>`).join('');
+                    const fmtLeft = (iso) => {
+                        if (!iso) return '—';
+                        const ms = new Date(iso) - new Date();
+                        if (ms <= 0) return '—';
+                        const m = Math.round(ms / 60000);
+                        return m >= 60 ? `${Math.floor(m/60)}h${m%60}m` : `${m}m`;
+                    };
+                    const detail = accounts.map(a => {
+                        const h = a.health || {};
+                        const m = meta[h.status] || meta.healthy;
+                        return `
+                        <tr class="hover:bg-gray-50 transition">
+                            <td class="px-4 py-3 text-gray-700 font-medium truncate max-w-[160px]" title="${a.owner_user_id}/${a.account_label}">${a.owner_user_id}/${a.account_label}</td>
+                            <td class="px-4 py-3"><span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-xs font-medium ${m.bg} ${m.text}"><span class="w-1.5 h-1.5 rounded-full ${m.dot}"></span>${m.label}</span></td>
+                            <td class="px-4 py-3 text-right text-gray-500">${(h.penalty||0).toFixed(2)}</td>
+                            <td class="px-4 py-3 text-right text-gray-500">${fmtLeft(h.rate_limit_until)}</td>
+                            <td class="px-4 py-3 text-right text-gray-500">${h.cyber_access ? '✓' : '—'}</td>
+                        </tr>`;
+                    }).join('');
+                    return `
+                    <div class="bg-white border border-gray-200 rounded-xl shadow-sm p-6 mb-8">
+                        <h3 class="text-sm font-semibold text-gray-800 mb-4">${t('statAccountHealth')} <span class="text-xs font-normal text-gray-400">${t('visibleAccounts', accounts.length)}</span></h3>
+                        <div class="grid grid-cols-2 md:grid-cols-5 gap-3 mb-5">${chips}</div>
+                        ${accounts.length ? `
+                        <div class="overflow-auto border border-gray-100 rounded-lg max-h-[300px]">
+                            <table class="w-full text-sm text-left">
+                                <thead class="bg-gray-50/90 text-gray-400 text-xs uppercase sticky top-0">
+                                    <tr>
+                                        <th class="px-4 py-2 font-medium">${t('colAccount')}</th>
+                                        <th class="px-4 py-2 font-medium">${t('colStatus')}</th>
+                                        <th class="px-4 py-2 font-medium text-right" title="${t('tipFailPenalty')}">${t('colFailPenalty')}</th>
+                                        <th class="px-4 py-2 font-medium text-right" title="${t('tipCooldownLeft')}">${t('colCooldownLeft')}</th>
+                                        <th class="px-4 py-2 font-medium text-right" title="${t('tipFallback')}">${t('colFallback')}</th>
+                                    </tr>
+                                </thead>
+                                <tbody class="divide-y divide-gray-100">${detail}</tbody>
+                            </table>
+                        </div>` : `<div class="text-center text-gray-400 text-sm py-4">${t('poolEmpty')}</div>`}
+                    </div>`;
+                };
+
+                // Daily Usage: 30-day SVG chart — stacked bars of input/output tokens
+                // per day, overlaid with a request-count line. Uses the by_day
+                // buckets from /v1/stats.
+                const dailyChart = () => {
+                    const byDay = (d.by_day || []).filter(b => /^\d{4}-\d{2}-\d{2}$/.test(b.key));
+                    const map = {}; byDay.forEach(b => map[b.key] = b);
+                    // Build a contiguous 30-day window ending today.
+                    const days = [];
+                    const today = new Date();
+                    for (let i = 29; i >= 0; i--) {
+                        const dt = new Date(today); dt.setDate(today.getDate() - i);
+                        const year = dt.getFullYear();
+                        const month = String(dt.getMonth() + 1).padStart(2, '0');
+                        const day = String(dt.getDate()).padStart(2, '0');
+                        const key = `${year}-${month}-${day}`;
+                        const b = map[key];
+                        days.push({
+                            key,
+                            inTok: b ? (b.input_tokens || 0) : 0,
+                            outTok: b ? (b.output_tokens || 0) : 0,
+                            requests: b ? b.requests : 0,
+                        });
+                    }
+                    const W = 900, H = 220, padL = 8, padR = 8, padT = 16, padB = 28;
+                    const innerW = W - padL - padR, innerH = H - padT - padB;
+                    const maxTok = Math.max(1, ...days.map(x => x.inTok + x.outTok));
+                    const maxReq = Math.max(1, ...days.map(x => x.requests));
+                    const bw = innerW / days.length;
+                    const bars = days.map((x, i) => {
+                        const hIn = (x.inTok / maxTok) * innerH;
+                        const hOut = (x.outTok / maxTok) * innerH;
+                        const bx = (padL + i * bw + bw * 0.15).toFixed(1);
+                        const w = (bw * 0.7).toFixed(1);
+                        const yIn = padT + innerH - hIn;          // input: bottom segment
+                        const yOut = yIn - hOut;                   // output: stacked on top
+                        return `<rect x="${bx}" y="${yIn.toFixed(1)}" width="${w}" height="${hIn.toFixed(1)}" fill="#6366f1" fill-opacity="0.85"></rect>`
+                            + `<rect x="${bx}" y="${yOut.toFixed(1)}" width="${w}" height="${hOut.toFixed(1)}" rx="2" fill="#38bdf8" fill-opacity="0.9"></rect>`;
+                    }).join('');
+                    const linePts = days.map((x, i) => {
+                        const px = padL + i * bw + bw / 2;
+                        const py = padT + innerH - (x.requests / maxReq) * innerH;
+                        return `${px.toFixed(1)},${py.toFixed(1)}`;
+                    }).join(' ');
+                    const xLabels = days.map((x, i) => (i % 5 === 0 || i === days.length - 1)
+                        ? `<text x="${(padL + i * bw + bw / 2).toFixed(1)}" y="${H - 8}" font-size="10" fill="#9ca3af" text-anchor="middle">${x.key.slice(5)}</text>` : '').join('');
+                    const overlays = days.map((x, i) => {
+                        const px = (padL + i * bw).toFixed(1);
+                        return `<rect x="${px}" y="0" width="${bw.toFixed(1)}" height="${padT + innerH}" fill="transparent" class="cursor-pointer hover:fill-gray-100 hover:fill-opacity-10 transition-colors" onmousemove="showChartTooltip(event, '${x.key}', ${x.requests}, ${x.inTok}, ${x.outTok})" onmouseout="hideChartTooltip()"></rect>`;
+                    }).join('');
+                    const hasData = days.some(x => x.inTok > 0 || x.outTok > 0 || x.requests > 0);
+                    return `
+                    <div class="bg-white border border-gray-200 rounded-xl shadow-sm p-6 mb-8 relative">
+                        <div class="flex justify-between items-center mb-4">
+                            <h3 class="text-sm font-semibold text-gray-800">${t('dailyUsage30d')}</h3>
+                            <div class="flex items-center gap-4 text-xs text-gray-500">
+                                <span class="flex items-center gap-1"><span class="inline-block w-3 h-3 rounded-sm bg-indigo-500"></span>${t('tipIn')}</span>
+                                <span class="flex items-center gap-1"><span class="inline-block w-3 h-3 rounded-sm bg-sky-400"></span>${t('tipOut')}</span>
+                                <span class="flex items-center gap-1"><span class="inline-block w-4 h-0.5 bg-emerald-500"></span>${t('colRequests')}</span>
+                            </div>
+                        </div>
+                        ${hasData ? `<svg viewBox="0 0 ${W} ${H}" class="w-full" style="height:220px; overflow: visible;">
+                            ${bars}
+                            <polyline points="${linePts}" fill="none" stroke="#10b981" stroke-width="2" pointer-events="none" />
+                            ${xLabels}
+                            ${overlays}
+                        </svg>` : `<div class="text-center text-gray-400 text-sm py-12">${t('noUsage30d')}</div>`}
+                    </div>`;
+                };
+
+                const okRate = d.total_requests ? Math.round(d.success / d.total_requests * 100) : 0;
+
+                el.innerHTML = `
+                    <div class="grid grid-cols-2 gap-6 mb-6">
+                        ${card(t('totalRequests'), d.total_requests)}
+                        ${card(t('successRate'), okRate + '%', t('successFailDetail', d.success, d.errors))}
+                    </div>
+                    <div class="grid grid-cols-2 lg:grid-cols-3 gap-6 mb-8">
+                        ${card(t('inputTokens'), fmtTok(d.total_input_tokens), (d.total_input_tokens||0).toLocaleString())}
+                        ${card(t('outputTokens'), fmtTok(d.total_output_tokens), (d.total_output_tokens||0).toLocaleString())}
+                        ${card(t('cachedTokens'), fmtTok(d.total_cached_tokens), t('hitRate', hitRate(d.total_cached_tokens||0, d.total_prompt_tokens||0).toFixed(1)))}
+                    </div>
+                    ${dailyChart()}
+                    ${accountHealth()}
+                    <div class="grid grid-cols-1 xl:grid-cols-2 2xl:grid-cols-3 gap-6 mb-8">
+                        ${table(t('byModel'), d.by_model)}
+                        ${providerTable()}
+                        ${table(t('byUser'), d.by_user)}
+                        ${table(t('byAccount'), d.by_account)}
+                    </div>
+                    <div class="bg-white border border-gray-200 rounded-xl shadow-sm overflow-hidden flex flex-col h-[500px]">
+                        <div class="px-6 py-4 border-b border-gray-100 bg-gray-50/50 flex-shrink-0 flex justify-between items-center">
+                            <h3 class="text-sm font-semibold text-gray-800">${t('recentRequests')}</h3>
+                            <span class="text-xs text-gray-400">${t('nItems', d.recent.length)}</span>
+                        </div>
+                        <div class="overflow-auto flex-1 relative">
+                        ${d.recent.length ? `<table class="w-full text-sm text-left">
+                            <thead class="bg-gray-50/90 backdrop-blur-sm text-gray-500 text-xs uppercase sticky top-0 z-10 shadow-sm">
+                                <tr>
+                                    <th class="px-6 py-3 font-medium">${t('colTime')}</th>
+                                    <th class="px-6 py-3 font-medium">${t('colRequester')}</th>
+                                    <th class="px-6 py-3 font-medium">${t('colAccountUsed')}</th>
+                                    <th class="px-6 py-3 font-medium">${t('model')}</th>
+                                    <th class="px-6 py-3 font-medium">${t('colStatus')}</th>
+                                    <th class="px-6 py-3 font-medium text-right">${t('colInputTok')}</th>
+                                    <th class="px-6 py-3 font-medium text-right">${t('colOutputTok')}</th>
+                                </tr>
+                            </thead>
+                            <tbody class="divide-y divide-gray-100">
+                                ${d.recent.map(r => `
+                                <tr class="hover:bg-gray-50 transition">
+                                    <td class="px-6 py-3 text-gray-500">${new Date(r.created_at).toLocaleString()}</td>
+                                    <td class="px-6 py-3 text-gray-900 font-medium">${r.requester}</td>
+                                    <td class="px-6 py-3 text-gray-700">${r.used_account || '—'}</td>
+                                    <td class="px-6 py-3 text-gray-500">${r.model || '—'}</td>
+                                    <td class="px-6 py-3"><span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${r.status === 'success' ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'}">${r.status}</span></td>
+                                    <td class="px-6 py-3 text-right text-gray-500">${(r.input_tokens||0).toLocaleString()}</td>
+                                    <td class="px-6 py-3 text-right text-gray-500">${(r.output_tokens||0).toLocaleString()}</td>
+                                </tr>`).join('')}
+                            </tbody>
+                        </table>` : `<div class="p-6 text-center text-gray-400 text-sm">${t('noRecords')}</div>`}
+                        </div>
+                    </div>
+                    <div class="text-xs text-gray-400 mt-4 text-right">${t('generatedAt', new Date(d.generated_at).toLocaleString())}</div>`;
+            } catch (e) {
+                el.innerHTML = `<div class="text-center text-red-500 py-12">${t('errorPrefix', e.message)}</div>`;
+            }
+        }
+
+        // ---- Capacity Page (burn-down + wall prediction) ----
+        async function loadCapacity() {
+            const el = document.getElementById('capacityContent');
+            el.innerHTML = `<div class="text-center text-gray-400 py-12">${t('computingCapacity')}</div>`;
+            try {
+                const res = await fetch('/v1/stats/capacity', { headers: { 'Authorization': `Bearer ${gatewayToken()}` } });
+                const d = await res.json();
+                if (!res.ok) throw new Error(d.error || t('loadFailed'));
+                if (!(d.providers || []).length) {
+                    el.innerHTML = `<div class="text-center text-gray-400 py-12 border-2 border-dashed border-gray-200 rounded-xl">${t('poolEmptyImport')}</div>`;
+                    return;
+                }
+                el.innerHTML = d.providers.map(p => renderProviderCapacity(p)).join('')
+                    + `<div class="text-xs text-gray-400 mt-4 text-right">${t('generatedAtRetention', new Date(d.generated_at).toLocaleString(), d.retention_hours)}</div>`;
+            } catch (e) {
+                el.innerHTML = `<div class="text-center text-red-500 py-12">${t('errorPrefix', e.message)}</div>`;
+            }
+        }
+
+        function capProviderMeta() {
+            return {
+                claude: { name: 'Claude', badge: 'bg-purple-100 text-purple-700', primary: t('win5h'), secondary: t('winWeek') },
+                codex:  { name: 'Codex',  badge: 'bg-blue-100 text-blue-700',     primary: t('win5h'), secondary: t('winWeek') },
+                cursor: { name: 'Cursor', badge: 'bg-emerald-100 text-emerald-700', primary: t('winMonthQuota'), secondary: '' },
+            };
+        }
+
+        function fmtMinutes(m) {
+            if (m == null) return '—';
+            if (m <= 0) return t('now');
+            if (m < 60) return `${m}m`;
+            const h = Math.floor(m / 60);
+            if (h < 24) return `${h}h ${m % 60}m`;
+            return `${Math.floor(h / 24)}d ${h % 24}h`;
+        }
+        function fmtBurn(b) {
+            if (b == null) return '—';
+            if (b === 0) return '0%/h';
+            return (b < 0.1 ? b.toFixed(2) : b.toFixed(1)) + '%/h';
+        }
+
+        // Burn-down line chart: pool average REMAINING percent over time (so the
+        // line burns downward toward the 5% hard-exclude floor).
+        function capacityChart(series, meta) {
+            const pts = (series || []).filter(s => s.primary != null || s.secondary != null);
+            if (pts.length < 2) {
+                return `<div class="text-center text-gray-400 text-sm py-10">${t('notEnoughHistory')}</div>`;
+            }
+            const W = 900, H = 200, padL = 34, padR = 8, padT = 10, padB = 24;
+            const innerW = W - padL - padR, innerH = H - padT - padB;
+            const t0 = new Date(pts[0].at).getTime();
+            const t1 = new Date(pts[pts.length - 1].at).getTime();
+            const span = Math.max(1, t1 - t0);
+            const x = (iso) => padL + ((new Date(iso).getTime() - t0) / span) * innerW;
+            // y maps REMAINING (100-used): 100% remaining at top, 0 at bottom.
+            const yRemain = (usedPct) => padT + (1 - (100 - usedPct) / 100) * innerH;
+            const line = (pick, color) => {
+                const segs = pts.filter(s => pick(s) != null)
+                    .map(s => `${x(s.at).toFixed(1)},${yRemain(pick(s)).toFixed(1)}`);
+                return segs.length >= 2 ? `<polyline points="${segs.join(' ')}" fill="none" stroke="${color}" stroke-width="2"/>` : '';
+            };
+            const grid = [0, 25, 50, 75, 100].map(rem => {
+                const gy = padT + (1 - rem / 100) * innerH;
+                return `<line x1="${padL}" y1="${gy}" x2="${W - padR}" y2="${gy}" stroke="#e5e7eb" stroke-width="1"/>`
+                    + `<text x="${padL - 6}" y="${gy + 3}" font-size="10" fill="#9ca3af" text-anchor="end">${rem}%</text>`;
+            }).join('');
+            // The scheduler's 95%-used hard-exclude line = 5% remaining.
+            const hardY = padT + (1 - 5 / 100) * innerH;
+            const hard = `<line x1="${padL}" y1="${hardY}" x2="${W - padR}" y2="${hardY}" stroke="#ef4444" stroke-width="1" stroke-dasharray="4 3"/>`
+                + `<text x="${W - padR}" y="${hardY - 4}" font-size="9" fill="#ef4444" text-anchor="end">${t('schedExcludeLine')}</text>`;
+            const xLabels = [pts[0], pts[Math.floor(pts.length / 2)], pts[pts.length - 1]].map(s =>
+                `<text x="${x(s.at).toFixed(1)}" y="${H - 6}" font-size="10" fill="#9ca3af" text-anchor="middle">${new Date(s.at).toLocaleString([], { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</text>`
+            ).join('');
+            const legend = `<div class="flex items-center gap-4 text-xs text-gray-500 mb-1">
+                <span class="flex items-center gap-1"><span class="inline-block w-4 h-0.5 bg-indigo-500"></span>${t('leftSuffix', meta.primary)}</span>
+                ${meta.secondary ? `<span class="flex items-center gap-1"><span class="inline-block w-4 h-0.5 bg-fuchsia-500"></span>${t('leftSuffix', meta.secondary)}</span>` : ''}
+            </div>`;
+            return legend + `<svg viewBox="0 0 ${W} ${H}" class="w-full" style="height:200px">
+                ${grid}${hard}
+                ${line(s => s.primary, '#6366f1')}
+                ${meta.secondary ? line(s => s.secondary, '#d946ef') : ''}
+                ${xLabels}
+            </svg>`;
+        }
+
+        function capacityWindowCell(w) {
+            if (!w) return '<td class="px-4 py-3 text-gray-400">—</td>';
+            const pct = w.used_percent;
+            const col = pctColor(pct);
+            const eta = w.exhaust_before_reset
+                ? `<span class="text-red-600 font-medium" title="${t('tipExhaustBeforeReset')}">${t('exhaustIn', fmtMinutes(w.minutes_to_exhaust))}</span>`
+                : (w.minutes_to_exhaust != null ? `<span class="text-gray-400" title="${t('tipResetFirst')}">${t('resetFirst')}</span>` : `<span class="text-gray-400">${t('noBurn')}</span>`);
+            return `<td class="px-4 py-3">
+                <div class="flex items-center gap-2">
+                    <div class="w-16 h-1.5 bg-gray-100 rounded-full overflow-hidden flex-shrink-0"><div class="h-full ${col} rounded-full" style="width:${Math.min(100, pct)}%"></div></div>
+                    <span class="text-gray-700 font-medium whitespace-nowrap">${pct.toFixed(1)}%</span>
+                </div>
+                <div class="text-[10px] text-gray-400 mt-1 whitespace-nowrap">${fmtBurn(w.burn_rate_pct_per_hour)} · ${eta} · ${t('resetPrefix', fmtReset(w.reset_after_seconds))}</div>
+            </td>`;
+        }
+
+        function renderProviderCapacity(p) {
+            const meta = capProviderMeta()[p.provider] || { name: p.provider, badge: 'bg-gray-100 text-gray-700', primary: t('primaryWindow'), secondary: t('secondaryWindow') };
+            const pool = p.pool || {};
+            const fmtTokShort = (v) => { v = v || 0; if (v >= 1e9) return (v/1e9).toFixed(1)+'B'; if (v >= 1e6) return (v/1e6).toFixed(1)+'M'; if (v >= 1e3) return (v/1e3).toFixed(1)+'K'; return String(v); };
+
+            // Wall verdict: the headline of this whole page.
+            let wall;
+            if (pool.pool_exhaust_at) {
+                wall = `<div class="text-2xl font-bold text-red-600">${new Date(pool.pool_exhaust_at).toLocaleString([], { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</div>
+                    <div class="text-xs text-red-400 mt-1">${t('wallExhaustHint')}</div>`;
+            } else if (pool.accounts_at_risk > 0) {
+                wall = `<div class="text-2xl font-bold text-amber-600">${t('accountsWillHitWall', pool.accounts_at_risk)}</div>
+                    <div class="text-xs text-gray-400 mt-1">${t('earliestHint', pool.earliest_exhaust_label || '', fmtMinutes(pool.earliest_exhaust_minutes))}</div>`;
+            } else {
+                wall = `<div class="text-2xl font-bold text-green-600">${t('noWallRisk')}</div>
+                    <div class="text-xs text-gray-400 mt-1">${t('allWindowsResetFirst')}</div>`;
+            }
+
+            const statCard = (label, html) => `<div class="bg-white border border-gray-200 rounded-xl p-5 shadow-sm">
+                <div class="text-xs font-medium text-gray-500 mb-2">${label}</div>${html}</div>`;
+            const pctCard = (label, used, burn) => statCard(label, used == null
+                ? '<div class="text-2xl font-bold text-gray-300">—</div>'
+                : `<div class="text-2xl font-bold text-gray-900">${used.toFixed(1)}%</div>
+                   <div class="text-xs text-gray-400 mt-1">${t('burnRate', fmtBurn(burn))}</div>`);
+
+            const rows = (p.accounts || []).map(a => {
+                const statusMeta = {
+                    healthy:  ['bg-green-50 text-green-700', t('cHealthy')], cooldown: ['bg-amber-50 text-amber-700', t('cCooldown')],
+                    degraded: ['bg-orange-50 text-orange-700', t('cDegraded')], disabled: ['bg-gray-100 text-gray-500', t('cDisabled')],
+                    dead:     ['bg-red-50 text-red-700', t('cDead')],
+                }[a.status] || ['bg-gray-50 text-gray-600', a.status];
+                const risk = a.primary && a.primary.exhaust_before_reset
+                    ? `<span class="px-1.5 py-0.5 bg-red-100 text-red-700 text-[10px] font-bold rounded-full">${t('hittingWall')}</span>`
+                    : (a.primary && a.primary.used_percent >= 95 ? `<span class="px-1.5 py-0.5 bg-red-100 text-red-700 text-[10px] font-bold rounded-full">${t('excluded')}</span>` : '');
+                return `<tr class="hover:bg-gray-50 transition">
+                    <td class="px-4 py-3">
+                        <div class="text-gray-800 font-medium truncate max-w-[200px]" title="${a.owner_user_id}/${a.account_label}">${a.account_label}</div>
+                        <div class="text-[10px] text-gray-400">${a.owner_user_id}${a.share_enabled ? t('sharedSuffix') : t('privateSuffix')}</div>
+                    </td>
+                    <td class="px-4 py-3"><span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-medium ${statusMeta[0]}">${statusMeta[1]}</span> ${risk}</td>
+                    ${capacityWindowCell(a.primary)}
+                    ${meta.secondary ? capacityWindowCell(a.secondary) : ''}
+                </tr>`;
+            }).join('');
+
+            return `<div class="mb-10">
+                <div class="flex items-center gap-2 mb-4">
+                    <span class="px-2 py-0.5 ${meta.badge} text-xs font-bold rounded-full uppercase">${meta.name}</span>
+                    <span class="text-xs text-gray-400">${t('usableCount', pool.accounts_usable, pool.accounts_total)}${pool.accounts_at_risk ? t('atRiskSuffix', pool.accounts_at_risk) : ''}</span>
+                </div>
+                <div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-5">
+                    ${statCard(t('wallPrediction'), wall)}
+                    ${pctCard(t('avgUsage', meta.primary), pool.avg_primary_used_percent, pool.avg_primary_burn_pct_per_hour)}
+                    ${meta.secondary ? pctCard(t('avgUsage', meta.secondary), pool.avg_secondary_used_percent, pool.avg_secondary_burn_pct_per_hour) : statCard('', '<div class="text-2xl font-bold text-gray-300">—</div>')}
+                    ${statCard(t('tokenUsage'), `<div class="text-2xl font-bold text-gray-900">${fmtTokShort(pool.billable_tokens_last_24h)}<span class="text-sm font-medium text-gray-400">/24h</span></div>
+                        <div class="text-xs text-gray-400 mt-1">${t('last1h', fmtTokShort(pool.billable_tokens_last_1h))}</div>`)}
+                </div>
+                <div class="bg-white border border-gray-200 rounded-xl shadow-sm p-6 mb-5">
+                    <h3 class="text-sm font-semibold text-gray-800 mb-3">${t('poolBurndown')}</h3>
+                    ${capacityChart(p.series, meta)}
+                </div>
+                <div class="bg-white border border-gray-200 rounded-xl shadow-sm overflow-hidden">
+                    <table class="w-full text-sm text-left">
+                        <thead class="bg-gray-50/90 text-gray-400 text-xs uppercase">
+                            <tr>
+                                <th class="px-4 py-2 font-medium">${t('colAccount')}</th>
+                                <th class="px-4 py-2 font-medium">${t('colStatus')}</th>
+                                <th class="px-4 py-2 font-medium">${meta.primary}</th>
+                                ${meta.secondary ? `<th class="px-4 py-2 font-medium">${meta.secondary}</th>` : ''}
+                            </tr>
+                        </thead>
+                        <tbody class="divide-y divide-gray-100">${rows || ''}</tbody>
+                    </table>
+                </div>
+            </div>`;
+        }
+
+        document.getElementById('connectLocalBtn').addEventListener('click', async () => {
+            const btn = document.getElementById('connectLocalBtn');
+            const originalText = btn.innerHTML;
+            btn.innerHTML = t('importing');
+            btn.disabled = true;
+
+            try {
+                const res = await fetch('/v1/provider/connect/codex/local', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${gatewayToken()}`
+                    },
+                    body: JSON.stringify({
+                        account_label: `${getUserId()}`,
+                        share_enabled: true,
+                        daily_token_limit: null
+                    })
+                });
+                const data = await res.json();
+                if (res.ok) {
+                    showToast(t('codexImported'));
+                    loadAccounts();
+                } else {
+                    showToast(data.error || t('importFailed'), 'error');
+                }
+            } catch (e) {
+                showToast(e.message, 'error');
+            } finally {
+                btn.innerHTML = originalText;
+                btn.disabled = false;
+            }
+        });
+
+        document.getElementById('connectClaudeLocalBtn').addEventListener('click', async () => {
+            const btn = document.getElementById('connectClaudeLocalBtn');
+            const originalText = btn.innerHTML;
+            btn.innerHTML = t('importing');
+            btn.disabled = true;
+
+            try {
+                const res = await fetch('/v1/provider/connect/claude/local', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${gatewayToken()}`
+                    },
+                    body: JSON.stringify({
+                        account_label: `${getUserId()}`,
+                        share_enabled: true,
+                        daily_token_limit: null
+                    })
+                });
+                const data = await res.json();
+                if (res.ok) {
+                    showToast(t('claudeImported'));
+                    loadAccounts();
+                } else {
+                    showToast(data.error || t('importFailed'), 'error');
+                }
+            } catch (e) {
+                showToast(e.message, 'error');
+            } finally {
+                btn.innerHTML = originalText;
+                btn.disabled = false;
+            }
+        });
+
+        document.getElementById('connectCursorBtn').addEventListener('click', async () => {
+            // One-click: read cursorAuth/accessToken straight from the local
+            // Cursor state.vscdb (same UX as Codex/Claude local import).
+            const btn = document.getElementById('connectCursorBtn');
+            const originalText = btn.innerHTML;
+            btn.innerHTML = t('importing');
+            btn.disabled = true;
+
+            try {
+                const res = await fetch('/v1/provider/connect/cursor/local', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${gatewayToken()}`
+                    },
+                    body: JSON.stringify({
+                        account_label: '',
+                        share_enabled: true,
+                        daily_token_limit: null
+                    })
+                });
+                const data = await res.json();
+                if (res.ok) {
+                    showToast(t('cursorImported'));
+                    loadAccounts();
+                } else {
+                    showToast(data.error || t('importFailed'), 'error');
+                }
+            } catch (e) {
+                showToast(e.message, 'error');
+            } finally {
+                btn.innerHTML = originalText;
+                btn.disabled = false;
+            }
+        });
+
+        // Playground Page
+        async function loadModels(manual = false) {
+            const select = document.getElementById('model');
+            const provider = document.getElementById('provider').value || 'codex';
+            const fallback = provider === 'claude' ? 'claude-sonnet-4-5' : provider === 'cursor' ? 'cursor' : 'gpt-5.5';
+            select.innerHTML = `<option>${t('loading')}</option>`;
+            try {
+                const res = await fetch(`/v1/provider/models/${provider}`, { headers: { 'Authorization': `Bearer ${gatewayToken()}` } });
+                const data = await res.json();
+                if (res.ok && Array.isArray(data.models) && data.models.length) {
+                    select.innerHTML = '';
+                    data.models.forEach(m => { const opt = document.createElement('option'); opt.value = m.slug; opt.textContent = m.display_name; select.appendChild(opt); });
+                    window.__modelsLoadedFor = provider;
+                    if (manual) showToast(t('modelsRefreshed'));
+                } else {
+                    select.innerHTML = `<option value="${fallback}">${t('fallbackSuffix', fallback)}</option>`;
+                    window.__modelsLoadedFor = null;
+                    if (!res.ok && manual) showToast(data.error || t('fetchModelsFailed'), 'error');
+                }
+            } catch (e) {
+                select.innerHTML = `<option value="${fallback}">${t('fallbackSuffix', fallback)}</option>`;
+                window.__modelsLoadedFor = null;
+                if (manual) showToast(t('networkError'), 'error');
+            }
+        }
+        function onProviderChange() { loadModels(); }
+        document.getElementById('refreshModels').addEventListener('click', (e) => { e.preventDefault(); loadModels(true); });
+
+        document.getElementById('gatewayForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            renderTerminal('responseOutput', t('sendingRequest'));
+
+            const provider = document.getElementById('provider').value || 'codex';
+            const payload = {
+                prompt: document.getElementById('prompt').value,
+                model: document.getElementById('model').value,
+                preferred_provider: provider,
+            };
+
+            try {
+                const res = await fetch('/v1/gateway/relay', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${gatewayToken()}`
+                    },
+                    body: JSON.stringify(payload)
+                });
+                const data = await res.json();
+                renderRelayResult(data, res.ok);
+            } catch (e) {
+                renderTerminal('responseOutput', t('errorPrefix', e.message), true);
+            }
+        });
+
+        // Client Setup Page
+        document.getElementById('applyCodex').addEventListener('click', async () => {
+            renderTerminal('setupOutput', t('switchingShared'));
+            try {
+                const res = await fetch('/v1/client/codex/apply', {
+                    method: 'POST',
+                    headers: { 'Authorization': `Bearer ${gatewayToken()}` }
+                });
+                const data = await res.json();
+                renderTerminal('setupOutput', JSON.stringify(data, null, 2), !res.ok);
+                if (res.ok) showToast(t('switchedShared'));
+            } catch (e) {
+                renderTerminal('setupOutput', t('errorPrefix', e.message), true);
+            }
+        });
+
+        document.getElementById('restoreCodex').addEventListener('click', async () => {
+            renderTerminal('setupOutput', t('switchingPersonal'));
+            try {
+                const res = await fetch('/v1/client/codex/restore', { method: 'POST' });
+                const data = await res.json();
+                renderTerminal('setupOutput', JSON.stringify(data, null, 2), !res.ok);
+                if (res.ok) showToast(t('switchedPersonal'));
+            } catch (e) {
+                renderTerminal('setupOutput', t('errorPrefix', e.message), true);
+            }
+        });
+
+        document.getElementById('applyClaude').addEventListener('click', async () => {
+            renderTerminal('setupOutput', t('switchingSharedClaude'));
+            try {
+                const res = await fetch('/v1/client/claude/apply', {
+                    method: 'POST',
+                    headers: { 'Authorization': `Bearer ${gatewayToken()}` }
+                });
+                const data = await res.json();
+                renderTerminal('setupOutput', JSON.stringify(data, null, 2), !res.ok);
+                if (res.ok) showToast(t('switchedSharedClaude'));
+            } catch (e) {
+                renderTerminal('setupOutput', t('errorPrefix', e.message), true);
+            }
+        });
+
+        document.getElementById('restoreClaude').addEventListener('click', async () => {
+            renderTerminal('setupOutput', t('switchingPersonalClaude'));
+            try {
+                const res = await fetch('/v1/client/claude/restore', { method: 'POST' });
+                const data = await res.json();
+                renderTerminal('setupOutput', JSON.stringify(data, null, 2), !res.ok);
+                if (res.ok) showToast(t('switchedPersonalClaude'));
+            } catch (e) {
+                renderTerminal('setupOutput', t('errorPrefix', e.message), true);
+            }
+        });
+
+        document.getElementById('applyCursor').addEventListener('click', async () => {
+            renderTerminal('setupOutput', t('switchingSharedCursor'));
+            try {
+                const res = await fetch('/v1/client/cursor/apply', {
+                    method: 'POST',
+                    headers: { 'Authorization': `Bearer ${gatewayToken()}` }
+                });
+                const data = await res.json();
+                renderTerminal('setupOutput', JSON.stringify(data, null, 2), !res.ok);
+                if (res.ok) showToast(t('switchedSharedCursor'));
+            } catch (e) {
+                renderTerminal('setupOutput', t('errorPrefix', e.message), true);
+            }
+        });
+
+        document.getElementById('restoreCursor').addEventListener('click', async () => {
+            renderTerminal('setupOutput', t('switchingPersonalCursor'));
+            try {
+                const res = await fetch('/v1/client/cursor/restore', { method: 'POST' });
+                const data = await res.json();
+                renderTerminal('setupOutput', JSON.stringify(data, null, 2), !res.ok);
+                if (res.ok) showToast(t('switchedPersonalCursor'));
+            } catch (e) {
+                renderTerminal('setupOutput', t('errorPrefix', e.message), true);
+            }
+        });
+
+        // Init: localize the default prompt only when the user hasn't typed
+        // anything, then apply static labels / language button before first load.
+        (function initLang() {
+            // The textarea ships with the zh default; swap it for the active
+            // language's default (covers en on first load).
+            syncDefaultPrompt();
+            applyStaticI18n();
+            updateLangButton();
+        })();
+        loadAccounts();
+    </script>
+</body>
+</html>

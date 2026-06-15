@@ -1,0 +1,16 @@
+# Local data & secrets — contains real OAuth tokens and account emails
+data/
+
+# Build artifacts
+target/
+.cargo-home/
+
+# Logs (may contain account labels / emails)
+*.log
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+.env
+.env.*
