@@ -13,13 +13,15 @@ const SECONDARY_HARD_EXCLUDE_PERCENT: f64 = 99.0;
 /// Whether a provider's usage percentage represents a true rate-limit window
 /// that should hard-exclude / cool down an account at high utilization.
 ///
-/// Cursor is the exception: its percentage is the *included spend allowance*
-/// (e.g. the $20 plan credit), not a usability cap — team/on-demand accounts
-/// keep working past 100% by paying for overage. So a Cursor account is never
-/// excluded on its usage percent; a genuine block surfaces as a failed request
-/// and cools the account down through the normal failure path instead.
+/// Cursor and Ollama are the exceptions:
+/// - Cursor's percentage is the *included spend allowance* (e.g. the $20 plan
+///   credit), not a usability cap — team/on-demand accounts keep working past
+///   100% by paying for overage. A genuine block surfaces as a failed request
+///   and cools the account down through the normal failure path instead.
+/// - Ollama is a local, non-metered upstream: it has no rate-limit windows at
+///   all (and never carries a snapshot), so usage percent must never gate it.
 pub(crate) fn usage_percent_gates_selection(provider: &str) -> bool {
-    provider != "cursor"
+    !matches!(provider, "cursor" | "ollama" | "glm")
 }
 
 /// Sticky-session rebalance thresholds: a bound account is "pressured" when
@@ -594,6 +596,8 @@ mod share_policy_tests {
             id_token: String::new(),
             account_id: String::new(),
             api_key: String::new(),
+            base_url: String::new(),
+            base_url_alt: String::new(),
             share_enabled: share,
             share_limit_percent: limit,
             daily_token_limit: None,

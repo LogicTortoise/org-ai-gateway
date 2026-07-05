@@ -48,21 +48,7 @@ pub(crate) async fn index_html() -> Html<&'static str> {
 pub(crate) async fn donate_script(headers: HeaderMap) -> impl IntoResponse {
     const SCRIPT: &str = include_str!("../../assets/donate.sh");
 
-    let header_str = |name: &str| -> Option<String> {
-        headers
-            .get(name)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-    };
-
-    let proto = header_str("x-forwarded-proto")
-        .map(|p| p.split(',').next().unwrap_or("http").trim().to_string())
-        .unwrap_or_else(|| "http".to_string());
-    let host = header_str("x-forwarded-host")
-        .or_else(|| header_str("host"))
-        .unwrap_or_else(|| "127.0.0.1:8080".to_string());
-    let base_url = format!("{}://{}", proto, host);
+    let base_url = crate::util::request_base_url(&headers);
 
     // replacen(.., 1): only the default-assignment line carries the injected URL.
     // The later guard keeps the literal sentinel so a script run without injection

@@ -6,6 +6,7 @@ use crate::client_config::merge_gateway_into_config;
 use crate::provider::codex::codex_bootstrap_payload;
 use crate::util::expand_home;
 use crate::util::path_exists;
+use crate::util::request_base_url;
 
 pub(crate) async fn codex_bootstrap(headers: HeaderMap) -> impl IntoResponse {
     let user_id = match extract_user_id(&headers) {
@@ -19,7 +20,8 @@ pub(crate) async fn codex_bootstrap(headers: HeaderMap) -> impl IntoResponse {
         }
     };
 
-    let payload = match codex_bootstrap_payload(&user_id) {
+    let base_url = format!("{}/v1", request_base_url(&headers));
+    let payload = match codex_bootstrap_payload(&user_id, &base_url) {
         Ok(v) => v,
         Err(e) => {
             return (
@@ -81,7 +83,8 @@ pub(crate) async fn codex_apply(headers: HeaderMap) -> impl IntoResponse {
         backup_created = true;
     }
 
-    let merged = match merge_gateway_into_config(&existing) {
+    let base_url = format!("{}/v1", request_base_url(&headers));
+    let merged = match merge_gateway_into_config(&existing, &base_url) {
         Ok(v) => v,
         Err(e) => {
             return (
@@ -217,7 +220,8 @@ pub(crate) async fn claude_apply(headers: HeaderMap) -> impl IntoResponse {
     // the client config, so the local Claude points at the gateway with a real
     // owner-bound credential rather than a forgeable `user:<id>`.
     let gateway_token = raw_bearer(&headers).unwrap_or_else(|| format!("user:{}", user_id));
-    let merged = match merge_gateway_into_claude_settings(&existing, &gateway_token) {
+    let base_url = request_base_url(&headers);
+    let merged = match merge_gateway_into_claude_settings(&existing, &gateway_token, &base_url) {
         Ok(v) => v,
         Err(e) => {
             return (
@@ -316,8 +320,6 @@ const CURSOR_REACTIVE_KEY: &str =
     "src.vs.platform.reactivestorage.browser.reactiveStorageServiceImpl.persistentStorage.applicationUser";
 /// ItemTable key holding the custom OpenAI API key.
 const CURSOR_OPENAI_KEY: &str = "cursorAuth/openAIKey";
-/// Base URL the gateway exposes its OpenAI-compatible endpoint under.
-const GATEWAY_OPENAI_BASE: &str = "http://127.0.0.1:8080/v1";
 
 fn cursor_db_path() -> String {
     if cfg!(target_os = "windows") {
@@ -430,8 +432,9 @@ pub(crate) async fn cursor_apply(headers: HeaderMap) -> impl IntoResponse {
     }
 
     // Inject gateway routing.
+    let base_url = format!("{}/v1", request_base_url(&headers));
     if let Value::Object(map) = &mut blob {
-        map.insert("openAIBaseUrl".into(), Value::String(GATEWAY_OPENAI_BASE.into()));
+        map.insert("openAIBaseUrl".into(), Value::String(base_url.clone()));
         map.insert("useOpenAIKey".into(), Value::Bool(true));
     }
     let new_blob = match serde_json::to_string(&blob) {
@@ -455,7 +458,7 @@ pub(crate) async fn cursor_apply(headers: HeaderMap) -> impl IntoResponse {
             "backup_created": backup_created,
             "db_path": db,
             "backup_path": backup_path,
-            "base_url": GATEWAY_OPENAI_BASE,
+            "base_url": base_url,
             "note": "已把本机 Cursor 的 OpenAI Base URL 指向网关并启用自定义 Key。请完全退出并重新打开 Cursor 后生效。",
             "caveat": "注意：Cursor 仅在 chat/plan 面板使用自定义 Base URL，主力 Agent/Tab 仍走 Cursor 自有后端（Cursor 的设计限制，非网关问题）。"
         })),

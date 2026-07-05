@@ -186,6 +186,19 @@ pub(crate) struct UpstreamAccount {
     // Backward compatibility for older records that used api_key.
     #[serde(default)]
     pub(crate) api_key: String,
+    /// Upstream base URL for endpoint-style providers (ollama, e.g.
+    /// `http://127.0.0.1:11434`). Empty for the OAuth/account providers
+    /// (codex/claude/cursor), which target a hardcoded upstream. `#[serde(default)]`
+    /// keeps older records (written before this field existed) loadable.
+    #[serde(default)]
+    pub(crate) base_url: String,
+    /// Secondary upstream base URL for providers that expose two protocol
+    /// endpoints. Today only GLM uses it: `base_url` holds the OpenAI-compatible
+    /// `/chat/completions` prefix, `base_url_alt` the Anthropic-compatible
+    /// `/v1/messages` prefix. Empty for every other provider. `#[serde(default)]`
+    /// keeps older records (written before this field existed) loadable.
+    #[serde(default)]
+    pub(crate) base_url_alt: String,
     pub(crate) share_enabled: bool,
     /// Cap on how far NON-OWNER traffic may drive this account's usage windows,
     /// in percent (e.g. 60 = others stop being routed here once either window

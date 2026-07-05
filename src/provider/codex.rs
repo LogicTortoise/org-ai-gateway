@@ -2,7 +2,6 @@ use crate::prelude::*;
 use crate::auth::jwt_chatgpt_account_id;
 use crate::auth::jwt_email;
 use crate::auth::jwt_exp;
-use crate::client_config::GATEWAY_BASE_URL;
 use crate::client_config::GATEWAY_PROVIDER_KEY;
 use crate::sse::extract_output_text;
 use crate::sse::extract_output_text_from_sse;
@@ -365,7 +364,10 @@ pub(crate) fn parse_codex_auth_json(raw: &str) -> Result<ParsedCodexCreds, Strin
 }
 
 
-pub(crate) fn codex_bootstrap_payload(user_id: &str) -> Result<CodexBootstrapResponse, String> {
+pub(crate) fn codex_bootstrap_payload(
+    user_id: &str,
+    base_url: &str,
+) -> Result<CodexBootstrapResponse, String> {
     // Display-only snippet describing what `应用` merges into config.toml.
     let config_toml = format!(
         "# 仅合并以下内容进 ~/.codex/config.toml（其余保持不变）\n\
@@ -376,7 +378,7 @@ pub(crate) fn codex_bootstrap_payload(user_id: &str) -> Result<CodexBootstrapRes
          wire_api = \"responses\"\n\
          requires_openai_auth = true\n",
         key = GATEWAY_PROVIDER_KEY,
-        url = GATEWAY_BASE_URL,
+        url = base_url,
     );
 
     let steps = vec![

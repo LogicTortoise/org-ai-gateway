@@ -1,8 +1,6 @@
 use crate::prelude::*;
 
 pub(crate) const GATEWAY_PROVIDER_KEY: &str = "org-ai-gateway";
-/// Where the local client should send `responses`/`models` calls.
-pub(crate) const GATEWAY_BASE_URL: &str = "http://127.0.0.1:8080/v1";
 
 /// Merge the gateway model-provider into an existing `config.toml`, preserving
 /// every other key (projects, plugins, model, marketplaces, ...).
@@ -12,7 +10,12 @@ pub(crate) const GATEWAY_BASE_URL: &str = "http://127.0.0.1:8080/v1";
 /// account, token refresh) keep hitting the real server and the client stays
 /// healthy. Crucially we never write `auth.json`, so the client keeps its real
 /// identity and Codex's account-mismatch guard never fires.
-pub(crate) fn merge_gateway_into_config(existing: &str) -> Result<String, String> {
+///
+/// `base_url` is where the local client should send `responses`/`models`
+/// calls — the gateway's own `/v1`, derived from the request that asked for
+/// this config rather than hardcoded, since the bind address/port varies by
+/// deployment.
+pub(crate) fn merge_gateway_into_config(existing: &str, base_url: &str) -> Result<String, String> {
     use toml_edit::{value, DocumentMut, Item, Table};
 
     let mut doc: DocumentMut = existing
@@ -31,7 +34,7 @@ pub(crate) fn merge_gateway_into_config(existing: &str) -> Result<String, String
 
     let mut provider = Table::new();
     provider["name"] = value("Codex via org-ai-gateway");
-    provider["base_url"] = value(GATEWAY_BASE_URL);
+    provider["base_url"] = value(base_url);
     provider["wire_api"] = value("responses");
     provider["requires_openai_auth"] = value(true);
     providers[GATEWAY_PROVIDER_KEY] = Item::Table(provider);
@@ -42,8 +45,14 @@ pub(crate) fn merge_gateway_into_config(existing: &str) -> Result<String, String
 
 /// `gateway_token` is the credential the local client should present to the
 /// gateway — whatever bearer the caller authenticated with (the `user:<id>`
-/// form).
-pub(crate) fn merge_gateway_into_claude_settings(existing: &str, gateway_token: &str) -> Result<String, String> {
+/// form). `base_url` is the gateway's own root (no `/v1` suffix — that's
+/// appended by the Claude client itself), derived from the request rather
+/// than hardcoded.
+pub(crate) fn merge_gateway_into_claude_settings(
+    existing: &str,
+    gateway_token: &str,
+    base_url: &str,
+) -> Result<String, String> {
     let mut root: Value = if existing.trim().is_empty() {
         json!({})
     } else {
@@ -69,7 +78,7 @@ pub(crate) fn merge_gateway_into_claude_settings(existing: &str, gateway_token: 
 
     env_obj.insert(
         "ANTHROPIC_BASE_URL".to_string(),
-        Value::String("http://127.0.0.1:8080".to_string()),
+        Value::String(base_url.to_string()),
     );
     env_obj.insert(
         "CLAUDE_CODE_OAUTH_TOKEN".to_string(),

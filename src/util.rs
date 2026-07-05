@@ -1,5 +1,31 @@
 use crate::prelude::*;
 
+/// Derive the gateway's externally-visible base URL (`scheme://host[:port]`,
+/// no trailing slash) from the inbound request's own headers, instead of a
+/// hardcoded host/port. `GATEWAY_BIND_ADDR` can be (and on some deployments
+/// is) different from the well-known default, and behind a reverse proxy the
+/// bind address isn't the public one either — the request the client itself
+/// just sent already carries the address that worked, so honor that.
+/// Honors `X-Forwarded-Proto`/`X-Forwarded-Host` so it produces the public
+/// URL when behind a trusted edge/reverse proxy.
+pub(crate) fn request_base_url(headers: &HeaderMap) -> String {
+    let header_str = |name: &str| -> Option<String> {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+
+    let proto = header_str("x-forwarded-proto")
+        .map(|p| p.split(',').next().unwrap_or("http").trim().to_string())
+        .unwrap_or_else(|| "http".to_string());
+    let host = header_str("x-forwarded-host")
+        .or_else(|| header_str("host"))
+        .unwrap_or_else(|| "127.0.0.1:8080".to_string());
+    format!("{}://{}", proto, host)
+}
+
 pub(crate) fn truncate_text(input: &str, max_chars: usize) -> String {
     let mut out: String = input.chars().take(max_chars).collect();
     if input.chars().count() > max_chars {

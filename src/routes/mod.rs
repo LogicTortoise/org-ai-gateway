@@ -2,6 +2,7 @@
 pub(crate) mod accounts;
 pub(crate) mod apikeys;
 pub(crate) mod capacity;
+pub(crate) mod chains_api;
 pub(crate) mod health;
 pub(crate) mod mock_auth;
 pub(crate) mod models_api;

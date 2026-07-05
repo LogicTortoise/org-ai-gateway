@@ -237,6 +237,8 @@ mod cyber_tests {
                 id_token: String::new(),
                 account_id: String::new(),
                 api_key: String::new(),
+                base_url: String::new(),
+                base_url_alt: String::new(),
                 share_enabled: true,
                 share_limit_percent: None,
                 daily_token_limit: None,

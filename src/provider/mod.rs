@@ -1,8 +1,11 @@
 use crate::prelude::*;
 use crate::pool::storage::persist_all_accounts;
+pub(crate) mod chains;
 pub(crate) mod claude;
 pub(crate) mod codex;
 pub(crate) mod cursor;
+pub(crate) mod glm;
+pub(crate) mod ollama;
 
 /// The upstream providers the gateway can route to. Accounts persist the
 /// provider as a string (`UpstreamAccount.provider`), so this enum is the
@@ -12,6 +15,20 @@ pub(crate) enum Provider {
     Codex,
     Claude,
     Cursor,
+    /// A local model server speaking the Ollama API (`/api/chat`). Unlike the
+    /// others it has no OAuth/account/rate-limit machinery: an "account" is just
+    /// a base URL, it's free, and it serves as both a directly-selectable
+    /// provider (`model=ollama/<name>`) and the whole-pool fallback.
+    Ollama,
+    /// GLM (Zhipu / z.ai). An API-key endpoint provider (no OAuth/refresh). It
+    /// can serve BOTH client protocols: Claude-format traffic (`/v1/messages`)
+    /// rides GLM's Anthropic-compatible endpoint as a near-native buffered
+    /// passthrough, while Codex-format traffic (`/v1/responses`) goes through the
+    /// shared format adapter onto GLM's OpenAI-compatible `/chat/completions`.
+    /// An "account" is a base URL (OpenAI-compat) + optional alt base URL
+    /// (Anthropic-compat) + an api key. Real token usage is returned by both
+    /// endpoints, so audited usage is exact.
+    Glm,
 }
 
 impl Provider {
@@ -20,6 +37,8 @@ impl Provider {
             "codex" => Some(Self::Codex),
             "claude" => Some(Self::Claude),
             "cursor" => Some(Self::Cursor),
+            "ollama" => Some(Self::Ollama),
+            "glm" => Some(Self::Glm),
             _ => None,
         }
     }
@@ -29,6 +48,8 @@ impl Provider {
             Self::Codex => "codex",
             Self::Claude => "claude",
             Self::Cursor => "cursor",
+            Self::Ollama => "ollama",
+            Self::Glm => "glm",
         }
     }
 }
@@ -45,8 +66,16 @@ pub(crate) fn route_provider(model: &str, preferred_provider: Option<&str>) -> S
         return pref.as_str().to_string();
     }
 
+    if ollama::is_ollama_model(model) {
+        return Provider::Ollama.as_str().to_string();
+    }
+
     if cursor::is_cursor_model(model) {
         return Provider::Cursor.as_str().to_string();
+    }
+
+    if glm::is_glm_model(model) {
+        return Provider::Glm.as_str().to_string();
     }
 
     if model.to_ascii_lowercase().contains("claude") {
@@ -61,6 +90,8 @@ pub(crate) fn normalize_model_for_provider(model: &str, provider: &str) -> Strin
         Some(Provider::Codex) if model.trim().is_empty() => DEFAULT_CODEX_MODEL.to_string(),
         Some(Provider::Claude) if model.trim().is_empty() => DEFAULT_CLAUDE_MODEL.to_string(),
         Some(Provider::Cursor) => cursor::cursor_canonical_model(model),
+        Some(Provider::Ollama) => ollama::ollama_canonical_model(model),
+        Some(Provider::Glm) => glm::glm_canonical_model(model),
         _ => model.to_string(),
     }
 }

@@ -78,6 +78,12 @@ struct ConnectCreds {
     refresh_token: String,
     id_token: String,
     account_id: String,
+    /// API-key credential for key-auth endpoint providers (GLM); empty otherwise.
+    api_key: String,
+    /// Upstream base URL for endpoint-style providers (ollama; GLM OpenAI-compat).
+    base_url: String,
+    /// Secondary base URL (GLM Anthropic-compat `/v1/messages` prefix); empty otherwise.
+    base_url_alt: String,
     expires_at: Option<DateTime<Utc>>,
 }
 
@@ -88,6 +94,9 @@ impl ConnectCreds {
             refresh_token: String::new(),
             id_token: String::new(),
             account_id: String::new(),
+            api_key: String::new(),
+            base_url: String::new(),
+            base_url_alt: String::new(),
             expires_at,
         }
     }
@@ -100,6 +109,9 @@ impl From<ParsedCodexCreds> for ConnectCreds {
             refresh_token: c.refresh_token,
             id_token: c.id_token,
             account_id: c.account_id,
+            api_key: String::new(),
+            base_url: String::new(),
+            base_url_alt: String::new(),
             expires_at: None,
         }
     }
@@ -112,6 +124,9 @@ impl From<ParsedClaudeCreds> for ConnectCreds {
             refresh_token: c.refresh_token,
             id_token: String::new(),
             account_id: String::new(),
+            api_key: String::new(),
+            base_url: String::new(),
+            base_url_alt: String::new(),
             expires_at: c.expires_at,
         }
     }
@@ -154,7 +169,9 @@ async fn finish_connect(
         refresh_token: creds.refresh_token,
         id_token: creds.id_token,
         account_id: creds.account_id,
-        api_key: String::new(),
+        api_key: creds.api_key,
+        base_url: creds.base_url,
+        base_url_alt: creds.base_url_alt,
         share_enabled,
         share_limit_percent: normalize_share_limit(share_limit_percent),
         daily_token_limit,
@@ -662,6 +679,204 @@ pub(crate) async fn connect_cursor_local(
 }
 
 
+/// Connect a local ollama as a pooled (free, non-metered) provider. The
+/// "credential" is just a base URL (default `http://127.0.0.1:11434`, overridable
+/// via `OLLAMA_BASE_URL`); an optional `bearer_token` supports an ollama placed
+/// behind an auth proxy. The endpoint is probed (`GET /api/tags`) at connect time
+/// so a misconfigured URL fails here rather than on the first chat request.
+pub(crate) async fn connect_ollama(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<ConnectOllamaRequest>,
+) -> impl IntoResponse {
+    let user_id = match extract_user_id(&headers) {
+        Ok(uid) => uid,
+        Err(err) => return unauthorized(err),
+    };
+
+    let base_url = {
+        let raw = payload.base_url.trim();
+        if raw.is_empty() {
+            std::env::var("OLLAMA_BASE_URL")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| crate::provider::ollama::DEFAULT_OLLAMA_BASE_URL.to_string())
+        } else {
+            raw.to_string()
+        }
+    };
+    if !(base_url.starts_with("http://") || base_url.starts_with("https://")) {
+        return bad_request(json!({
+            "error": "base_url 必须以 http:// 或 https:// 开头",
+            "hint": "例如 http://127.0.0.1:11434"
+        }));
+    }
+    let base_url = base_url.trim_end_matches('/').to_string();
+    let bearer = payload.bearer_token.unwrap_or_default().trim().to_string();
+
+    let account_label = if payload.account_label.trim().is_empty() {
+        let host = base_url
+            .trim_start_matches("https://")
+            .trim_start_matches("http://");
+        format!("ollama@{}", host)
+    } else {
+        payload.account_label.trim().to_string()
+    };
+
+    // Reachability probe: build a throwaway account and list its models.
+    let probe = UpstreamAccount {
+        id: String::new(),
+        owner_user_id: user_id.clone(),
+        provider: "ollama".to_string(),
+        account_label: account_label.clone(),
+        access_token: bearer.clone(),
+        refresh_token: String::new(),
+        id_token: String::new(),
+        account_id: String::new(),
+        api_key: String::new(),
+        base_url: base_url.clone(),
+        base_url_alt: String::new(),
+        share_enabled: payload.share_enabled,
+        share_limit_percent: None,
+        daily_token_limit: None,
+        created_at: Utc::now(),
+        runtime: AccountRuntime::default(),
+    };
+    if let Err(e) = crate::provider::ollama::fetch_ollama_models(&probe).await {
+        return bad_request(json!({
+            "error": format!("无法连接到 ollama: {}", e),
+            "base_url": base_url,
+            "hint": "请确认本机 ollama 正在运行（ollama serve），或检查 base_url"
+        }));
+    }
+
+    let creds = ConnectCreds {
+        access_token: bearer,
+        refresh_token: String::new(),
+        id_token: String::new(),
+        account_id: String::new(),
+        api_key: String::new(),
+        base_url,
+        base_url_alt: String::new(),
+        expires_at: None,
+    };
+    finish_connect(
+        &state,
+        user_id,
+        "ollama",
+        account_label,
+        creds,
+        payload.share_enabled,
+        payload.share_limit_percent,
+        payload.daily_token_limit,
+    )
+    .await
+}
+
+/// Connect a GLM (Zhipu / z.ai) account as a metered, API-key endpoint provider.
+/// Store the OpenAI-compatible base (`base_url`, for Codex-format traffic) and/or
+/// the Anthropic-compatible base (`base_url_alt`, for Claude-format traffic) plus
+/// the api key. At least one base must be given. Unless `skip_probe` is set, the
+/// endpoint+key are validated at connect time.
+pub(crate) async fn connect_glm(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<ConnectGlmRequest>,
+) -> impl IntoResponse {
+    let user_id = match extract_user_id(&headers) {
+        Ok(uid) => uid,
+        Err(err) => return unauthorized(err),
+    };
+
+    let api_key = payload.api_key.trim().to_string();
+    if api_key.is_empty() {
+        return bad_request(json!({ "error": "api_key 不能为空" }));
+    }
+    let normalize = |raw: &str| -> Result<String, Response> {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return Ok(String::new());
+        }
+        if !(raw.starts_with("http://") || raw.starts_with("https://")) {
+            return Err(bad_request(json!({
+                "error": "base_url / base_url_alt 必须以 http:// 或 https:// 开头",
+            })));
+        }
+        Ok(raw.trim_end_matches('/').to_string())
+    };
+    let base_url = match normalize(&payload.base_url) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let base_url_alt = match normalize(&payload.base_url_alt) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    if base_url.is_empty() && base_url_alt.is_empty() {
+        return bad_request(json!({
+            "error": "至少要填一个 base_url（OpenAI 兼容）或 base_url_alt（Anthropic 兼容）",
+            "hint": "例如 https://open.bigmodel.cn/api/paas/v4 和 https://open.bigmodel.cn/api/anthropic",
+        }));
+    }
+
+    let account_label = if payload.account_label.trim().is_empty() {
+        "glm".to_string()
+    } else {
+        payload.account_label.trim().to_string()
+    };
+
+    if !payload.skip_probe {
+        let probe = UpstreamAccount {
+            id: String::new(),
+            owner_user_id: user_id.clone(),
+            provider: "glm".to_string(),
+            account_label: account_label.clone(),
+            access_token: String::new(),
+            refresh_token: String::new(),
+            id_token: String::new(),
+            account_id: String::new(),
+            api_key: api_key.clone(),
+            base_url: base_url.clone(),
+            base_url_alt: base_url_alt.clone(),
+            share_enabled: payload.share_enabled,
+            share_limit_percent: None,
+            daily_token_limit: None,
+            created_at: Utc::now(),
+            runtime: AccountRuntime::default(),
+        };
+        if let Err(e) = crate::provider::glm::probe_glm(&probe).await {
+            return bad_request(json!({
+                "error": format!("无法连接 GLM: {}", e),
+                "hint": "请检查 base_url / base_url_alt 和 api_key，或勾选「跳过探测」",
+            }));
+        }
+    }
+
+    let creds = ConnectCreds {
+        access_token: String::new(),
+        refresh_token: String::new(),
+        id_token: String::new(),
+        account_id: String::new(),
+        api_key,
+        base_url,
+        base_url_alt,
+        expires_at: None,
+    };
+    finish_connect(
+        &state,
+        user_id,
+        "glm",
+        account_label,
+        creds,
+        payload.share_enabled,
+        payload.share_limit_percent,
+        payload.daily_token_limit,
+    )
+    .await
+}
+
+
 pub(crate) async fn delete_account(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -815,6 +1030,50 @@ pub(crate) struct ConnectCursorRequest {
     pub(crate) session_token: String,
     /// Override path to Cursor's `state.vscdb` (defaults to the per-OS location).
     pub(crate) source_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ConnectOllamaRequest {
+    #[serde(default)]
+    pub(crate) account_label: String,
+    #[serde(default)]
+    pub(crate) share_enabled: bool,
+    #[serde(default)]
+    pub(crate) share_limit_percent: Option<f64>,
+    #[serde(default)]
+    pub(crate) daily_token_limit: Option<u64>,
+    /// ollama base URL (defaults to `OLLAMA_BASE_URL` or `http://127.0.0.1:11434`).
+    #[serde(default)]
+    pub(crate) base_url: String,
+    /// Optional bearer token for an ollama behind an auth proxy (local needs none).
+    #[serde(default)]
+    pub(crate) bearer_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ConnectGlmRequest {
+    #[serde(default)]
+    pub(crate) account_label: String,
+    #[serde(default)]
+    pub(crate) share_enabled: bool,
+    #[serde(default)]
+    pub(crate) share_limit_percent: Option<f64>,
+    #[serde(default)]
+    pub(crate) daily_token_limit: Option<u64>,
+    /// GLM API key (bearer auth).
+    #[serde(default)]
+    pub(crate) api_key: String,
+    /// OpenAI-compatible base prefix (e.g. `https://open.bigmodel.cn/api/paas/v4`
+    /// or `https://api.z.ai/api/paas/v4`); `/chat/completions` is appended.
+    #[serde(default)]
+    pub(crate) base_url: String,
+    /// Anthropic-compatible base prefix (e.g. `https://open.bigmodel.cn/api/anthropic`
+    /// or `https://api.z.ai/api/anthropic`); `/v1/messages` is appended.
+    #[serde(default)]
+    pub(crate) base_url_alt: String,
+    /// Skip the connect-time reachability/auth probe (useful offline).
+    #[serde(default)]
+    pub(crate) skip_probe: bool,
 }
 
 #[derive(Debug, Serialize)]

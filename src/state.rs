@@ -8,6 +8,8 @@ pub(crate) struct AppState {
     pub(crate) api_key_file: PathBuf,
     /// Capacity-history snapshot file (derived data; see `capacity`).
     pub(crate) capacity_file: PathBuf,
+    /// Provider-priority chains config file (`provider_chains.json`).
+    pub(crate) chain_file: PathBuf,
     pub(crate) accounts: Arc<RwLock<Vec<UpstreamAccount>>>,
     /// Latest real rate-limit snapshot per account internal id, captured from the
     /// `x-codex-*` response headers ChatGPT returns on each `responses` call.
@@ -43,5 +45,12 @@ pub(crate) struct AppState {
     /// account must be serialized — otherwise all but the first redeem a
     /// now-consumed token and wrongly mark a just-refreshed account dead.
     pub(crate) refresh_locks: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Global provider-priority chains (one per protocol slot). Read on every
+    /// proxied request to decide the failover/round-robin order; edited via the
+    /// `/v1/provider/chains` API and persisted to `chain_file`.
+    pub(crate) chains: Arc<RwLock<crate::provider::chains::ProviderChains>>,
+    /// Per-slot round-robin rotation counters (keyed by `ChainSlot::as_str`).
+    /// Incremented once per request in round-robin mode to rotate the start.
+    pub(crate) chain_rr: Arc<tokio::sync::Mutex<HashMap<String, usize>>>,
 }
 
