@@ -23,7 +23,7 @@ if RUNNING="$(pgrep -f "${BIN}" || true)"; [[ -n "$RUNNING" ]]; then
 fi
 
 # 没有二进制才构建；日常启动直接跑已编译好的二进制，不再每次编译。
-# 需要重新编译时执行: scripts/build.sh（或 scripts/restart.sh，默认会重编）
+# 需要重新编译时执行: scripts/build.sh（或 scripts/restart.sh -b）
 if [[ ! -x "$BIN" ]]; then
   echo "未找到二进制，开始构建 (cargo build --release) ..."
   cargo build --release
