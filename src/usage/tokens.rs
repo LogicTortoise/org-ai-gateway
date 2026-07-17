@@ -49,7 +49,7 @@ pub(crate) fn parse_usage(provider: &str, body: &str) -> TokenUsage {
     if !events.is_empty() {
         return if provider == "claude" {
             parse_claude_events(&events)
-        } else if provider == "glm" {
+        } else if provider == "glm" || provider == "kimi" {
             parse_glm_events(&events)
         } else {
             parse_codex_events(&events)
@@ -58,7 +58,7 @@ pub(crate) fn parse_usage(provider: &str, body: &str) -> TokenUsage {
     if let Ok(v) = serde_json::from_str::<Value>(body) {
         return if provider == "claude" {
             parse_claude_json(&v)
-        } else if provider == "glm" {
+        } else if provider == "glm" || provider == "kimi" {
             parse_glm_json(&v)
         } else {
             parse_codex_json(&v)
@@ -67,9 +67,10 @@ pub(crate) fn parse_usage(provider: &str, body: &str) -> TokenUsage {
     TokenUsage::default()
 }
 
-// ---- GLM (Zhipu / z.ai) ----
+// ---- GLM (Zhipu / z.ai) + Kimi (Moonshot) ----
 //
-// GLM rides two endpoints with two usage shapes:
+// GLM and Kimi both ride two endpoints with two usage shapes (they share these
+// parsers):
 //   * Anthropic-compatible `/v1/messages` → claude-shaped (`input_tokens` /
 //     `output_tokens`, possibly streamed as message_start/message_delta events).
 //   * OpenAI-compatible `/chat/completions` → openai-shaped

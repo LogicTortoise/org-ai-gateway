@@ -8,6 +8,8 @@ use crate::provider::cursor::fetch_cursor_models;
 use crate::provider::ollama::fetch_ollama_models;
 use crate::provider::glm::fetch_glm_models;
 use crate::provider::glm::glm_model_catalog;
+use crate::provider::kimi::fetch_kimi_models;
+use crate::provider::kimi::kimi_model_catalog;
 
 pub(crate) async fn get_codex_models(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let user_id = match extract_user_id(&headers) {
@@ -232,6 +234,42 @@ pub(crate) async fn get_glm_models(State(state): State<AppState>, headers: Heade
         StatusCode::OK,
         Json(ProviderModelsResponse {
             provider: "glm".to_string(),
+            account_id,
+            owner_user_id: user_id,
+            models,
+        }),
+    )
+        .into_response()
+}
+
+/// Kimi models: prefer the LIVE list from a connected Kimi account's OpenAI-
+/// compatible `/models` endpoint, falling back to the static catalog
+/// (`KIMI_MODELS` override, else the built-in list) when no account is connected
+/// or the live fetch fails. Since Kimi's base URL defaults to Moonshot's public
+/// endpoint, the catalog is always resolvable.
+pub(crate) async fn get_kimi_models(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let user_id = match extract_user_id(&headers) {
+        Ok(uid) => uid,
+        Err(err) => {
+            return (StatusCode::UNAUTHORIZED, Json(json!({ "error": err }))).into_response();
+        }
+    };
+
+    let mut account_id = String::new();
+    let mut models = kimi_model_catalog();
+    if let Some(account) = select_healthy_account(&state, "kimi", &user_id, None, false, false).await {
+        account_id = account.id.clone();
+        match fetch_kimi_models(&account).await {
+            Ok(live) if !live.is_empty() => models = live,
+            Ok(_) => {}
+            Err(e) => warn!("kimi live model list failed, using static catalog: {}", e),
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(ProviderModelsResponse {
+            provider: "kimi".to_string(),
             account_id,
             owner_user_id: user_id,
             models,

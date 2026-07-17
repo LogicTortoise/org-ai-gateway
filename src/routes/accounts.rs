@@ -877,6 +877,104 @@ pub(crate) async fn connect_glm(
 }
 
 
+/// Connect a Kimi (Moonshot) account as a metered, API-key endpoint provider.
+/// Unlike GLM, the base URLs are optional: they default to Moonshot's public
+/// OpenAI-compatible (`/v1`) and Anthropic-compatible (`/anthropic`) endpoints,
+/// so a connect only needs an api key. Unless `skip_probe` is set, the key is
+/// validated at connect time.
+pub(crate) async fn connect_kimi(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<ConnectKimiRequest>,
+) -> impl IntoResponse {
+    let user_id = match extract_user_id(&headers) {
+        Ok(uid) => uid,
+        Err(err) => return unauthorized(err),
+    };
+
+    let api_key = payload.api_key.trim().to_string();
+    if api_key.is_empty() {
+        return bad_request(json!({ "error": "api_key 不能为空" }));
+    }
+    let normalize = |raw: &str| -> Result<String, Response> {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return Ok(String::new());
+        }
+        if !(raw.starts_with("http://") || raw.starts_with("https://")) {
+            return Err(bad_request(json!({
+                "error": "base_url / base_url_alt 必须以 http:// 或 https:// 开头",
+            })));
+        }
+        Ok(raw.trim_end_matches('/').to_string())
+    };
+    // Both bases are optional; empty means "use Moonshot's built-in default".
+    let base_url = match normalize(&payload.base_url) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let base_url_alt = match normalize(&payload.base_url_alt) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+
+    let account_label = if payload.account_label.trim().is_empty() {
+        "kimi".to_string()
+    } else {
+        payload.account_label.trim().to_string()
+    };
+
+    if !payload.skip_probe {
+        let probe = UpstreamAccount {
+            id: String::new(),
+            owner_user_id: user_id.clone(),
+            provider: "kimi".to_string(),
+            account_label: account_label.clone(),
+            access_token: String::new(),
+            refresh_token: String::new(),
+            id_token: String::new(),
+            account_id: String::new(),
+            api_key: api_key.clone(),
+            base_url: base_url.clone(),
+            base_url_alt: base_url_alt.clone(),
+            share_enabled: payload.share_enabled,
+            share_limit_percent: None,
+            daily_token_limit: None,
+            created_at: Utc::now(),
+            runtime: AccountRuntime::default(),
+        };
+        if let Err(e) = crate::provider::kimi::probe_kimi(&probe).await {
+            return bad_request(json!({
+                "error": format!("无法连接 Kimi: {}", e),
+                "hint": "请检查 api_key（或勾选「跳过探测」）",
+            }));
+        }
+    }
+
+    let creds = ConnectCreds {
+        access_token: String::new(),
+        refresh_token: String::new(),
+        id_token: String::new(),
+        account_id: String::new(),
+        api_key,
+        base_url,
+        base_url_alt,
+        expires_at: None,
+    };
+    finish_connect(
+        &state,
+        user_id,
+        "kimi",
+        account_label,
+        creds,
+        payload.share_enabled,
+        payload.share_limit_percent,
+        payload.daily_token_limit,
+    )
+    .await
+}
+
+
 pub(crate) async fn delete_account(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1069,6 +1167,32 @@ pub(crate) struct ConnectGlmRequest {
     pub(crate) base_url: String,
     /// Anthropic-compatible base prefix (e.g. `https://open.bigmodel.cn/api/anthropic`
     /// or `https://api.z.ai/api/anthropic`); `/v1/messages` is appended.
+    #[serde(default)]
+    pub(crate) base_url_alt: String,
+    /// Skip the connect-time reachability/auth probe (useful offline).
+    #[serde(default)]
+    pub(crate) skip_probe: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ConnectKimiRequest {
+    #[serde(default)]
+    pub(crate) account_label: String,
+    #[serde(default)]
+    pub(crate) share_enabled: bool,
+    #[serde(default)]
+    pub(crate) share_limit_percent: Option<f64>,
+    #[serde(default)]
+    pub(crate) daily_token_limit: Option<u64>,
+    /// Kimi (Moonshot) API key (bearer auth). The only required field.
+    #[serde(default)]
+    pub(crate) api_key: String,
+    /// OpenAI-compatible base prefix; defaults to Moonshot's public endpoint
+    /// (`https://api.moonshot.cn/v1`) when empty. `/chat/completions` appended.
+    #[serde(default)]
+    pub(crate) base_url: String,
+    /// Anthropic-compatible base prefix; defaults to Moonshot's public endpoint
+    /// (`https://api.moonshot.cn/anthropic`) when empty. `/v1/messages` appended.
     #[serde(default)]
     pub(crate) base_url_alt: String,
     /// Skip the connect-time reachability/auth probe (useful offline).

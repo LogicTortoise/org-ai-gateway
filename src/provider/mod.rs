@@ -5,6 +5,7 @@ pub(crate) mod claude;
 pub(crate) mod codex;
 pub(crate) mod cursor;
 pub(crate) mod glm;
+pub(crate) mod kimi;
 pub(crate) mod ollama;
 
 /// The upstream providers the gateway can route to. Accounts persist the
@@ -29,6 +30,13 @@ pub(crate) enum Provider {
     /// (Anthropic-compat) + an api key. Real token usage is returned by both
     /// endpoints, so audited usage is exact.
     Glm,
+    /// Kimi (Moonshot AI). Structurally identical to GLM — an API-key endpoint
+    /// provider (no OAuth/refresh) serving BOTH client protocols via Moonshot's
+    /// Anthropic-compatible (`/anthropic/v1/messages`) and OpenAI-compatible
+    /// (`/v1/chat/completions`) endpoints. Endpoints are well-known so the base
+    /// URLs default to Moonshot's public ones; an "account" is effectively just
+    /// an api key. Serves as a Claude Code fallback via the Claude chain.
+    Kimi,
 }
 
 impl Provider {
@@ -39,6 +47,7 @@ impl Provider {
             "cursor" => Some(Self::Cursor),
             "ollama" => Some(Self::Ollama),
             "glm" => Some(Self::Glm),
+            "kimi" => Some(Self::Kimi),
             _ => None,
         }
     }
@@ -50,6 +59,7 @@ impl Provider {
             Self::Cursor => "cursor",
             Self::Ollama => "ollama",
             Self::Glm => "glm",
+            Self::Kimi => "kimi",
         }
     }
 }
@@ -78,6 +88,10 @@ pub(crate) fn route_provider(model: &str, preferred_provider: Option<&str>) -> S
         return Provider::Glm.as_str().to_string();
     }
 
+    if kimi::is_kimi_model(model) {
+        return Provider::Kimi.as_str().to_string();
+    }
+
     if model.to_ascii_lowercase().contains("claude") {
         return Provider::Claude.as_str().to_string();
     }
@@ -92,6 +106,7 @@ pub(crate) fn normalize_model_for_provider(model: &str, provider: &str) -> Strin
         Some(Provider::Cursor) => cursor::cursor_canonical_model(model),
         Some(Provider::Ollama) => ollama::ollama_canonical_model(model),
         Some(Provider::Glm) => glm::glm_canonical_model(model),
+        Some(Provider::Kimi) => kimi::kimi_canonical_model(model),
         _ => model.to_string(),
     }
 }

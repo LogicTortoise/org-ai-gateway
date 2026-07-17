@@ -17,6 +17,7 @@ use crate::provider::chains::ordered_attempts;
 use crate::provider::chains::ChainSlot;
 use crate::provider::cursor::CursorFormat;
 use crate::provider::glm;
+use crate::provider::kimi;
 use crate::provider::ollama::ollama_canonical_model;
 use crate::provider::ollama::ollama_http_client;
 use crate::provider::ollama::send_ollama_upstream;
@@ -120,6 +121,26 @@ async fn serve_with_chain(
                     .await
                 } else {
                     serve_glm(state, client_format, user_id, payload, client_wants_stream, shared_only).await
+                }
+            }
+            "kimi" => {
+                // Same split as GLM: Claude-format traffic → Kimi's Anthropic-
+                // compatible endpoint as a raw buffered passthrough (this is the
+                // Claude Code fallback path), everything else → Kimi's OpenAI-
+                // compatible endpoint via the adapter.
+                if matches!(client_format, CursorFormat::Claude) {
+                    serve_native_provider(
+                        state.clone(),
+                        "kimi",
+                        client_format,
+                        user_id.to_string(),
+                        payload.clone(),
+                        client_wants_stream,
+                        shared_only,
+                    )
+                    .await
+                } else {
+                    serve_kimi(state, client_format, user_id, payload, client_wants_stream, shared_only).await
                 }
             }
             "ollama" => {
@@ -752,6 +773,146 @@ async fn serve_glm(
     }
 }
 
+/// Serve a request via Kimi's OpenAI-compatible `/chat/completions` through the
+/// shared format adapter — the Codex/OpenAI-format twin of the Claude-format
+/// Anthropic passthrough in `serve_native_provider`. A near-mirror of `serve_glm`
+/// (Kimi is structurally identical to GLM): real token usage, account-swap
+/// retry, and the metered per-user token-budget quota gate.
+async fn serve_kimi(
+    state: &AppState,
+    format: CursorFormat,
+    user_id: &str,
+    payload: &Value,
+    client_wants_stream: bool,
+    shared_only: bool,
+) -> ProviderOutcome {
+    use crate::provider::cursor::{build_buffered_body, build_sse_body, estimate_request_tokens, extract_request};
+
+    let owned_only = match crate::quota::enforce_user_quota(state, "kimi", user_id, !shared_only).await {
+        Ok(v) => v,
+        Err(resp) => return ProviderOutcome::NextProvider(Some(resp)),
+    };
+
+    let req = match extract_request(payload) {
+        Ok(v) => v,
+        Err(e) => {
+            return ProviderOutcome::NextProvider(Some(
+                (StatusCode::BAD_REQUEST, Json(json!({ "error": e, "provider": "kimi" }))).into_response(),
+            ));
+        }
+    };
+
+    let raw_model = payload.get("model").and_then(|v| v.as_str()).unwrap_or("kimi");
+    // Direct `kimi/<name>` / `kimi-*` / `moonshot-*` → that model; a paid model
+    // name routed here by the chain → the configured Kimi default model.
+    let upstream_model = if kimi::is_kimi_model(raw_model) {
+        kimi::kimi_canonical_model(raw_model)
+    } else {
+        kimi::kimi_canonical_model("kimi")
+    };
+    let request_id = Uuid::new_v4().to_string();
+    let request_json_chars = payload.to_string().chars().count();
+    let estimated_input = estimate_request_tokens(&req);
+    let client = kimi::kimi_http_client();
+
+    let max_attempts = provider_attempt_budget(state, "kimi").await;
+    let mut excluded: HashSet<String> = HashSet::new();
+    let mut selected_any = false;
+    let mut last_error: Option<(StatusCode, Value)> = None;
+
+    for _ in 0..max_attempts {
+        let now = Utc::now();
+        let selected = {
+            let accounts = state.accounts.read().await;
+            let rate_limits = state.rate_limits.read().await;
+            let owner_usage = state.owner_usage.read().await;
+            let mut warm = eligible_accounts(&accounts, "kimi", user_id, &excluded, now, true);
+            if owned_only {
+                warm.retain(|a| a.owner_user_id == user_id);
+            }
+            if shared_only {
+                warm.retain(|a| a.share_enabled);
+            }
+            // Only accounts that expose the OpenAI-compatible endpoint can serve
+            // this adapter path.
+            warm.retain(kimi::supports_openai);
+            select_account_for_request(&warm, user_id, "kimi", &rate_limits, &owner_usage)
+        };
+        let Some(account) = selected else { break };
+        selected_any = true;
+        excluded.insert(account.id.clone());
+        note_account_pick(state, &account.id).await;
+
+        let result = match kimi::send_kimi_openai(client, &account, &upstream_model, &req).await {
+            Ok(r) => r,
+            Err(err) => {
+                apply_account_failure(state, &account.id, ErrorClass::Transient, None, None, false).await;
+                last_error = Some((StatusCode::BAD_GATEWAY, json!({ "error": err, "provider": "kimi" })));
+                continue;
+            }
+        };
+
+        if !result.status.is_success() || (result.text.is_empty() && result.error.is_some()) {
+            let detail = result
+                .error
+                .clone()
+                .unwrap_or_else(|| format!("kimi upstream returned {}", result.status));
+            let class = ErrorClass::from_status(result.status.as_u16());
+            apply_account_failure(state, &account.id, class, None, None, false).await;
+            info!(
+                "kimi_error_{} on {} ({})",
+                result.status.as_u16(),
+                account.account_label,
+                if class.is_retryable() { "retrying on next account" } else { "final" },
+            );
+            let status = if result.status.is_success() { StatusCode::BAD_GATEWAY } else { result.status };
+            last_error = Some((status, json!({ "error": detail, "provider": "kimi" })));
+            if class.is_retryable() {
+                continue;
+            }
+            break;
+        }
+
+        // Success: clear backoff, audit with REAL token usage, render the reply.
+        reset_backoff(state, &account.id).await;
+        let input_tokens = if result.usage.input_tokens > 0 {
+            result.usage.input_tokens as u64
+        } else {
+            estimated_input
+        };
+        write_proxy_audit(
+            state, user_id, &account, "kimi", payload, request_json_chars, result.text.len(),
+            "success", result.usage,
+        )
+        .await;
+
+        if client_wants_stream {
+            let sse = build_sse_body(format, &request_id, raw_model, &result.text, input_tokens);
+            let mut response = Response::new(sse.into());
+            *response.status_mut() = StatusCode::OK;
+            response.headers_mut().insert(
+                CONTENT_TYPE,
+                HeaderValue::from_static("text/event-stream; charset=utf-8"),
+            );
+            return ProviderOutcome::Served(response);
+        }
+        let body = build_buffered_body(format, &request_id, raw_model, &result.text, input_tokens);
+        return ProviderOutcome::Served((StatusCode::OK, Json(body)).into_response());
+    }
+
+    match last_error {
+        Some((status, body)) => ProviderOutcome::NextProvider(Some((status, Json(body)).into_response())),
+        None if !selected_any => ProviderOutcome::NextProvider(None),
+        None => ProviderOutcome::NextProvider(Some(
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": "all kimi accounts exhausted", "provider": "kimi" })),
+            )
+                .into_response(),
+        )),
+    }
+}
+
 /// Serve a request via ONE native (account-pooled, raw-payload) provider —
 /// `codex` (Responses) or `claude`/`glm` (Anthropic) — with account-swap retry,
 /// ported from the Go `proxyRequest` loop. Selects an account, sends, classifies
@@ -901,6 +1062,12 @@ async fn serve_native_provider(
             // GLM rides its Anthropic-compatible endpoint for Claude-format
             // traffic: raw passthrough, no OAuth refresh, no Claude fingerprint.
             "glm" => glm::send_glm_anthropic(&account, &attempt_payload)
+                .await
+                .map(|resp| (resp, account.clone())),
+            // Kimi rides its Anthropic-compatible endpoint for Claude-format
+            // traffic, exactly like GLM: raw passthrough, no OAuth refresh, no
+            // Claude fingerprint.
+            "kimi" => kimi::send_kimi_anthropic(&account, &attempt_payload)
                 .await
                 .map(|resp| (resp, account.clone())),
             _ => send_claude_upstream_with_refresh(&state, &account, &attempt_payload).await,
@@ -1179,6 +1346,14 @@ fn build_error_payload(
         let detail = if provider == "codex" {
             format!(
                 "共享池中的账号 ({}) Token 已过期或无效，请联系共享者重新导入 auth.json。",
+                account_label
+            )
+        } else if provider == "glm" || provider == "kimi" {
+            // Key-auth metered providers: a 401 is a bad/expired API key, not an
+            // OAuth token — so the credentials.json advice doesn't apply.
+            format!(
+                "共享池中的 {} 账号 ({}) API Key 无效或已过期，请重新连接该账号。",
+                provider.to_uppercase(),
                 account_label
             )
         } else {

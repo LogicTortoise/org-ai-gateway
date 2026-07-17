@@ -42,8 +42,8 @@ impl ChainSlot {
     /// rides the format adapter; the native provider only serves its own slot.
     pub(crate) fn allowed_providers(self) -> &'static [&'static str] {
         match self {
-            ChainSlot::Codex => &["codex", "glm", "ollama", "cursor"],
-            ChainSlot::Claude => &["claude", "glm", "ollama", "cursor"],
+            ChainSlot::Codex => &["codex", "glm", "kimi", "ollama", "cursor"],
+            ChainSlot::Claude => &["claude", "glm", "kimi", "ollama", "cursor"],
         }
     }
 }

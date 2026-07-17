@@ -21,7 +21,7 @@ const SECONDARY_HARD_EXCLUDE_PERCENT: f64 = 99.0;
 /// - Ollama is a local, non-metered upstream: it has no rate-limit windows at
 ///   all (and never carries a snapshot), so usage percent must never gate it.
 pub(crate) fn usage_percent_gates_selection(provider: &str) -> bool {
-    !matches!(provider, "cursor" | "ollama" | "glm")
+    !matches!(provider, "cursor" | "ollama" | "glm" | "kimi")
 }
 
 /// Sticky-session rebalance thresholds: a bound account is "pressured" when

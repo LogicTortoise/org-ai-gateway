@@ -156,6 +156,10 @@
                         <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"></path></svg>
                         <span data-i18n="importGlm">连接 GLM</span>
                     </button>
+                    <button id="connectKimiBtn" class="bg-slate-700 hover:bg-slate-800 text-white px-4 py-2 rounded-md shadow-sm text-sm font-medium flex items-center gap-2 transition">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"></path></svg>
+                        <span data-i18n="importKimi">连接 Kimi</span>
+                    </button>
                 </div>
             </div>
 
@@ -179,6 +183,7 @@
                     <option value="cursor">Cursor</option>
                     <option value="ollama">Ollama</option>
                     <option value="glm">GLM</option>
+                    <option value="kimi">Kimi</option>
                 </select>
                 <select id="statusFilter" onchange="applyAccountFilters()" class="bg-gray-50 border border-gray-200 rounded-md px-4 py-2 text-sm focus:outline-none focus:bg-white focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition min-w-[160px]">
                     <option value="" data-i18n="allStatuses">所有状态</option>
@@ -228,6 +233,7 @@
                                 <option value="cursor">Cursor</option>
                                 <option value="ollama">Ollama</option>
                                 <option value="glm">GLM</option>
+                                <option value="kimi">Kimi</option>
                             </select>
                         </div>
 
@@ -427,6 +433,43 @@
         </div>
     </div>
 
+    <!-- Kimi connect modal -->
+    <div id="kimiModal" class="fixed inset-0 z-50 hidden items-center justify-center bg-black/40 p-4">
+        <div class="bg-white rounded-xl shadow-2xl w-full max-w-lg p-6">
+            <h3 class="text-lg font-semibold text-gray-900 mb-1" data-i18n="kimiModalTitle">连接 Kimi 账号</h3>
+            <p class="text-xs text-gray-500 mb-4" data-i18n="kimiHint">只需填 Moonshot API Key，端点默认指向官方地址。可作为 Claude Code 的降级账号。</p>
+            <div class="space-y-3">
+                <div>
+                    <label class="block text-xs font-medium text-gray-600 mb-1" data-i18n="kimiApiKey">API Key</label>
+                    <input id="kimiApiKey" type="password" autocomplete="off" class="w-full border border-gray-300 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-slate-500 focus:ring-1 focus:ring-slate-500">
+                </div>
+                <details class="text-xs text-gray-500">
+                    <summary class="cursor-pointer select-none" data-i18n="kimiAdvanced">高级：自定义端点（留空用官方默认）</summary>
+                    <div class="space-y-3 mt-3">
+                        <div>
+                            <label class="block text-xs font-medium text-gray-600 mb-1" data-i18n="kimiBaseUrlAlt">Anthropic 兼容 base_url（Claude 流量用）</label>
+                            <input id="kimiBaseUrlAlt" type="text" placeholder="https://api.moonshot.cn/anthropic" class="w-full border border-gray-300 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-slate-500 focus:ring-1 focus:ring-slate-500">
+                        </div>
+                        <div>
+                            <label class="block text-xs font-medium text-gray-600 mb-1" data-i18n="kimiBaseUrl">OpenAI 兼容 base_url（Codex 流量用）</label>
+                            <input id="kimiBaseUrl" type="text" placeholder="https://api.moonshot.cn/v1" class="w-full border border-gray-300 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-slate-500 focus:ring-1 focus:ring-slate-500">
+                        </div>
+                    </div>
+                </details>
+                <div>
+                    <label class="block text-xs font-medium text-gray-600 mb-1" data-i18n="kimiLabel">备注名（可选）</label>
+                    <input id="kimiLabel" type="text" class="w-full border border-gray-300 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-slate-500 focus:ring-1 focus:ring-slate-500">
+                </div>
+                <label class="flex items-center gap-2 text-sm text-gray-700"><input id="kimiShareEnabled" type="checkbox" class="rounded"> <span data-i18n="kimiShareEnabled">加入共享池</span></label>
+                <label class="flex items-center gap-2 text-sm text-gray-700"><input id="kimiSkipProbe" type="checkbox" class="rounded"> <span data-i18n="kimiSkipProbe">跳过连通性探测</span></label>
+            </div>
+            <div class="flex justify-end gap-3 mt-6">
+                <button id="kimiCancelBtn" class="px-4 py-2 rounded-md text-sm font-medium text-gray-600 hover:bg-gray-100" data-i18n="cancelBtn">取消</button>
+                <button id="kimiSaveBtn" class="px-4 py-2 rounded-md text-sm font-medium text-white bg-slate-700 hover:bg-slate-800" data-i18n="saveBtn">保存</button>
+            </div>
+        </div>
+    </div>
+
     <!-- Chart Tooltip -->
     <div id="chartTooltip" class="fixed hidden z-50 bg-gray-900 text-white text-xs rounded-lg shadow-xl p-3 pointer-events-none transform -translate-x-1/2 -translate-y-full mt-[-15px] min-w-[140px]">
         <div id="ctDate" class="font-semibold text-gray-300 mb-2 border-b border-gray-700 pb-1"></div>
@@ -476,6 +519,11 @@
                 glmBaseUrl: 'OpenAI 兼容 base_url（Codex 流量用）', glmBaseUrlAlt: 'Anthropic 兼容 base_url（Claude 流量用）',
                 glmBaseUrlPh: '如 https://open.bigmodel.cn/api/paas/v4', glmBaseUrlAltPh: '如 https://open.bigmodel.cn/api/anthropic',
                 glmShareEnabled: '加入共享池', glmSkipProbe: '跳过连通性探测', glmHint: 'OpenAI / Anthropic 两个 base_url 至少填一个。', glmConnected: 'GLM 账号已连接',
+                importKimi: '连接 Kimi', kimiModalTitle: '连接 Kimi 账号', kimiApiKey: 'API Key', kimiLabel: '备注名（可选）',
+                kimiBaseUrl: 'OpenAI 兼容 base_url（Codex 流量用）', kimiBaseUrlAlt: 'Anthropic 兼容 base_url（Claude 流量用）',
+                kimiAdvanced: '高级：自定义端点（留空用官方默认）',
+                kimiShareEnabled: '加入共享池', kimiSkipProbe: '跳过连通性探测',
+                kimiHint: '只需填 Moonshot API Key，端点默认指向官方地址。可作为 Claude Code 的降级账号。', kimiConnected: 'Kimi 账号已连接',
                 cancelBtn: '取消', saveBtn: '保存',
                 chainsTitle: '优先级链路', chainsDesc: '为 Codex / Claude 两类入口分别配置 provider 顺序，以及「依次降级」或「循环使用」策略。',
                 chainCodex: 'Codex 入口 (/v1/responses)', chainClaude: 'Claude 入口 (/v1/messages)',
@@ -619,6 +667,11 @@
                 glmBaseUrl: 'OpenAI-compatible base_url (for Codex traffic)', glmBaseUrlAlt: 'Anthropic-compatible base_url (for Claude traffic)',
                 glmBaseUrlPh: 'e.g. https://open.bigmodel.cn/api/paas/v4', glmBaseUrlAltPh: 'e.g. https://open.bigmodel.cn/api/anthropic',
                 glmShareEnabled: 'Add to shared pool', glmSkipProbe: 'Skip reachability probe', glmHint: 'Provide at least one of the OpenAI / Anthropic base URLs.', glmConnected: 'GLM account connected',
+                importKimi: 'Connect Kimi', kimiModalTitle: 'Connect a Kimi account', kimiApiKey: 'API Key', kimiLabel: 'Label (optional)',
+                kimiBaseUrl: 'OpenAI-compatible base_url (for Codex traffic)', kimiBaseUrlAlt: 'Anthropic-compatible base_url (for Claude traffic)',
+                kimiAdvanced: 'Advanced: custom endpoints (leave blank for official defaults)',
+                kimiShareEnabled: 'Add to shared pool', kimiSkipProbe: 'Skip reachability probe',
+                kimiHint: 'Just paste your Moonshot API key — endpoints default to the official URLs. Works as a Claude Code fallback.', kimiConnected: 'Kimi account connected',
                 cancelBtn: 'Cancel', saveBtn: 'Save',
                 chainsTitle: 'Provider Priority', chainsDesc: 'Configure the provider order and failover / round-robin policy separately for the Codex and Claude entrypoints.',
                 chainCodex: 'Codex entrypoint (/v1/responses)', chainClaude: 'Claude entrypoint (/v1/messages)',
@@ -1247,12 +1300,13 @@
             const rl = acc.rate_limit;
             const usage = acc.usage || {};
             const provider = acc.provider || 'codex';
-            const providerNames = { codex: 'Codex', claude: 'Claude', cursor: 'Cursor', ollama: 'Ollama', glm: 'GLM' };
+            const providerNames = { codex: 'Codex', claude: 'Claude', cursor: 'Cursor', ollama: 'Ollama', glm: 'GLM', kimi: 'Kimi' };
             const badge = (rl && rl.plan_type) ? rl.plan_type : (providerNames[provider] || provider);
             const badgeColor = provider === 'claude' ? 'bg-purple-100 text-purple-700'
                 : provider === 'cursor' ? 'bg-emerald-100 text-emerald-700'
                 : provider === 'ollama' ? 'bg-gray-100 text-gray-700'
                 : provider === 'glm' ? 'bg-amber-100 text-amber-700'
+                : provider === 'kimi' ? 'bg-slate-200 text-slate-700'
                 : 'bg-blue-100 text-blue-700';
             const lastUsed = usage.last_used ? new Date(usage.last_used).toLocaleString() : t('never');
             const health = acc.health || {};
@@ -1365,7 +1419,7 @@
                 // whose JSON key order is randomized per response, so without
                 // this the cards reshuffle on every refresh. Sort by a fixed
                 // provider order, then created_at, then id.
-                const providerRank = { codex: 0, claude: 1, cursor: 2, glm: 3, ollama: 4 };
+                const providerRank = { codex: 0, claude: 1, cursor: 2, glm: 3, kimi: 4, ollama: 5 };
                 window.__allAccounts.sort((a, b) => {
                     const pa = providerRank[a.provider] ?? 99;
                     const pb = providerRank[b.provider] ?? 99;
@@ -2077,8 +2131,57 @@
             }
         });
 
+        // ==================== Kimi connect modal ====================
+        function openKimiModal() {
+            const m = document.getElementById('kimiModal');
+            m.classList.remove('hidden'); m.classList.add('flex');
+        }
+        function closeKimiModal() {
+            const m = document.getElementById('kimiModal');
+            m.classList.add('hidden'); m.classList.remove('flex');
+        }
+        document.getElementById('connectKimiBtn').addEventListener('click', openKimiModal);
+        document.getElementById('kimiCancelBtn').addEventListener('click', closeKimiModal);
+        document.getElementById('kimiModal').addEventListener('click', (e) => {
+            if (e.target.id === 'kimiModal') closeKimiModal();
+        });
+        document.getElementById('kimiSaveBtn').addEventListener('click', async () => {
+            const apiKey = document.getElementById('kimiApiKey').value.trim();
+            if (!apiKey) { showToast(t('kimiApiKey'), 'error'); return; }
+            const btn = document.getElementById('kimiSaveBtn');
+            const orig = btn.textContent; btn.textContent = t('importing'); btn.disabled = true;
+            try {
+                const res = await fetch('/v1/provider/connect/kimi', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${gatewayToken()}` },
+                    body: JSON.stringify({
+                        account_label: document.getElementById('kimiLabel').value.trim(),
+                        api_key: apiKey,
+                        base_url: document.getElementById('kimiBaseUrl').value.trim(),
+                        base_url_alt: document.getElementById('kimiBaseUrlAlt').value.trim(),
+                        share_enabled: document.getElementById('kimiShareEnabled').checked,
+                        skip_probe: document.getElementById('kimiSkipProbe').checked,
+                        daily_token_limit: null,
+                    }),
+                });
+                const d = await res.json();
+                if (res.ok) {
+                    showToast(t('kimiConnected'));
+                    closeKimiModal();
+                    document.getElementById('kimiApiKey').value = '';
+                    loadAccounts();
+                } else {
+                    showToast(d.error || t('fetchModelsFailed'), 'error');
+                }
+            } catch (e) {
+                showToast(e.message, 'error');
+            } finally {
+                btn.textContent = orig; btn.disabled = false;
+            }
+        });
+
         // ==================== Provider priority chains ====================
-        const CHAIN_PROVIDER_NAMES = { codex: 'Codex', claude: 'Claude', cursor: 'Cursor', ollama: 'Ollama', glm: 'GLM' };
+        const CHAIN_PROVIDER_NAMES = { codex: 'Codex', claude: 'Claude', cursor: 'Cursor', ollama: 'Ollama', glm: 'GLM', kimi: 'Kimi' };
         window.__chains = null;        // { codex:{mode,providers}, claude:{mode,providers} }
         window.__chainAllowed = null;  // { codex:[...], claude:[...] }
 
@@ -2189,7 +2292,7 @@
         async function loadModels(manual = false) {
             const select = document.getElementById('model');
             const provider = document.getElementById('provider').value || 'codex';
-            const fallback = provider === 'claude' ? 'claude-sonnet-4-5' : provider === 'cursor' ? 'cursor' : provider === 'ollama' ? 'ollama' : provider === 'glm' ? 'glm' : 'gpt-5.5';
+            const fallback = provider === 'claude' ? 'claude-sonnet-4-5' : provider === 'cursor' ? 'cursor' : provider === 'ollama' ? 'ollama' : provider === 'glm' ? 'glm' : provider === 'kimi' ? 'kimi' : 'gpt-5.5';
             select.innerHTML = `<option>${t('loading')}</option>`;
             try {
                 const res = await fetch(`/v1/provider/models/${provider}`, { headers: { 'Authorization': `Bearer ${gatewayToken()}` } });

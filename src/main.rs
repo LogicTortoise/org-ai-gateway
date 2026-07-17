@@ -34,6 +34,7 @@ use crate::routes::accounts::connect_codex_local;
 use crate::routes::accounts::connect_cursor;
 use crate::routes::accounts::connect_cursor_local;
 use crate::routes::accounts::connect_glm;
+use crate::routes::accounts::connect_kimi;
 use crate::routes::accounts::connect_ollama;
 use crate::routes::accounts::delete_account;
 use crate::routes::accounts::list_accounts;
@@ -54,6 +55,7 @@ use crate::routes::models_api::get_claude_models;
 use crate::routes::models_api::get_codex_models;
 use crate::routes::models_api::get_cursor_models;
 use crate::routes::models_api::get_glm_models;
+use crate::routes::models_api::get_kimi_models;
 use crate::routes::models_api::get_ollama_models;
 use crate::routes::models_api::proxy_models_codex;
 use crate::routes::models_api::proxy_models_openai;
@@ -173,6 +175,7 @@ async fn main() {
         )
         .route("/v1/provider/connect/ollama", post(connect_ollama))
         .route("/v1/provider/connect/glm", post(connect_glm))
+        .route("/v1/provider/connect/kimi", post(connect_kimi))
         .route(
             "/v1/provider/chains",
             get(get_chains).put(update_chains),
@@ -189,6 +192,7 @@ async fn main() {
         .route("/v1/provider/models/cursor", get(get_cursor_models))
         .route("/v1/provider/models/ollama", get(get_ollama_models))
         .route("/v1/provider/models/glm", get(get_glm_models))
+        .route("/v1/provider/models/kimi", get(get_kimi_models))
         .route("/v1/gateway/relay", post(relay))
         .route("/v1/client/codex/bootstrap", post(codex_bootstrap))
         .route("/v1/responses", post(proxy_responses))
