@@ -79,12 +79,13 @@ curl -X POST http://127.0.0.1:8080/v1/messages \
 
 ### 常用环境变量
 
+> 下表仅为常用摘录。**完整、权威的环境变量清单（含各 provider、配额、owner 保护等）见 [`docs/configuration.md`](docs/configuration.md)（SSOT，单一事实源）。**
+
 | 变量 | 作用 |
 | --- | --- |
 | `GATEWAY_BIND_ADDR` | 监听地址（默认 `0.0.0.0:8080`） |
 | `GATEWAY_EDGE_SECRET` | 可信边缘共享密钥，设置即启用身份头信任 |
 | `GATEWAY_USER_DAILY_TOKEN_LIMIT` / `…_WEEKLY_…` / `…_RPM_LIMIT` | 按用户的借用预算与限流 |
-| `GATEWAY_HEALTH_PROBE_SECS` | 账号健康探测周期（默认 120s，`0` 关闭） |
 | `GATEWAY_HTTP_TIMEOUT_SECS` | 上游 HTTP 总超时（默认 600s） |
 
 ### 已知取舍
@@ -160,12 +161,13 @@ The gateway does no login itself. Identity is resolved in this order:
 
 ### Common environment variables
 
+> The table below is a common-use excerpt only. **The complete, authoritative list of environment variables (providers, quotas, owner protection, …) lives in [`docs/configuration.md`](docs/configuration.md) — the single source of truth.**
+
 | Variable | Purpose |
 | --- | --- |
 | `GATEWAY_BIND_ADDR` | Listen address (default `0.0.0.0:8080`) |
 | `GATEWAY_EDGE_SECRET` | Trusted-edge shared secret; setting it enables header trust |
 | `GATEWAY_USER_DAILY_TOKEN_LIMIT` / `…_WEEKLY_…` / `…_RPM_LIMIT` | Per-user borrow budget and rate limit |
-| `GATEWAY_HEALTH_PROBE_SECS` | Account health probe interval (default 120s, `0` disables) |
 | `GATEWAY_HTTP_TIMEOUT_SECS` | Total upstream HTTP timeout (default 600s) |
 
 ### Known trade-off
