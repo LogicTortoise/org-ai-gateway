@@ -82,6 +82,8 @@ async fn main() {
     crate::edge::log_startup();
     // Announce per-user quota limits (GATEWAY_USER_*).
     crate::quota::log_startup();
+    // Announce owner-heavy-usage protection (GATEWAY_OWNER_PROTECTION / *_PERCENT / *_SHARE).
+    crate::pool::log_startup();
 
     // Ensure the persistence directory exists before anything tries to read or
     // append to it; otherwise account/audit/capacity writes fail at runtime.

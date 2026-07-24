@@ -459,11 +459,67 @@ pub(crate) fn account_visible_to_user(account: &UpstreamAccount, request_user_id
     account.owner_user_id == request_user_id || account.share_enabled
 }
 
-/// Usage threshold above which a shared account *may* be reserved for its owner.
-const OWNER_HEAVY_USAGE_PERCENT: f64 = 60.0;
-/// Owner's minimum share of the last-7-days billable tokens for the
-/// reservation to kick in.
-const OWNER_HEAVY_OWNER_SHARE: f64 = 0.5;
+/// Owner-heavy-usage protection, configured once from the environment. Donated
+/// accounts are meant to be shared, so this guard is **off by default**: every
+/// shared account is fully available to non-owners regardless of who has been
+/// using it. It exists only as an opt-in knob — set `GATEWAY_OWNER_PROTECTION=on`
+/// to reserve a shared account for its owner once its weekly window is high AND
+/// the owner produced most of the last 7 days' tokens, and tune the two
+/// thresholds to control how aggressively that reservation kicks in.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OwnerProtectionConfig {
+    /// `GATEWAY_OWNER_PROTECTION`: master switch. Off by default; `1`/`on`/`true`/`yes` enables.
+    pub(crate) enabled: bool,
+    /// `GATEWAY_OWNER_PROTECT_USAGE_PERCENT`: weekly-window usage above which reservation may kick in.
+    pub(crate) usage_percent: f64,
+    /// `GATEWAY_OWNER_PROTECT_OWNER_SHARE`: owner's minimum share (0..1) of last-7-days billable tokens.
+    pub(crate) owner_share: f64,
+}
+
+impl Default for OwnerProtectionConfig {
+    fn default() -> Self {
+        Self { enabled: false, usage_percent: 60.0, owner_share: 0.5 }
+    }
+}
+
+impl OwnerProtectionConfig {
+    fn from_env() -> Self {
+        let d = Self::default();
+        let enabled = std::env::var("GATEWAY_OWNER_PROTECTION")
+            .ok()
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes"))
+            .unwrap_or(d.enabled);
+        fn num(name: &str, default: f64) -> f64 {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .filter(|v| v.is_finite())
+                .unwrap_or(default)
+        }
+        Self {
+            enabled,
+            usage_percent: num("GATEWAY_OWNER_PROTECT_USAGE_PERCENT", d.usage_percent),
+            owner_share: num("GATEWAY_OWNER_PROTECT_OWNER_SHARE", d.owner_share),
+        }
+    }
+}
+
+pub(crate) fn owner_protection_config() -> &'static OwnerProtectionConfig {
+    static CONFIG: std::sync::OnceLock<OwnerProtectionConfig> = std::sync::OnceLock::new();
+    CONFIG.get_or_init(OwnerProtectionConfig::from_env)
+}
+
+pub(crate) fn log_startup() {
+    let cfg = owner_protection_config();
+    if cfg.enabled {
+        info!(
+            "owner-heavy-usage protection enabled: usage_percent={} owner_share={}",
+            cfg.usage_percent, cfg.owner_share
+        );
+    } else {
+        info!("owner-heavy-usage protection DISABLED (GATEWAY_OWNER_PROTECTION=off)");
+    }
+}
 
 /// The owner-configured share cap, in percent. None / out-of-range => 100.
 pub(crate) fn effective_share_limit(account: &UpstreamAccount) -> f64 {
@@ -520,10 +576,22 @@ pub(crate) fn owner_needs_protection(
     rate_limits: &HashMap<String, RateLimitSnapshot>,
     owner_usage: &HashMap<String, OwnerUsageStat>,
 ) -> bool {
+    owner_needs_protection_with(owner_protection_config(), account, rate_limits, owner_usage)
+}
+
+fn owner_needs_protection_with(
+    cfg: &OwnerProtectionConfig,
+    account: &UpstreamAccount,
+    rate_limits: &HashMap<String, RateLimitSnapshot>,
+    owner_usage: &HashMap<String, OwnerUsageStat>,
+) -> bool {
+    if !cfg.enabled {
+        return false;
+    }
     let Some(snapshot) = rate_limits.get(&account.id) else {
         return false;
     };
-    if snapshot.secondary_used_percent.unwrap_or(0.0) < OWNER_HEAVY_USAGE_PERCENT {
+    if snapshot.secondary_used_percent.unwrap_or(0.0) < cfg.usage_percent {
         return false;
     }
     let Some(stat) = owner_usage.get(&account.id) else {
@@ -533,7 +601,7 @@ pub(crate) fn owner_needs_protection(
     if total == 0 {
         return false;
     }
-    (stat.owner_billable as f64) / (total as f64) >= OWNER_HEAVY_OWNER_SHARE
+    (stat.owner_billable as f64) / (total as f64) >= cfg.owner_share
 }
 
 /// Combined gate for using an account on behalf of `request_user_id`. The
@@ -657,7 +725,25 @@ mod share_policy_tests {
     }
 
     #[test]
-    fn owner_heavy_guard_reserves_account() {
+    fn owner_heavy_guard_is_off_by_default() {
+        // Donated accounts stay shared: even under owner-heavy usage the default
+        // (env-unset) config never reserves, and non-owners keep borrowing.
+        let a = account("a1", "alice", true, None);
+        let mut limits = HashMap::new();
+        limits.insert("a1".to_string(), snapshot(10.0, 70.0));
+        let mut usage = HashMap::new();
+        usage.insert(
+            "a1".to_string(),
+            OwnerUsageStat { owner_billable: 800, others_billable: 200, computed_at: Some(Utc::now()), ..OwnerUsageStat::default() },
+        );
+        assert!(!owner_needs_protection(&a, &limits, &usage));
+        assert!(account_open_to_requester(&a, "bob", &limits, &usage));
+    }
+
+    #[test]
+    fn owner_heavy_guard_reserves_account_when_enabled() {
+        // Opt-in via config: high weekly window + owner-produced majority.
+        let cfg = OwnerProtectionConfig { enabled: true, usage_percent: 60.0, owner_share: 0.5 };
         let a = account("a1", "alice", true, None);
         let mut limits = HashMap::new();
         limits.insert("a1".to_string(), snapshot(10.0, 70.0));
@@ -667,22 +753,22 @@ mod share_policy_tests {
             OwnerUsageStat { owner_billable: 800, others_billable: 200, computed_at: Some(Utc::now()), ..OwnerUsageStat::default() },
         );
         // Weekly window high + owner produced 80% of it => protected.
-        assert!(owner_needs_protection(&a, &limits, &usage));
-        assert!(!account_open_to_requester(&a, "bob", &limits, &usage));
-        assert!(account_open_to_requester(&a, "alice", &limits, &usage));
+        assert!(owner_needs_protection_with(&cfg, &a, &limits, &usage));
+        // Same inputs, guard disabled => never reserves.
+        assert!(!owner_needs_protection_with(&OwnerProtectionConfig { enabled: false, ..cfg }, &a, &limits, &usage));
         // Mostly consumed by others => not the owner's problem, keep sharing.
         usage.insert(
             "a1".to_string(),
             OwnerUsageStat { owner_billable: 200, others_billable: 800, computed_at: Some(Utc::now()), ..OwnerUsageStat::default() },
         );
-        assert!(!owner_needs_protection(&a, &limits, &usage));
+        assert!(!owner_needs_protection_with(&cfg, &a, &limits, &usage));
         // Low weekly usage => no protection regardless of split.
         limits.insert("a1".to_string(), snapshot(10.0, 30.0));
         usage.insert(
             "a1".to_string(),
             OwnerUsageStat { owner_billable: 800, others_billable: 200, computed_at: Some(Utc::now()), ..OwnerUsageStat::default() },
         );
-        assert!(!owner_needs_protection(&a, &limits, &usage));
+        assert!(!owner_needs_protection_with(&cfg, &a, &limits, &usage));
     }
 
     #[test]
