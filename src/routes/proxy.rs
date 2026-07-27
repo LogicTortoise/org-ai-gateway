@@ -913,6 +913,23 @@ async fn serve_kimi(
     }
 }
 
+/// Backoff schedule for retrying a `Transient` failure on the SAME account
+/// before giving up on it and swapping.
+///
+/// Anthropic's 529 `overloaded_error` is a momentary capacity signal, not an
+/// account-level verdict: the same account usually serves the same request fine
+/// seconds later. Swapping immediately is actively counterproductive, because
+/// the new account has none of this conversation's prompt cache — a 1.2M-char
+/// transcript that cost ~1k `cache_creation` tokens on the bound account has to
+/// be re-cached in full on the new one, turning a cheap request into exactly the
+/// oversized kind that upstream sheds first. So: wait, retry the same account,
+/// keep the cache.
+///
+/// The budget is per REQUEST, not per account, so the worst case stays bounded
+/// at 150s of waiting regardless of pool size (well inside the 600s
+/// `GATEWAY_HTTP_TIMEOUT_SECS` per-attempt ceiling and client timeouts).
+const TRANSIENT_SAME_ACCOUNT_BACKOFF_SECS: [u64; 3] = [15, 45, 90];
+
 /// Serve a request via ONE native (account-pooled, raw-payload) provider —
 /// `codex` (Responses) or `claude`/`glm` (Anthropic) — with account-swap retry,
 /// ported from the Go `proxyRequest` loop. Selects an account, sends, classifies
@@ -962,16 +979,26 @@ async fn serve_native_provider(
     // `audit_token_counts`).
     let request_json_chars = payload.to_string().chars().count();
 
-    let max_attempts = provider_attempt_budget(&state, provider).await;
+    // Attempt budget = one pass over the pool, plus the same-account backoff
+    // retries (which deliberately do NOT consume an account swap).
+    let account_budget = provider_attempt_budget(&state, provider).await;
+    let max_attempts = account_budget + TRANSIENT_SAME_ACCOUNT_BACKOFF_SECS.len();
     let mut excluded: HashSet<String> = HashSet::new();
     let mut selected_any = false;
     let mut last_error: Option<(StatusCode, Value)> = None;
+    // How many same-account backoff retries this request has already spent.
+    let mut transient_retries = 0usize;
+    // The account the previous attempt used, so a same-account retry doesn't
+    // re-charge selection-spread pressure and push itself out of the pool.
+    let mut last_picked: Option<String> = None;
     // Audit data for the most recent failed attempt. Only written when the
     // request FINALLY fails: auditing every retried attempt made one client
     // request show up as N records, inflating the dashboard's error counts by
     // the retry factor. Intermediate failures are traced instead.
     let mut pending_failure_audit: Option<(UpstreamAccount, usize, String)> = None;
-    // Set after a cyber_policy hit to force the next attempt onto a cyber account.
+    // Pins the next attempt to a specific account, bypassing scoring: set after a
+    // cyber_policy hit (to force a cyber account) and by the same-account
+    // transient backoff (to force the cache-warm account it just waited on).
     let mut forced_account: Option<String> = None;
 
     for _ in 0..max_attempts {
@@ -1045,7 +1072,10 @@ async fn serve_native_provider(
         };
         selected_any = true;
         excluded.insert(account.id.clone());
-        note_account_pick(&state, &account.id).await;
+        if last_picked.as_deref() != Some(account.id.as_str()) {
+            note_account_pick(&state, &account.id).await;
+        }
+        last_picked = Some(account.id.clone());
 
         // Claude OAuth (sk-ant-oat) tokens require the full Claude Code fingerprint:
         // system-block injection + metadata + tool-name obfuscation (restored on
@@ -1273,6 +1303,38 @@ async fn serve_native_provider(
 
         // Remember what we'd audit/return if this turns out to be the request's
         // final outcome; an intermediate retried failure is only traced.
+        pending_failure_audit = Some((
+            account_for_request.clone(),
+            body.len(),
+            format!("upstream_error_{}", upstream_status.as_u16()),
+        ));
+        last_error = Some(build_error_payload(upstream_status, provider, &account_for_request.account_label, &body));
+
+        // Transient (529 overloaded, 5xx, Cloudflare challenge): wait it out on
+        // the SAME account first — see TRANSIENT_SAME_ACCOUNT_BACKOFF_SECS for
+        // why swapping straight away makes the next attempt more likely to fail.
+        // 429 is excluded on purpose: RateLimit has its own reset-aware cooldown
+        // and a swap there is the correct move.
+        if class == ErrorClass::Transient && transient_retries < TRANSIENT_SAME_ACCOUNT_BACKOFF_SECS.len() {
+            let wait_secs = TRANSIENT_SAME_ACCOUNT_BACKOFF_SECS[transient_retries];
+            transient_retries += 1;
+            info!(
+                "upstream_error_{} on {} ({} attempt failed, backing off {}s and retrying the SAME account — retry {}/{}, keeps prompt cache)",
+                upstream_status.as_u16(),
+                account_for_request.account_label,
+                provider,
+                wait_secs,
+                transient_retries,
+                TRANSIENT_SAME_ACCOUNT_BACKOFF_SECS.len(),
+            );
+            // Re-admit the account for selection and pin the next attempt to it,
+            // so the retry can't be scored onto a cache-cold peer.
+            excluded.remove(&account_for_request.id);
+            forced_account = Some(account_for_request.id.clone());
+            tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
+            continue;
+        }
+
         info!(
             "upstream_error_{} on {} ({} attempt failed{})",
             upstream_status.as_u16(),
@@ -1280,12 +1342,6 @@ async fn serve_native_provider(
             provider,
             if class.is_retryable() { ", retrying on next account" } else { "" },
         );
-        pending_failure_audit = Some((
-            account_for_request.clone(),
-            body.len(),
-            format!("upstream_error_{}", upstream_status.as_u16()),
-        ));
-        last_error = Some(build_error_payload(upstream_status, provider, &account_for_request.account_label, &body));
 
         if class.is_retryable() {
             continue;

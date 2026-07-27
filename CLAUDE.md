@@ -8,6 +8,8 @@
 
 调度链（provider 顺序 / failover vs round_robin）由 `data/provider_chains.json` 控制，不是 env——说明也在上面那份 SSOT 里。
 
+**降级语义分工（别混）**：链上的 Kimi / GLM 只做**额度降级**（Claude 配额真用尽才接手）；上游瞬时故障（529 `overloaded_error` / 5xx）走**原账号退避重试**，见 `proxy.rs` 的 `TRANSIENT_SAME_ACCOUNT_BACKOFF_SECS`。不要为了提高成功率往 claude 链里加 kimi/glm——换 provider 会让 prompt cache 全废，请求体积暴涨，失败率反而升高。理由详见 [`docs/configuration.md`](docs/configuration.md#降级语义额度降级--失败降级)。
+
 ## 构建 / 启停
 
 ```bash

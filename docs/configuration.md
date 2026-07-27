@@ -136,3 +136,16 @@ GATEWAY_OWNER_PROTECTION=on GATEWAY_HTTP_TIMEOUT_SECS=900 ./scripts/restart.sh -
 ```
 
 （用 `round_robin` 会让 claude 健康时也分流到 kimi，不是降级。）
+
+### 降级语义：额度降级 ≠ 失败降级
+
+链上的 Kimi / GLM 只承担**额度降级**——Claude 账号池的配额真的用尽（429 / 每日额度打满 / 全部 cooling）时，用便宜的上游把请求接住。
+
+**它们不负责失败降级。** 上游的瞬时故障（Anthropic 的 529 `overloaded_error`、5xx、Cloudflare 挑战）不该把请求甩给另一个 provider，原因有两条：
+
+1. **模型不等价**：529 只是上游一时过载，同一个 Claude 账号几十秒后就能正常服务。为此把请求降到 Kimi，是用回答质量换一次本来可以等到的重试。
+2. **prompt cache 会全废**：换 provider（甚至只是换账号）意味着这段对话的缓存前缀完全失效。一个百万字符量级的 transcript 在缓存命中时只付一两千 `cache_creation` token，换人后要全量重建——请求体积暴涨十倍，正好撞在上游最优先拒绝的那一类上，失败概率反而更高。
+
+所以瞬时故障的正解是**原账号退避重试**，实现在 `src/routes/proxy.rs` 的 `TRANSIENT_SAME_ACCOUNT_BACKOFF_SECS`（15s / 45s / 90s，每请求共享 3 次预算，期间用 `forced_account` 把请求钉在缓存热的那个账号上）。只有退避耗尽、或遇到 429 这类真正的额度信号，才轮到换账号 → 换 provider。
+
+**结论**：不要为了"提高成功率"往 claude 链里加 kimi/glm。链是额度兜底，退避是故障兜底，两者不要混。
