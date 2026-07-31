@@ -174,6 +174,32 @@ pub(crate) fn inject_request(payload: &mut Value, account: &UpstreamAccount, use
     if let Some(mobj) = metadata.as_object_mut() {
         mobj.insert("user_id".to_string(), Value::String(user_blob));
     }
+
+    clamp_effort_without_thinking(payload);
+}
+
+/// `effort: "xhigh"` is only valid alongside enabled thinking, but Claude Code
+/// applies its global effort setting to the internal turns that run with thinking
+/// off — web search among them — which upstream rejects with `output_config.effort
+/// 'xhigh' is not supported when thinking is disabled`. Clamp to the highest
+/// effort valid without thinking; turns that do enable thinking keep xhigh.
+fn clamp_effort_without_thinking(payload: &mut Value) {
+    let thinking_enabled = payload
+        .get("thinking")
+        .and_then(|t| t.get("type"))
+        .and_then(|t| t.as_str())
+        == Some("enabled");
+    if thinking_enabled {
+        return;
+    }
+    if let Some(effort) = payload
+        .get_mut("output_config")
+        .and_then(|oc| oc.get_mut("effort"))
+    {
+        if effort.as_str() == Some("xhigh") {
+            *effort = Value::String("high".to_string());
+        }
+    }
 }
 
 /// Replace the `cch=00000` placeholder in the serialized body with the xxhash64
@@ -201,15 +227,40 @@ fn hashed_tool_name(name: &str, salt: u32) -> String {
     format!("t_{}", crate::util::hex_lower(&digest[..4]))
 }
 
-/// Build a deterministic obfuscation map for all tool names referenced in the
-/// payload, rewrite them in place, and return `obfuscated -> original` for
-/// restoring the response. Covers `tools[].name`, `tool_choice.name`, and
-/// `tool_use` blocks in messages.
+/// Build a deterministic obfuscation map for the client-declared tool names
+/// referenced in the payload, rewrite them in place, and return `obfuscated ->
+/// original` for restoring the response. Covers `tools[].name`,
+/// `tool_choice.name`, and `tool_use` blocks in messages. Anthropic server tools
+/// keep their protocol-fixed names untouched.
 pub(crate) fn obfuscate_tool_names(payload: &mut Value) -> HashMap<String, String> {
     let mut forward: HashMap<String, String> = HashMap::new(); // original -> obfuscated
     let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
 
+    // Server tools (`web_search_20250305`, `code_execution_*`, …) carry a
+    // protocol-fixed `name` that upstream validates as a literal, so rewriting it
+    // fails the whole request with `tools.N.<type>.name: Input should be
+    // '<name>'`. Only client-declared tools — no `type`, or `type: "custom"` —
+    // have a free-form name that is safe to obfuscate.
+    let pinned: std::collections::HashSet<String> = payload
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .map(|tools| {
+            tools
+                .iter()
+                .filter(|tool| match tool.get("type").and_then(|t| t.as_str()) {
+                    Some(t) => t != "custom",
+                    None => false,
+                })
+                .filter_map(|tool| tool.get("name").and_then(|n| n.as_str()))
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+
     let mut assign = |original: &str| -> String {
+        if pinned.contains(original) {
+            return original.to_string();
+        }
         if let Some(o) = forward.get(original) {
             return o.clone();
         }
@@ -379,6 +430,69 @@ mod tests {
         let restored = restore_tool_names(body.to_string().as_bytes(), &reverse);
         let restored: Value = serde_json::from_slice(&restored).unwrap();
         assert_eq!(restored["content"][0]["name"].as_str().unwrap(), "Bash");
+    }
+
+    #[test]
+    fn server_tool_names_are_not_obfuscated() {
+        // Upstream validates `web_search_20250305.name` as the literal
+        // "web_search"; obfuscating it 400s the whole request.
+        let mut payload = json!({
+            "tools": [
+                { "type": "web_search_20250305", "name": "web_search", "max_uses": 8 },
+                { "name": "Bash" },
+                { "type": "custom", "name": "Read" }
+            ],
+            "tool_choice": { "type": "tool", "name": "web_search" }
+        });
+        let reverse = obfuscate_tool_names(&mut payload);
+
+        assert_eq!(payload["tools"][0]["name"].as_str().unwrap(), "web_search");
+        assert_eq!(payload["tool_choice"]["name"].as_str().unwrap(), "web_search");
+        // Client tools still get obfuscated, `type: "custom"` included.
+        assert!(payload["tools"][1]["name"].as_str().unwrap().starts_with("t_"));
+        assert!(payload["tools"][2]["name"].as_str().unwrap().starts_with("t_"));
+        // No reverse entry means the response restorer leaves server_tool_use alone.
+        assert!(!reverse.values().any(|v| v == "web_search"));
+
+        let body = json!({ "content": [
+            { "type": "server_tool_use", "name": "web_search", "id": "x" }
+        ]});
+        let restored = restore_tool_names(body.to_string().as_bytes(), &reverse);
+        let restored: Value = serde_json::from_slice(&restored).unwrap();
+        assert_eq!(restored["content"][0]["name"].as_str().unwrap(), "web_search");
+    }
+
+    #[test]
+    fn xhigh_effort_clamped_only_when_thinking_off() {
+        // thinking off -> xhigh is rejected upstream, clamp it.
+        let mut p = json!({ "output_config": { "effort": "xhigh" } });
+        clamp_effort_without_thinking(&mut p);
+        assert_eq!(p["output_config"]["effort"].as_str().unwrap(), "high");
+
+        let mut p = json!({
+            "thinking": { "type": "disabled" },
+            "output_config": { "effort": "xhigh" }
+        });
+        clamp_effort_without_thinking(&mut p);
+        assert_eq!(p["output_config"]["effort"].as_str().unwrap(), "high");
+
+        // thinking on -> xhigh is valid, leave it.
+        let mut p = json!({
+            "thinking": { "type": "enabled", "budget_tokens": 10000 },
+            "output_config": { "effort": "xhigh" }
+        });
+        clamp_effort_without_thinking(&mut p);
+        assert_eq!(p["output_config"]["effort"].as_str().unwrap(), "xhigh");
+
+        // Lower efforts are valid without thinking and must pass through.
+        let mut p = json!({ "output_config": { "effort": "medium" } });
+        clamp_effort_without_thinking(&mut p);
+        assert_eq!(p["output_config"]["effort"].as_str().unwrap(), "medium");
+
+        // No output_config at all must not panic or invent one.
+        let mut p = json!({ "model": "claude-opus-4-7" });
+        clamp_effort_without_thinking(&mut p);
+        assert!(p.get("output_config").is_none());
     }
 
     #[test]
