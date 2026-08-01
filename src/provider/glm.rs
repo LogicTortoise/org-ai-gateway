@@ -26,17 +26,28 @@ use crate::prelude::*;
 use crate::provider::cursor::ExtractedRequest;
 use crate::util::truncate_text;
 
-/// Default GLM model when a request selects the bare `glm` slug (override with
-/// `GLM_DEFAULT_MODEL`).
-const FALLBACK_DEFAULT_MODEL: &str = "glm-5.2";
+/// Built-in default GLM model, used when neither the runtime override nor
+/// `GLM_DEFAULT_MODEL` supplies one. Selected by the bare `glm` slug, and the
+/// shared built-in for all three Claude Code tier slots (GLM has only one
+/// model family in its catalog, so the three slots collapse to the same value
+/// unless the operator overrides them on the model-map panel).
+pub(crate) const BUILTIN_DEFAULT_MODEL: &str = "glm-5.2";
+pub(crate) const BUILTIN_OPUS_MODEL: &str = "glm-5.2";
+pub(crate) const BUILTIN_SONNET_MODEL: &str = "glm-5.2";
+pub(crate) const BUILTIN_FABLE_MODEL: &str = "glm-5.2";
 
 /// STATIC FALLBACK model list, used only when the live `/models` fetch fails
 /// (e.g. no GLM account connected yet). This list can lag behind GLM's actual
-/// catalog — `get_glm_models` prefers the live list, and `GLM_MODELS`
-/// (comma-separated) overrides the whole thing. Any model id also works
+/// catalog — `get_glm_models` prefers the live list, and an override (runtime
+/// edit or `GLM_MODELS`) pins the list outright. Any model id also works
 /// directly via `glm/<id>` regardless of whether it appears here.
-const DEFAULT_GLM_MODELS: &[&str] =
+pub(crate) const BUILTIN_MODELS: &[&str] =
     &["glm-5.2", "glm-4.6", "glm-4.5", "glm-4.5-air", "glm-4.5-x", "glm-4-flash"];
+
+/// This provider's entry in the runtime model-config table.
+fn spec() -> &'static crate::provider::model_config::ProviderModelSpec {
+    crate::provider::model_config::spec("glm").expect("glm model spec")
+}
 
 /// Dedicated HTTP client for GLM. A short connect timeout (fail fast on the
 /// fallback path) and a generous total timeout (long generations).
@@ -69,15 +80,15 @@ pub(crate) fn is_glm_model(model: &str) -> bool {
 }
 
 /// Maps a gateway model name to the upstream GLM model id. `glm/glm-4.6` ->
-/// `glm-4.6`; a bare `glm` -> the configured default; `glm-4.6` -> unchanged.
+/// `glm-4.6`; a native `glm-4.6` -> unchanged; a bare `glm` -> the configured
+/// default. Claude Code traffic arrives as `claude-*` names, which are rewritten
+/// via the standard tier rewrite: opus → opus slot, sonnet (with haiku folded
+/// in) → sonnet slot, fable → fable slot, anything else → default slot.
 pub(crate) fn glm_canonical_model(model: &str) -> String {
     let m = model.trim();
+    let lower = m.to_ascii_lowercase();
     if m.eq_ignore_ascii_case("glm") {
-        return std::env::var("GLM_DEFAULT_MODEL")
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| FALLBACK_DEFAULT_MODEL.to_string());
+        return glm_default_model();
     }
     if let Some(rest) = m
         .strip_prefix("glm/")
@@ -86,7 +97,38 @@ pub(crate) fn glm_canonical_model(model: &str) -> String {
     {
         return rest.to_string();
     }
-    m.to_string()
+    // Native `glm-<id>` ids (e.g. `glm-4.6`, `glm-4.5-air`) pass through to the
+    // upstream unchanged — GLM's catalog uses its own ids and doesn't go
+    // through the tier rewrite.
+    if lower.starts_with("glm-") {
+        return m.to_string();
+    }
+    if lower.contains("opus") {
+        return glm_opus_model();
+    }
+    if lower.contains("haiku") || lower.contains("sonnet") {
+        return glm_sonnet_model();
+    }
+    if lower.contains("fable") {
+        return glm_fable_model();
+    }
+    glm_default_model()
+}
+
+fn glm_default_model() -> String {
+    spec().resolve(crate::provider::model_config::Slot::Default)
+}
+
+fn glm_opus_model() -> String {
+    spec().resolve(crate::provider::model_config::Slot::Opus)
+}
+
+fn glm_sonnet_model() -> String {
+    spec().resolve(crate::provider::model_config::Slot::Sonnet)
+}
+
+fn glm_fable_model() -> String {
+    spec().resolve(crate::provider::model_config::Slot::Fable)
 }
 
 /// The OpenAI-compatible base prefix for a GLM account: its stored `base_url`,
@@ -276,24 +318,19 @@ fn models_from_ids(ids: impl IntoIterator<Item = String>) -> Vec<ModelInfo> {
     out
 }
 
-/// The STATIC fallback model catalog: `GLM_MODELS` override if set, else the
-/// built-in `DEFAULT_GLM_MODELS`. Used when no live list is available.
+/// The STATIC fallback model catalog: the runtime override if set, else
+/// `GLM_MODELS`, else the built-in list. Used when no live list is available.
 pub(crate) fn glm_model_catalog() -> Vec<ModelInfo> {
-    let names: Vec<String> = match std::env::var("GLM_MODELS") {
-        Ok(v) if !v.trim().is_empty() => {
-            v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
-        }
-        _ => DEFAULT_GLM_MODELS.iter().map(|s| s.to_string()).collect(),
-    };
-    models_from_ids(names)
+    models_from_ids(spec().catalog())
 }
 
 /// Fetch the LIVE model list from GLM's OpenAI-compatible `GET {base}/models`.
 /// Returns the upstream ids mapped to `glm/<id>` slugs. Errors (no OpenAI base,
 /// bad key, endpoint absent) bubble up so the caller can fall back to the static
-/// catalog. An explicit `GLM_MODELS` override short-circuits the network call.
+/// catalog. A pinned catalog (runtime override or `GLM_MODELS`) short-circuits
+/// the network call — otherwise the live list would immediately overwrite it.
 pub(crate) async fn fetch_glm_models(account: &UpstreamAccount) -> Result<Vec<ModelInfo>, String> {
-    if std::env::var("GLM_MODELS").map(|v| !v.trim().is_empty()).unwrap_or(false) {
+    if spec().catalog_pinned() {
         return Ok(glm_model_catalog());
     }
     let base = glm_openai_base(account);

@@ -29,9 +29,21 @@ use crate::util::truncate_text;
 /// and `OLLAMA_BASE_URL` is unset.
 pub(crate) const DEFAULT_OLLAMA_BASE_URL: &str = "http://127.0.0.1:11434";
 
-/// Default model when a request selects the bare `ollama` slug (override with
-/// `OLLAMA_DEFAULT_MODEL`).
-const FALLBACK_DEFAULT_MODEL: &str = "llama3";
+/// Built-in default model when a request selects the bare `ollama` slug, used
+/// when neither the runtime override nor `OLLAMA_DEFAULT_MODEL` supplies one.
+/// Also the shared built-in for all three Claude Code tier slots (Ollama's
+/// catalog is operator-defined, so the three slots collapse to the same value
+/// unless the operator overrides them on the model-map panel).
+pub(crate) const BUILTIN_DEFAULT_MODEL: &str = "llama3";
+pub(crate) const BUILTIN_OPUS_MODEL: &str = "llama3";
+pub(crate) const BUILTIN_SONNET_MODEL: &str = "llama3";
+pub(crate) const BUILTIN_FABLE_MODEL: &str = "llama3";
+
+/// This provider's entry in the runtime model-config table.
+fn spec() -> &'static crate::provider::model_config::ProviderModelSpec {
+    crate::provider::model_config::spec("ollama").expect("ollama model spec")
+}
+
 
 /// Dedicated HTTP client for ollama. Local-first: a short connect timeout so an
 /// absent/unreachable ollama fails fast (important on the fallback path, where a
@@ -66,15 +78,14 @@ pub(crate) fn is_ollama_model(model: &str) -> bool {
 }
 
 /// Maps a gateway model name to the upstream ollama model tag. `ollama/llama3`
-/// -> `llama3`; a bare `ollama` -> the configured default model.
+/// -> `llama3`; a bare `ollama` -> the configured default model. Claude Code
+/// traffic arrives as `claude-*` names, which are rewritten via the standard
+/// tier rewrite: opus → opus slot, sonnet (with haiku folded in) → sonnet slot,
+/// fable → fable slot, anything else → default slot.
 pub(crate) fn ollama_canonical_model(model: &str) -> String {
     let m = model.trim();
     if m.eq_ignore_ascii_case("ollama") {
-        return std::env::var("OLLAMA_DEFAULT_MODEL")
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| FALLBACK_DEFAULT_MODEL.to_string());
+        return ollama_default_model();
     }
     if let Some(rest) = m
         .strip_prefix("ollama/")
@@ -82,7 +93,33 @@ pub(crate) fn ollama_canonical_model(model: &str) -> String {
     {
         return rest.to_string();
     }
-    m.to_string()
+    let lower = m.to_ascii_lowercase();
+    if lower.contains("opus") {
+        return ollama_opus_model();
+    }
+    if lower.contains("haiku") || lower.contains("sonnet") {
+        return ollama_sonnet_model();
+    }
+    if lower.contains("fable") {
+        return ollama_fable_model();
+    }
+    ollama_default_model()
+}
+
+fn ollama_default_model() -> String {
+    spec().resolve(crate::provider::model_config::Slot::Default)
+}
+
+fn ollama_opus_model() -> String {
+    spec().resolve(crate::provider::model_config::Slot::Opus)
+}
+
+fn ollama_sonnet_model() -> String {
+    spec().resolve(crate::provider::model_config::Slot::Sonnet)
+}
+
+fn ollama_fable_model() -> String {
+    spec().resolve(crate::provider::model_config::Slot::Fable)
 }
 
 /// The base URL for an ollama account: its stored `base_url`, else the

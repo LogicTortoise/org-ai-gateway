@@ -78,7 +78,10 @@ GATEWAY_OWNER_PROTECTION=on GATEWAY_HTTP_TIMEOUT_SECS=900 ./scripts/restart.sh -
 |---|---|---|
 | `GLM_BASE_URL` | 空（回落到账号 `base_url`） | OpenAI 兼容端点前缀 |
 | `GLM_ANTHROPIC_BASE_URL` | 空（回落到账号 `base_url_alt`） | Anthropic 兼容端点前缀 |
-| `GLM_DEFAULT_MODEL` | `glm-5.2` | 降级到 GLM 时的默认模型 |
+| `GLM_DEFAULT_MODEL` | `glm-5.2` | **默认档**（裸 `glm` slug；独立项，不是 Claude tier） |
+| `GLM_OPUS_MODEL` | `glm-5.2` | **opus 档**（`claude-opus-*`） |
+| `GLM_SONNET_MODEL` | `glm-5.2` | **sonnet + haiku 档**（`claude-sonnet-*`、`claude-haiku-*`） |
+| `GLM_FABLE_MODEL` | `glm-5.2` | **fable 档**（`claude-fable-*`） |
 | `GLM_MODELS` | 内置目录 | 逗号分隔，覆盖 model 目录 |
 | `GLM_TIMEOUT_SECS` | `600` | 超时（秒） |
 
@@ -87,18 +90,82 @@ GATEWAY_OWNER_PROTECTION=on GATEWAY_HTTP_TIMEOUT_SECS=900 ./scripts/restart.sh -
 |---|---|---|
 | `KIMI_BASE_URL` | 内置 Moonshot OpenAI 端点 | OpenAI 兼容端点前缀 |
 | `KIMI_ANTHROPIC_BASE_URL` | `https://api.moonshot.cn/anthropic` | Anthropic 兼容端点前缀 |
-| `KIMI_DEFAULT_MODEL` | `kimi-k2-0711-preview` | 降级到 Kimi 时的默认模型 |
+| `KIMI_DEFAULT_MODEL` | `kimi-k2-0711-preview` | **默认档**（裸 `kimi` slug；独立项，不是 Claude tier） |
+| `KIMI_OPUS_MODEL` | `kimi-k2-0711-preview` | **opus 档**（`claude-opus-*`） |
+| `KIMI_SONNET_MODEL` | `kimi-k2-0711-preview` | **sonnet + haiku 档**（`claude-sonnet-*`、`claude-haiku-*`） |
+| `KIMI_FABLE_MODEL` | `kimi-k2-0711-preview` | **fable 档**（`claude-fable-*`） |
 | `KIMI_MODELS` | 内置目录 | 逗号分隔，覆盖 model 目录 |
 | `KIMI_TIMEOUT_SECS` | `600` | 超时（秒） |
+
+### Trae（trae2anthropic sidecar）
+
+Trae 不是直连的云端 API：Trae IDE 用的是私有的 `api/agent/v3` agent 协议（请求体 AES-256-GCM 加密），网关不直接实现它，而是把流量交给本机的 [`trae2anthropic`](https://github.com/ProjectEio/trae2api) sidecar，由它翻译成 Trae 协议。所以这里配的是 **sidecar 的地址**，不是 Trae 官方地址；具体的 Trae 登录态、多账号轮换、额度耗尽自动禁用都在 sidecar 自己的管理面板（`<base_url>/admin/`）里维护，网关看不到也不管。
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `TRAE_BASE_URL` | `http://127.0.0.1:8788` | sidecar 地址；账号自带的 `base_url` 优先级更高 |
+| `TRAE_DEFAULT_MODEL` | `minimax-m3` | **默认档**（裸 `trae` slug；独立项，不是 Claude tier） |
+| `TRAE_OPUS_MODEL` | `minimax-m3` | **opus 档**（`claude-opus-*`） |
+| `TRAE_SONNET_MODEL` | `minimax-m3` | **sonnet + haiku 档**（`claude-sonnet-*`、`claude-haiku-*`） |
+| `TRAE_FABLE_MODEL` | `minimax-m3` | **fable 档**（`claude-fable-*`） |
+| `TRAE_MODELS` | 内置目录 | 逗号分隔，覆盖 model 目录（设了就不再向 sidecar 拉活列表） |
+| `TRAE_TIMEOUT_SECS` | `600` | 超时（秒） |
+
+**只走 Claude slot。** sidecar 只暴露 Anthropic 形状的 `/v1/messages`，没有 OpenAI 兼容端点，因此 Trae 不能进 Codex 链（chains 校验会拒绝）。
+
+**模型名必须显式带 `trae` 前缀**（`trae` / `trae/<model>` / `trae-<model>`）。Trae 转售的是各家原名（`gpt-5.4`、`kimi-k2.5`、`gemini-3.1-pro`…），裸名不会被识别成 Trae——否则会劫持 Codex / Kimi / GLM 的路由。裸 `trae` 走默认档，从 Claude 链降级过来的 `claude-*` 名字按 3 档改写到对应 `TRAE_*_MODEL`。
+
+**API Key 是可选的**：sidecar 在管理面板没生成 key 之前 API 是开放的，此时账号留空即可；生成了 key 就填进去（网关同时发 `x-api-key` 和 `Authorization: Bearer`）。这里的 401 是 **sidecar 拒绝网关的 key**，不是 Trae 登录失效。
+
+### MiniMax（开放平台，API Key）
+
+直连 MiniMax 官方的 **Anthropic 兼容端点**（`/anthropic/v1/messages`），不需要 sidecar，只要一把 API Key。网关同时发 `Authorization: Bearer` 和 `x-api-key`，哪种鉴权风格都能接住。
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `MINIMAX_BASE_URL` | `https://api.minimaxi.com/anthropic` | Anthropic 兼容端点前缀；账号自带的 `base_url` 优先级更高 |
+| `MINIMAX_DEFAULT_MODEL` | `MiniMax-M3` | **默认档**（裸 `minimax` slug；独立项，不是 Claude tier） |
+| `MINIMAX_OPUS_MODEL` | `MiniMax-M3` | **opus 档**（`claude-opus-*`） |
+| `MINIMAX_SONNET_MODEL` | `MiniMax-M3` | **sonnet + haiku 档**（`claude-sonnet-*`、`claude-haiku-*`） |
+| `MINIMAX_FABLE_MODEL` | `MiniMax-M3` | **fable 档**（`claude-fable-*`） |
+| `MINIMAX_MODELS` | 内置目录 | 逗号分隔，覆盖 model 目录（MiniMax 的 Anthropic 面没有 `/models`，所以目录是静态的） |
+| `MINIMAX_TIMEOUT_SECS` | `600` | 超时（秒） |
+
+**只走 Claude slot。** 网关只把它接到 Anthropic 形状的 `/v1/messages` 上——那条路是带 tool_use 的原样透传；接到 Codex 链要走的 OpenAI 适配层只能转纯文本，工具调用会丢，所以 chains 校验直接拒绝 MiniMax 进 Codex slot。
+
+**模型名大小写会自动修正**：MiniMax 的官方 id 是混合大小写（`MiniMax-M3`），客户端传小写 `minimax-m3` 会被 400；网关按内置目录把已知 id 的大小写还原回去。裸 `minimax` 走默认档，从 Claude 链降级过来的 `claude-*` 名字按 3 档改写到对应 `MINIMAX_*_MODEL`。
+
+### DeepSeek（开放平台，API Key）
+
+同样是直连官方 **Anthropic 兼容端点**（`/anthropic/v1/messages`），一把 API Key 即可。
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `DEEPSEEK_BASE_URL` | `https://api.deepseek.com/anthropic` | Anthropic 兼容端点前缀；账号自带的 `base_url` 优先级更高 |
+| `DEEPSEEK_DEFAULT_MODEL` | `deepseek-v4-pro` | **默认档**（裸 `deepseek` slug + 未匹配到任何 Claude 档的外来名，独立项，不是 Claude tier） |
+| `DEEPSEEK_OPUS_MODEL` | `deepseek-v4-pro` | **opus 档**（`claude-opus-*`） |
+| `DEEPSEEK_SONNET_MODEL` | `deepseek-v4-pro` | **sonnet + haiku 档**（`claude-sonnet-*` 和 `claude-haiku-*` 共享一个上游目标） |
+| `DEEPSEEK_FABLE_MODEL` | `deepseek-v4-flash` | **fable 档**（Claude Code 最便宜的 tier） |
+| `DEEPSEEK_MODELS` | 内置目录 | 逗号分隔，覆盖 model 目录 |
+| `DEEPSEEK_TIMEOUT_SECS` | `600` | 超时（秒） |
+
+**只走 Claude slot**，理由同 MiniMax。
+
+**按 Claude Code 的 3 档 tier 改写**：`claude-opus-*` → `DEEPSEEK_OPUS_MODEL`；`claude-sonnet-*` 和 `claude-haiku-*`（`claude-haiku-4-5-*` / `claude-3-5-haiku-*` 两种写法都认）→ `DEEPSEEK_SONNET_MODEL`（**haiku 合并到 sonnet** —— 两个 tier 共享一个上游目标，因为大多数第三方厂商没有独立的 sonnet 变体）；`claude-fable-*` → `DEEPSEEK_FABLE_MODEL`；裸 `deepseek` slug 或其它未知名 → `DEEPSEEK_DEFAULT_MODEL`（独立项，不是 Claude tier）。和 DeepSeek 官方给的 Claude Code 迁移配方一致，免得后台小任务按 pro 档计费。想要 1M 上下文就把 `DEEPSEEK_OPUS_MODEL` / `DEEPSEEK_SONNET_MODEL` 设成 `deepseek-v4-pro[1m]`。
+
+> `DEEPSEEK_MODELS` 的目录是静态的，这是刻意的：DeepSeek 的 `GET /models` 返回的是它 **OpenAI 面** 的 id（`deepseek-chat` / `deepseek-reasoner`），不是这条 Anthropic 面文档里的 id，拉活列表只会让人选到随后被静默改写的模型名。
 
 ### Ollama（本地）
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `OLLAMA_BASE_URL` | `http://127.0.0.1:11434` | Ollama 服务地址 |
-| `OLLAMA_DEFAULT_MODEL` | `llama3` | 默认模型 |
+| `OLLAMA_DEFAULT_MODEL` | `llama3` | **默认档**（裸 `ollama` slug；独立项，不是 Claude tier） |
+| `OLLAMA_OPUS_MODEL` | `llama3` | **opus 档**（`claude-opus-*`） |
+| `OLLAMA_SONNET_MODEL` | `llama3` | **sonnet + haiku 档**（`claude-sonnet-*`、`claude-haiku-*`） |
+| `OLLAMA_FABLE_MODEL` | `llama3` | **fable 档**（`claude-fable-*`） |
 | `OLLAMA_TIMEOUT_SECS` | `600` | 超时（秒） |
 
-> GLM / Kimi / Ollama 是否真正参与某个协议（Claude / Codex）的调度，取决于 **`data/provider_chains.json`** 里对应 slot 的 `providers` 列表和 `mode`，与这里的 env **无关**。env 只配"怎么连"，chains 配"要不要用、什么顺序"。详见下方。
+> GLM / Kimi / Trae / MiniMax / DeepSeek / Ollama 是否真正参与某个协议（Claude / Codex）的调度，取决于 **`data/provider_chains.json`** 里对应 slot 的 `providers` 列表和 `mode`，与这里的 env **无关**。env 只配"怎么连"，chains 配"要不要用、什么顺序"。详见下方。
 
 ## 日志
 
@@ -126,7 +193,7 @@ GATEWAY_OWNER_PROTECTION=on GATEWAY_HTTP_TIMEOUT_SECS=900 ./scripts/restart.sh -
 - `mode`：
   - `failover` —— 永远从第一个 provider 开始，只有耗尽/失败才降到下一个（**降级**语义）。
   - `round_robin` —— 每个请求轮换**起始 provider**，分摊负载，再按序降级。
-- `providers`：该 slot 依次尝试的 provider 列表。Claude slot 合法值：`claude`/`glm`/`kimi`/`ollama`/`cursor`；Codex slot：`codex`/`glm`/`kimi`/`ollama`/`cursor`。
+- `providers`：该 slot 依次尝试的 provider 列表。Claude slot 合法值：`claude`/`glm`/`kimi`/`minimax`/`deepseek`/`trae`/`ollama`/`cursor`；Codex slot：`codex`/`glm`/`kimi`/`ollama`/`cursor`（`trae`/`minimax`/`deepseek` 只接了 Anthropic 形状的端点，不能进 Codex slot）。
 - **注意**：链 `mode` 只管 **provider 之间**的轮换/降级；**同一 provider 的多个账号之间**的 round-robin 由 pool 选择器单独完成，与链 mode 无关。
 
 例：想让 Kimi 当 Claude 的**降级账号**（claude 全耗尽才用 kimi），配：
@@ -137,9 +204,17 @@ GATEWAY_OWNER_PROTECTION=on GATEWAY_HTTP_TIMEOUT_SECS=900 ./scripts/restart.sh -
 
 （用 `round_robin` 会让 claude 健康时也分流到 kimi，不是降级。）
 
+Trae / MiniMax / DeepSeek 同理，且**只能**用 `failover`：
+
+```json
+"claude": { "mode": "failover", "providers": ["claude", "minimax", "deepseek", "trae"] }
+```
+
+顺序就是尝试顺序，在 WebUI 的「优先级链路」面板里用 ↑/↓ 直接拖，存的就是这个数组。
+
 ### 降级语义：额度降级 ≠ 失败降级
 
-链上的 Kimi / GLM 只承担**额度降级**——Claude 账号池的配额真的用尽（429 / 每日额度打满 / 全部 cooling）时，用便宜的上游把请求接住。
+链上的 Kimi / GLM / MiniMax / DeepSeek / Trae 只承担**额度降级**——Claude 账号池的配额真的用尽（429 / 每日额度打满 / 全部 cooling）时，用便宜的上游把请求接住。
 
 **它们不负责失败降级。** 上游的瞬时故障（Anthropic 的 529 `overloaded_error`、5xx、Cloudflare 挑战）不该把请求甩给另一个 provider，原因有两条：
 
@@ -149,3 +224,49 @@ GATEWAY_OWNER_PROTECTION=on GATEWAY_HTTP_TIMEOUT_SECS=900 ./scripts/restart.sh -
 所以瞬时故障的正解是**原账号退避重试**，实现在 `src/routes/proxy.rs` 的 `TRANSIENT_SAME_ACCOUNT_BACKOFF_SECS`（15s / 45s / 90s，每请求共享 3 次预算，期间用 `forced_account` 把请求钉在缓存热的那个账号上）。只有退避耗尽、或遇到 429 这类真正的额度信号，才轮到换账号 → 换 provider。
 
 **结论**：不要为了"提高成功率"往 claude 链里加 kimi/glm。链是额度兜底，退避是故障兜底，两者不要混。
+
+---
+
+## 相关：模型映射运行时覆盖（`data/provider_models.json`）
+
+上面每个 provider 的 `*_DEFAULT_MODEL` / `*_OPUS_MODEL` / `*_SONNET_MODEL` / `*_FABLE_MODEL` / `*_MODELS` 这类 env，都可以在**运行时**被 `data/provider_models.json` 覆盖，不用改 env、不用重启。这是 WebUI「模型映射」面板保存的东西。
+
+**优先级（从高到低）**：
+
+```
+data/provider_models.json（手改）  >  环境变量  >  代码内置常量
+```
+
+文件形状：provider 名 → 该 provider 的覆盖项，字段全部"空即未覆盖"：
+
+```json
+{
+  "deepseek": {
+    "default_model": "deepseek-v4-pro",
+    "opus_model": "deepseek-v4-pro",
+    "sonnet_model": "deepseek-v4-pro",
+    "fable_model": "deepseek-v4-flash",
+    "models": ["deepseek-v4-pro", "deepseek-v4-flash"]
+  },
+  "minimax": { "default_model": "minimax-m3" }
+}
+```
+
+- `default_model` —— 默认档（裸 provider slug 和未知名兜底，**独立项**，不是 Claude tier）：裸 provider slug（如请求 `model: "kimi"`），以及经链路降级过来但未匹配到任何 Claude 档的模型名，都落到这一档。**每个 provider 都有这个独立项**。
+- `opus_model` —— Opus 档（`claude-opus-*`）。**所有 provider 都声明这一档**；不是 DeepSeek 专属。
+- `sonnet_model` —— Sonnet + Haiku 档（两个 tier 共享一个上游目标，因为大多数第三方厂商没有独立的 sonnet 变体）。**所有 provider 都声明这一档**。`haiku_model` 和旧名 `sonnet_haiku_model` 写入时仍被接受（serde alias 兼容老配置），新配置请用 `sonnet_model`。
+- `fable_model` —— Fable 档（`claude-fable-*`，Claude Code 最便宜的 tier）。**所有 provider 都声明这一档**。
+- `models` —— 整份模型清单覆盖。**非空即"钉死"**：GLM / Kimi / Trae / Ollama 平时会去上游 `GET /models` 拉清单，一旦这里填了内容（或对应 `*_MODELS` env 有值），就不再拉，直接用这份——否则刚填的清单会立刻被上游拉回的覆盖掉。
+- 空字符串 / 空数组 = 未覆盖，回落到 env；某 provider 全部字段都空则整条记录不落盘，文件不积垃圾。
+
+**读写方式**：
+
+| 端点 | 权限 | 作用 |
+|---|---|---|
+| `GET /v1/provider/model-map` | 任意已识别调用方 | 每档的 `matches` / env 名 / 内置值 / 当前覆盖 / **实际生效值 + 来源标记**（`override` / `env` / `builtin` / `live`）。每个 provider 都返回 4 行（`default` / `opus` / `sonnet` / `fable`）。 |
+| `PUT /v1/provider/model-map` | 仅 owner-trusted | 覆盖任意子集；未提及的 provider 保持原样；保存失败会回滚内存态 |
+| `POST /v1/provider/model-map/test` | 仅 owner-trusted | 按**当前已保存**的映射真发一次 `max_tokens: 1` 的最小请求，回报 HTTP 状态、耗时、发出的模型、**上游实际应答的模型**（`parse_response_model`）、token 用量。`slot` 字段可传 `default` / `opus` / `sonnet`（亦接受简写 `haiku`，已合并到 sonnet 档） / `fable`。 |
+
+改动**立即对下一个请求生效**（没有任何地方缓存解析结果），不需要重启——这是它和 env 最大的区别。
+
+> 匹配**规则**（哪些客户端模型名落到哪一档）写死在 Rust 里（`src/provider/model_config.rs` 的 `PROVIDER_MODEL_SPECS`），面板只编辑各档的**目标模型**和清单，不编辑规则。

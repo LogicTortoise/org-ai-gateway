@@ -31,17 +31,22 @@ use crate::prelude::*;
 use crate::provider::cursor::ExtractedRequest;
 use crate::util::truncate_text;
 
-/// Default Kimi model when a request selects the bare `kimi` slug (override with
-/// `KIMI_DEFAULT_MODEL`). This is what a `claude-*` request degraded onto the
-/// Kimi fallback ends up running.
-const FALLBACK_DEFAULT_MODEL: &str = "kimi-k2-0711-preview";
+/// Built-in default Kimi model, used when neither the runtime override nor
+/// `KIMI_DEFAULT_MODEL` supplies one. Also the shared built-in for all three
+/// Claude Code tier slots (Kimi has only one model family in its catalog, so
+/// the three slots collapse to the same value unless the operator overrides
+/// them on the model-map panel).
+pub(crate) const BUILTIN_DEFAULT_MODEL: &str = "kimi-k2-0711-preview";
+pub(crate) const BUILTIN_OPUS_MODEL: &str = "kimi-k2-0711-preview";
+pub(crate) const BUILTIN_SONNET_MODEL: &str = "kimi-k2-0711-preview";
+pub(crate) const BUILTIN_FABLE_MODEL: &str = "kimi-k2-0711-preview";
 
-/// STATIC FALLBACK model list, used only when the live `/models` fetch fails
-/// (e.g. no Kimi account connected yet). Can lag behind Moonshot's actual
-/// catalog — `fetch_kimi_models` prefers the live list, and `KIMI_MODELS`
-/// (comma-separated) overrides the whole thing. Any model id also works
-/// directly via `kimi/<id>` regardless of whether it appears here.
-const DEFAULT_KIMI_MODELS: &[&str] = &[
+/// Built-in static fallback model list, used only when the live `/models`
+/// fetch fails (e.g. no Kimi account connected yet). Can lag behind Moonshot's
+/// actual catalog — `fetch_kimi_models` prefers the live list, and an override
+/// (runtime edit or `KIMI_MODELS`) pins the list outright. Any model id also
+/// works directly via `kimi/<id>` regardless of whether it appears here.
+pub(crate) const BUILTIN_MODELS: &[&str] = &[
     "kimi-k2-0711-preview",
     "kimi-k2-turbo-preview",
     "kimi-latest",
@@ -49,6 +54,11 @@ const DEFAULT_KIMI_MODELS: &[&str] = &[
     "moonshot-v1-32k",
     "moonshot-v1-128k",
 ];
+
+/// This provider's entry in the runtime model-config table.
+fn spec() -> &'static crate::provider::model_config::ProviderModelSpec {
+    crate::provider::model_config::spec("kimi").expect("kimi model spec")
+}
 
 /// Built-in Moonshot endpoints. Used when neither the account nor the env
 /// override supplies a base URL, so connecting a Kimi account only needs an api
@@ -94,15 +104,14 @@ pub(crate) fn is_kimi_model(model: &str) -> bool {
 
 /// Maps a gateway model name to the upstream Kimi model id. `kimi/kimi-latest` ->
 /// `kimi-latest`; a bare `kimi`/`moonshot` -> the configured default; a native
-/// `kimi-*` / `moonshot-*` id -> unchanged.
+/// `kimi-*` / `moonshot-*` id -> unchanged. Claude Code traffic arrives as
+/// `claude-*` names, which are rewritten via the standard tier rewrite: opus →
+/// opus slot, sonnet (with haiku folded in) → sonnet slot, fable → fable slot,
+/// anything else → default slot.
 pub(crate) fn kimi_canonical_model(model: &str) -> String {
     let m = model.trim();
     if m.eq_ignore_ascii_case("kimi") || m.eq_ignore_ascii_case("moonshot") {
-        return std::env::var("KIMI_DEFAULT_MODEL")
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| FALLBACK_DEFAULT_MODEL.to_string());
+        return kimi_default_model();
     }
     let lower = m.to_ascii_lowercase();
     if lower.starts_with("kimi/") {
@@ -111,7 +120,35 @@ pub(crate) fn kimi_canonical_model(model: &str) -> String {
     if lower.starts_with("moonshot/") {
         return m["moonshot/".len()..].to_string();
     }
-    m.to_string()
+    if lower.starts_with("kimi-") || lower.starts_with("moonshot-") {
+        return m.to_string();
+    }
+    if lower.contains("opus") {
+        return kimi_opus_model();
+    }
+    if lower.contains("haiku") || lower.contains("sonnet") {
+        return kimi_sonnet_model();
+    }
+    if lower.contains("fable") {
+        return kimi_fable_model();
+    }
+    kimi_default_model()
+}
+
+fn kimi_default_model() -> String {
+    spec().resolve(crate::provider::model_config::Slot::Default)
+}
+
+fn kimi_opus_model() -> String {
+    spec().resolve(crate::provider::model_config::Slot::Opus)
+}
+
+fn kimi_sonnet_model() -> String {
+    spec().resolve(crate::provider::model_config::Slot::Sonnet)
+}
+
+fn kimi_fable_model() -> String {
+    spec().resolve(crate::provider::model_config::Slot::Fable)
 }
 
 /// The OpenAI-compatible base prefix for a Kimi account: its stored `base_url`,
@@ -312,24 +349,19 @@ fn models_from_ids(ids: impl IntoIterator<Item = String>) -> Vec<ModelInfo> {
     out
 }
 
-/// The STATIC fallback model catalog: `KIMI_MODELS` override if set, else the
-/// built-in `DEFAULT_KIMI_MODELS`. Used when no live list is available.
+/// The STATIC fallback model catalog: runtime override, else `KIMI_MODELS`,
+/// else the built-in list. Used when no live list is available.
 pub(crate) fn kimi_model_catalog() -> Vec<ModelInfo> {
-    let names: Vec<String> = match std::env::var("KIMI_MODELS") {
-        Ok(v) if !v.trim().is_empty() => {
-            v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
-        }
-        _ => DEFAULT_KIMI_MODELS.iter().map(|s| s.to_string()).collect(),
-    };
-    models_from_ids(names)
+    models_from_ids(spec().catalog())
 }
 
 /// Fetch the LIVE model list from Kimi's OpenAI-compatible `GET {base}/models`.
 /// Returns the upstream ids mapped to `kimi/<id>` slugs. Errors (bad key,
 /// endpoint absent) bubble up so the caller can fall back to the static catalog.
-/// An explicit `KIMI_MODELS` override short-circuits the network call.
+/// A pinned catalog (runtime override or `KIMI_MODELS`) short-circuits the
+/// network call — otherwise the live list would immediately overwrite it.
 pub(crate) async fn fetch_kimi_models(account: &UpstreamAccount) -> Result<Vec<ModelInfo>, String> {
-    if std::env::var("KIMI_MODELS").map(|v| !v.trim().is_empty()).unwrap_or(false) {
+    if spec().catalog_pinned() {
         return Ok(kimi_model_catalog());
     }
     let base = kimi_openai_base(account);

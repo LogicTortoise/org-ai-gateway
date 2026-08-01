@@ -8,7 +8,17 @@
          degrades to unstyled HTML but stays functional. Vendor it if needed. -->
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
-        body { font-family: 'Inter', -apple-system, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif; }
+        /* Single font stack for the whole page. Tailwind's font-mono utility
+           (ui-monospace / SF Mono / Consolas) and Inter's fallback chain would
+           otherwise produce two visibly different faces for inputs vs body
+           text — model ids in inputs read as one font, surrounding prose as
+           another. Force everything (including form controls) onto the same
+           stack so the page looks like one design system, not two glued
+           together. Real terminal / code-block outputs elsewhere still get
+           font-mono by Tailwind class. */
+        body, input, textarea, select, button, code, pre, kbd, samp {
+            font-family: 'Inter', -apple-system, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+        }
         ::-webkit-scrollbar { width: 8px; height: 8px; }
         ::-webkit-scrollbar-track { background: transparent; }
         ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
@@ -60,6 +70,10 @@
                     <a href="#" onclick="switchTab('upstreams')" id="nav-upstreams" class="nav-item active flex items-center px-3 py-2 text-sm font-medium text-gray-600 rounded-md">
                         <svg class="w-5 h-5 mr-3 text-gray-400 transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 002-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>
                         <span data-i18n="navAccounts">账号池管理</span>
+                    </a>
+                    <a href="#" onclick="switchTab('modelmap')" id="nav-modelmap" class="nav-item flex items-center px-3 py-2 text-sm font-medium text-gray-600 rounded-md">
+                        <svg class="w-5 h-5 mr-3 text-gray-400 transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4"></path></svg>
+                        <span data-i18n="navModelMap">模型映射</span>
                     </a>
                     <a href="#" onclick="switchTab('stats')" id="nav-stats" class="nav-item flex items-center px-3 py-2 text-sm font-medium text-gray-600 rounded-md">
                         <svg class="w-5 h-5 mr-3 text-gray-400 transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"></path></svg>
@@ -160,6 +174,18 @@
                         <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"></path></svg>
                         <span data-i18n="importKimi">连接 Kimi</span>
                     </button>
+                    <button id="connectTraeBtn" class="bg-sky-700 hover:bg-sky-800 text-white px-4 py-2 rounded-md shadow-sm text-sm font-medium flex items-center gap-2 transition">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"></path></svg>
+                        <span data-i18n="importTrae">连接 Trae</span>
+                    </button>
+                    <button id="connectMinimaxBtn" class="bg-rose-600 hover:bg-rose-700 text-white px-4 py-2 rounded-md shadow-sm text-sm font-medium flex items-center gap-2 transition">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"></path></svg>
+                        <span data-i18n="importMinimax">连接 MiniMax</span>
+                    </button>
+                    <button id="connectDeepseekBtn" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-md shadow-sm text-sm font-medium flex items-center gap-2 transition">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"></path></svg>
+                        <span data-i18n="importDeepseek">连接 DeepSeek</span>
+                    </button>
                 </div>
             </div>
 
@@ -184,6 +210,9 @@
                     <option value="ollama">Ollama</option>
                     <option value="glm">GLM</option>
                     <option value="kimi">Kimi</option>
+                    <option value="trae">Trae</option>
+                    <option value="minimax">MiniMax</option>
+                    <option value="deepseek">DeepSeek</option>
                 </select>
                 <select id="statusFilter" onchange="applyAccountFilters()" class="bg-gray-50 border border-gray-200 rounded-md px-4 py-2 text-sm focus:outline-none focus:bg-white focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition min-w-[160px]">
                     <option value="" data-i18n="allStatuses">所有状态</option>
@@ -196,6 +225,16 @@
             <!-- Accounts Grid -->
             <div id="accountsGrid" class="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-6">
                 <!-- Cards injected via JS -->
+            </div>
+        </div>
+
+        <!-- Tab: Model mapping -->
+        <div id="tab-modelmap" class="tab-content hidden flex-1 overflow-y-auto p-8">
+            <div class="mb-6">
+                <p class="text-sm text-gray-500" data-i18n="descModelMap">客户端请求的模型名，在各 provider 上实际会发往上游哪个模型。改完点「测试」真发一次最小请求验证是否打通。</p>
+            </div>
+            <div id="modelMapPanel">
+                <!-- Rendered by renderModelMap() -->
             </div>
         </div>
 
@@ -234,6 +273,9 @@
                                 <option value="ollama">Ollama</option>
                                 <option value="glm">GLM</option>
                                 <option value="kimi">Kimi</option>
+                                <option value="trae">Trae</option>
+                                <option value="minimax">MiniMax</option>
+                                <option value="deepseek">DeepSeek</option>
                             </select>
                         </div>
 
@@ -470,6 +512,102 @@
         </div>
     </div>
 
+    <!-- Trae connect modal. Only two fields: the sidecar's base URL and an
+         OPTIONAL API key — the real Trae logins live inside trae2anthropic's own
+         admin panel, not here. And no second base_url: the sidecar exposes only
+         an Anthropic-shaped /v1/messages, so Trae is Claude-slot-only. -->
+    <div id="traeModal" class="fixed inset-0 z-50 hidden items-center justify-center bg-black/40 p-4">
+        <div class="bg-white rounded-xl shadow-2xl w-full max-w-lg p-6">
+            <h3 class="text-lg font-semibold text-gray-900 mb-1" data-i18n="traeModalTitle">连接 Trae 账号</h3>
+            <p class="text-xs text-gray-500 mb-4" data-i18n="traeHint">指向本机 trae2anthropic sidecar（默认 http://127.0.0.1:8788）。Trae 登录态在 sidecar 的管理面板里维护，本网关只做 Claude 流量降级。</p>
+            <div class="space-y-3">
+                <div>
+                    <label class="block text-xs font-medium text-gray-600 mb-1" data-i18n="traeBaseUrl">Sidecar base_url</label>
+                    <input id="traeBaseUrl" type="text" placeholder="http://127.0.0.1:8788" class="w-full border border-gray-300 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-sky-500 focus:ring-1 focus:ring-sky-500">
+                </div>
+                <div>
+                    <label class="block text-xs font-medium text-gray-600 mb-1" data-i18n="traeApiKey">API Key（可选）</label>
+                    <input id="traeApiKey" type="password" autocomplete="off" class="w-full border border-gray-300 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-sky-500 focus:ring-1 focus:ring-sky-500">
+                </div>
+                <div>
+                    <label class="block text-xs font-medium text-gray-600 mb-1" data-i18n="traeLabel">备注名（可选）</label>
+                    <input id="traeLabel" type="text" class="w-full border border-gray-300 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-sky-500 focus:ring-1 focus:ring-sky-500">
+                </div>
+                <label class="flex items-center gap-2 text-sm text-gray-700"><input id="traeShareEnabled" type="checkbox" class="rounded"> <span data-i18n="traeShareEnabled">加入共享池</span></label>
+                <label class="flex items-center gap-2 text-sm text-gray-700"><input id="traeSkipProbe" type="checkbox" class="rounded"> <span data-i18n="traeSkipProbe">跳过连通性探测</span></label>
+            </div>
+            <div class="flex justify-end gap-3 mt-6">
+                <button id="traeCancelBtn" class="px-4 py-2 rounded-md text-sm font-medium text-gray-600 hover:bg-gray-100" data-i18n="cancelBtn">取消</button>
+                <button id="traeSaveBtn" class="px-4 py-2 rounded-md text-sm font-medium text-white bg-sky-700 hover:bg-sky-800" data-i18n="saveBtn">保存</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- MiniMax connect modal. API-key only; the base_url is advanced (MiniMax's
+         Anthropic-compatible endpoint is fixed for the public cloud). Claude-slot
+         only — MiniMax is wired to /v1/messages, not to any OpenAI surface here. -->
+    <div id="minimaxModal" class="fixed inset-0 z-50 hidden items-center justify-center bg-black/40 p-4">
+        <div class="bg-white rounded-xl shadow-2xl w-full max-w-lg p-6">
+            <h3 class="text-lg font-semibold text-gray-900 mb-1" data-i18n="minimaxModalTitle">连接 MiniMax 账号</h3>
+            <p class="text-xs text-gray-500 mb-4" data-i18n="minimaxHint">只需填 MiniMax 开放平台 API Key，端点默认指向官方 Anthropic 兼容地址。只作为 Claude Code（/v1/messages）的降级账号。</p>
+            <div class="space-y-3">
+                <div>
+                    <label class="block text-xs font-medium text-gray-600 mb-1" data-i18n="minimaxApiKey">API Key</label>
+                    <input id="minimaxApiKey" type="password" autocomplete="off" class="w-full border border-gray-300 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-rose-500 focus:ring-1 focus:ring-rose-500">
+                </div>
+                <details class="text-xs text-gray-500">
+                    <summary class="cursor-pointer select-none" data-i18n="minimaxAdvanced">高级：自定义端点（留空用官方默认）</summary>
+                    <div class="mt-3">
+                        <label class="block text-xs font-medium text-gray-600 mb-1" data-i18n="minimaxBaseUrl">Anthropic 兼容 base_url</label>
+                        <input id="minimaxBaseUrl" type="text" placeholder="https://api.minimaxi.com/anthropic" class="w-full border border-gray-300 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-rose-500 focus:ring-1 focus:ring-rose-500">
+                    </div>
+                </details>
+                <div>
+                    <label class="block text-xs font-medium text-gray-600 mb-1" data-i18n="minimaxLabel">备注名（可选）</label>
+                    <input id="minimaxLabel" type="text" class="w-full border border-gray-300 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-rose-500 focus:ring-1 focus:ring-rose-500">
+                </div>
+                <label class="flex items-center gap-2 text-sm text-gray-700"><input id="minimaxShareEnabled" type="checkbox" class="rounded"> <span data-i18n="minimaxShareEnabled">加入共享池</span></label>
+                <label class="flex items-center gap-2 text-sm text-gray-700"><input id="minimaxSkipProbe" type="checkbox" class="rounded"> <span data-i18n="minimaxSkipProbe">跳过连通性探测</span></label>
+            </div>
+            <div class="flex justify-end gap-3 mt-6">
+                <button id="minimaxCancelBtn" class="px-4 py-2 rounded-md text-sm font-medium text-gray-600 hover:bg-gray-100" data-i18n="cancelBtn">取消</button>
+                <button id="minimaxSaveBtn" class="px-4 py-2 rounded-md text-sm font-medium text-white bg-rose-600 hover:bg-rose-700" data-i18n="saveBtn">保存</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- DeepSeek connect modal. Same shape as MiniMax: API key + optional
+         Anthropic-compatible base_url, Claude slot only. -->
+    <div id="deepseekModal" class="fixed inset-0 z-50 hidden items-center justify-center bg-black/40 p-4">
+        <div class="bg-white rounded-xl shadow-2xl w-full max-w-lg p-6">
+            <h3 class="text-lg font-semibold text-gray-900 mb-1" data-i18n="deepseekModalTitle">连接 DeepSeek 账号</h3>
+            <p class="text-xs text-gray-500 mb-4" data-i18n="deepseekHint">只需填 DeepSeek 开放平台 API Key，端点默认指向官方 Anthropic 兼容地址。只作为 Claude Code（/v1/messages）的降级账号，haiku 档会自动落到 deepseek-v4-flash。</p>
+            <div class="space-y-3">
+                <div>
+                    <label class="block text-xs font-medium text-gray-600 mb-1" data-i18n="deepseekApiKey">API Key</label>
+                    <input id="deepseekApiKey" type="password" autocomplete="off" class="w-full border border-gray-300 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500">
+                </div>
+                <details class="text-xs text-gray-500">
+                    <summary class="cursor-pointer select-none" data-i18n="deepseekAdvanced">高级：自定义端点（留空用官方默认）</summary>
+                    <div class="mt-3">
+                        <label class="block text-xs font-medium text-gray-600 mb-1" data-i18n="deepseekBaseUrl">Anthropic 兼容 base_url</label>
+                        <input id="deepseekBaseUrl" type="text" placeholder="https://api.deepseek.com/anthropic" class="w-full border border-gray-300 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500">
+                    </div>
+                </details>
+                <div>
+                    <label class="block text-xs font-medium text-gray-600 mb-1" data-i18n="deepseekLabel">备注名（可选）</label>
+                    <input id="deepseekLabel" type="text" class="w-full border border-gray-300 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500">
+                </div>
+                <label class="flex items-center gap-2 text-sm text-gray-700"><input id="deepseekShareEnabled" type="checkbox" class="rounded"> <span data-i18n="deepseekShareEnabled">加入共享池</span></label>
+                <label class="flex items-center gap-2 text-sm text-gray-700"><input id="deepseekSkipProbe" type="checkbox" class="rounded"> <span data-i18n="deepseekSkipProbe">跳过连通性探测</span></label>
+            </div>
+            <div class="flex justify-end gap-3 mt-6">
+                <button id="deepseekCancelBtn" class="px-4 py-2 rounded-md text-sm font-medium text-gray-600 hover:bg-gray-100" data-i18n="cancelBtn">取消</button>
+                <button id="deepseekSaveBtn" class="px-4 py-2 rounded-md text-sm font-medium text-white bg-blue-600 hover:bg-blue-700" data-i18n="saveBtn">保存</button>
+            </div>
+        </div>
+    </div>
+
     <!-- Chart Tooltip -->
     <div id="chartTooltip" class="fixed hidden z-50 bg-gray-900 text-white text-xs rounded-lg shadow-xl p-3 pointer-events-none transform -translate-x-1/2 -translate-y-full mt-[-15px] min-w-[140px]">
         <div id="ctDate" class="font-semibold text-gray-300 mb-2 border-b border-gray-700 pb-1"></div>
@@ -500,7 +638,7 @@
             zh: {
                 docTitle: 'OrgMesh - AI 网关',
                 navSharer: '分享者', navUser: '使用者',
-                navAccounts: '账号池管理', navStats: '使用量统计', navCapacity: '容量预测',
+                navAccounts: '账号池管理', navModelMap: '模型映射', navStats: '使用量统计', navCapacity: '容量预测',
                 navPlayground: '请求测试', navSetup: '本地配置',
                 navDeploy: '部署', navOnboarding: '接入说明', navApiKeys: 'API 密钥',
                 copy: '复制', copied: '已复制', copyFailed: '复制失败',
@@ -514,6 +652,7 @@
                 thLabel: '备注', thKey: '密钥', thCreated: '创建时间', thStatus: '状态', thAction: '操作',
                 sysStatus: '系统状态', currentUser: '当前用户',
                 descUpstreams: '导入本机 Codex / Claude / Cursor 登录态，检查账号就绪状态，并保持账号访问有效。',
+                descModelMap: '客户端请求的模型名，在各 provider 上实际会发往上游哪个模型。改完点「测试」真发一次最小请求验证是否打通。',
                 importCodex: '导入 Codex', importClaude: '导入 Claude', importCursor: '导入 Cursor', importGlm: '连接 GLM',
                 glmModalTitle: '连接 GLM 账号', glmApiKey: 'API Key', glmLabel: '备注名（可选）',
                 glmBaseUrl: 'OpenAI 兼容 base_url（Codex 流量用）', glmBaseUrlAlt: 'Anthropic 兼容 base_url（Claude 流量用）',
@@ -524,11 +663,36 @@
                 kimiAdvanced: '高级：自定义端点（留空用官方默认）',
                 kimiShareEnabled: '加入共享池', kimiSkipProbe: '跳过连通性探测',
                 kimiHint: '只需填 Moonshot API Key，端点默认指向官方地址。可作为 Claude Code 的降级账号。', kimiConnected: 'Kimi 账号已连接',
+                importTrae: '连接 Trae', traeModalTitle: '连接 Trae 账号', traeApiKey: 'API Key（可选）', traeLabel: '备注名（可选）',
+                traeBaseUrl: 'Sidecar base_url', traeShareEnabled: '加入共享池', traeSkipProbe: '跳过连通性探测',
+                traeHint: '指向本机 trae2anthropic sidecar（默认 http://127.0.0.1:8788）。Trae 登录态在 sidecar 的管理面板里维护，本网关只做 Claude 流量降级。', traeConnected: 'Trae 账号已连接',
+                importMinimax: '连接 MiniMax', minimaxModalTitle: '连接 MiniMax 账号', minimaxApiKey: 'API Key', minimaxLabel: '备注名（可选）',
+                minimaxBaseUrl: 'Anthropic 兼容 base_url', minimaxAdvanced: '高级：自定义端点（留空用官方默认）',
+                minimaxShareEnabled: '加入共享池', minimaxSkipProbe: '跳过连通性探测',
+                minimaxHint: '只需填 MiniMax 开放平台 API Key，端点默认指向官方 Anthropic 兼容地址。只作为 Claude Code（/v1/messages）的降级账号。', minimaxConnected: 'MiniMax 账号已连接',
+                importDeepseek: '连接 DeepSeek', deepseekModalTitle: '连接 DeepSeek 账号', deepseekApiKey: 'API Key', deepseekLabel: '备注名（可选）',
+                deepseekBaseUrl: 'Anthropic 兼容 base_url', deepseekAdvanced: '高级：自定义端点（留空用官方默认）',
+                deepseekShareEnabled: '加入共享池', deepseekSkipProbe: '跳过连通性探测',
+                deepseekHint: '只需填 DeepSeek 开放平台 API Key，端点默认指向官方 Anthropic 兼容地址。只作为 Claude Code（/v1/messages）的降级账号，haiku 档会自动落到 deepseek-v4-flash。', deepseekConnected: 'DeepSeek 账号已连接',
                 cancelBtn: '取消', saveBtn: '保存',
                 chainsTitle: '优先级链路', chainsDesc: '为 Codex / Claude 两类入口分别配置 provider 顺序，以及「依次降级」或「循环使用」策略。',
                 chainCodex: 'Codex 入口 (/v1/responses)', chainClaude: 'Claude 入口 (/v1/messages)',
                 modeFailover: '依次降级', modeRoundRobin: '循环使用', addProvider: '+ 添加 provider', saveChains: '保存链路',
                 chainsSaved: '优先级链路已保存', moveUp: '上移', moveDown: '下移', removeItem: '移除',
+                modelMapMatches: '匹配', modelMapEnv: '环境变量', modelMapBuiltin: '内置默认',
+                modelMapOverridePh: '留空 = 用下面的默认值', modelMapEffective: '实际生效',
+                srcOverride: '手改', srcEnv: '环境变量', srcBuiltin: '内置', srcLive: '上游拉取',
+                modelMapCatalog: '模型清单', modelMapCatalogHint: '逗号分隔；留空则用环境变量 / 内置 / 上游拉取的清单。填了就等于「钉死」，不再从上游拉。',
+                modelMapCatalogLive: '（默认从上游 /models 拉取）',
+                modelMapSave: '保存映射', modelMapSaved: '模型映射已保存', modelMapTest: '测试', modelMapDetails: '说明',
+                modelMapSlotOpus: 'opus 档', modelMapSlotSonnet: 'sonnet 档', modelMapSlotFable: 'fable 档',
+                modelMapDefaultSlot: '裸 slug / 未知名（独立项）',
+                modelMapClickToFillHint: '点候选 → 填到当前聚焦的输入框',
+                modelMapFillHereFirst: '请先点要填的输入框，再点候选',
+                modelMapTesting: '测试中…', modelMapReset: '还原',
+                modelMapTestOk: '通了', modelMapTestFailed: '失败',
+                modelMapSent: '发出', modelMapServed: '上游应答', modelMapTokens: 'token', modelMapLatency: '耗时',
+                modelMapAccount: '账号',
                 searchPlaceholder: '搜索账号 / 所有者...',
                 allPlatforms: '所有平台', allStatuses: '所有状态',
                 statusActive: '活跃 (有请求)', statusShared: '已共享', statusPrivate: '私有',
@@ -648,7 +812,7 @@
             en: {
                 docTitle: 'OrgMesh - AI Gateway',
                 navSharer: 'Sharers', navUser: 'Users',
-                navAccounts: 'Account Pool', navStats: 'Usage Stats', navCapacity: 'Capacity Forecast',
+                navAccounts: 'Account Pool', navModelMap: 'Model Mapping', navStats: 'Usage Stats', navCapacity: 'Capacity Forecast',
                 navPlayground: 'Playground', navSetup: 'Local Setup',
                 navDeploy: 'Deploy', navOnboarding: 'Integration', navApiKeys: 'API Keys',
                 copy: 'Copy', copied: 'Copied', copyFailed: 'Copy failed',
@@ -662,6 +826,7 @@
                 thLabel: 'Label', thKey: 'Key', thCreated: 'Created', thStatus: 'Status', thAction: 'Action',
                 sysStatus: 'System Status', currentUser: 'Current user',
                 descUpstreams: 'Import local Codex / Claude / Cursor sessions, check account readiness, and keep account access valid.',
+                descModelMap: 'Which upstream model each provider will send for a given client-side model name. Click “Test” to fire a minimal request and verify after edits.',
                 importCodex: 'Import Codex', importClaude: 'Import Claude', importCursor: 'Import Cursor', importGlm: 'Connect GLM',
                 glmModalTitle: 'Connect a GLM account', glmApiKey: 'API Key', glmLabel: 'Label (optional)',
                 glmBaseUrl: 'OpenAI-compatible base_url (for Codex traffic)', glmBaseUrlAlt: 'Anthropic-compatible base_url (for Claude traffic)',
@@ -672,11 +837,36 @@
                 kimiAdvanced: 'Advanced: custom endpoints (leave blank for official defaults)',
                 kimiShareEnabled: 'Add to shared pool', kimiSkipProbe: 'Skip reachability probe',
                 kimiHint: 'Just paste your Moonshot API key — endpoints default to the official URLs. Works as a Claude Code fallback.', kimiConnected: 'Kimi account connected',
+                importTrae: 'Connect Trae', traeModalTitle: 'Connect a Trae account', traeApiKey: 'API Key (optional)', traeLabel: 'Label (optional)',
+                traeBaseUrl: 'Sidecar base_url', traeShareEnabled: 'Add to shared pool', traeSkipProbe: 'Skip reachability probe',
+                traeHint: 'Points at the local trae2anthropic sidecar (default http://127.0.0.1:8788). Trae logins live in the sidecar admin panel; this gateway only uses it as a Claude fallback.', traeConnected: 'Trae account connected',
+                importMinimax: 'Connect MiniMax', minimaxModalTitle: 'Connect a MiniMax account', minimaxApiKey: 'API Key', minimaxLabel: 'Label (optional)',
+                minimaxBaseUrl: 'Anthropic-compatible base_url', minimaxAdvanced: 'Advanced: custom endpoint (blank = official default)',
+                minimaxShareEnabled: 'Add to shared pool', minimaxSkipProbe: 'Skip reachability probe',
+                minimaxHint: 'Just a MiniMax platform API key; the endpoint defaults to their official Anthropic-compatible URL. Claude Code (/v1/messages) fallback only.', minimaxConnected: 'MiniMax account connected',
+                importDeepseek: 'Connect DeepSeek', deepseekModalTitle: 'Connect a DeepSeek account', deepseekApiKey: 'API Key', deepseekLabel: 'Label (optional)',
+                deepseekBaseUrl: 'Anthropic-compatible base_url', deepseekAdvanced: 'Advanced: custom endpoint (blank = official default)',
+                deepseekShareEnabled: 'Add to shared pool', deepseekSkipProbe: 'Skip reachability probe',
+                deepseekHint: 'Just a DeepSeek platform API key; the endpoint defaults to their official Anthropic-compatible URL. Claude Code (/v1/messages) fallback only — haiku-tier requests map to deepseek-v4-flash.', deepseekConnected: 'DeepSeek account connected',
                 cancelBtn: 'Cancel', saveBtn: 'Save',
                 chainsTitle: 'Provider Priority', chainsDesc: 'Configure the provider order and failover / round-robin policy separately for the Codex and Claude entrypoints.',
                 chainCodex: 'Codex entrypoint (/v1/responses)', chainClaude: 'Claude entrypoint (/v1/messages)',
                 modeFailover: 'Failover', modeRoundRobin: 'Round-robin', addProvider: '+ Add provider', saveChains: 'Save chains',
                 chainsSaved: 'Provider chains saved', moveUp: 'Move up', moveDown: 'Move down', removeItem: 'Remove',
+                modelMapMatches: 'Matches', modelMapEnv: 'Env var', modelMapBuiltin: 'Built-in default',
+                modelMapOverridePh: 'leave empty = fall through to the default below', modelMapEffective: 'In effect',
+                srcOverride: 'override', srcEnv: 'env var', srcBuiltin: 'built-in', srcLive: 'live /models',
+                modelMapCatalog: 'Model catalog', modelMapCatalogHint: 'Comma-separated. Empty = use env var / built-in / live fetch. Non-empty pins the catalog and skips the live fetch.',
+                modelMapCatalogLive: '(fetched live from upstream /models by default)',
+                modelMapSave: 'Save mapping', modelMapSaved: 'Model mapping saved', modelMapTest: 'Test', modelMapDetails: 'Details',
+                modelMapSlotOpus: 'opus slot', modelMapSlotSonnet: 'sonnet slot', modelMapSlotFable: 'fable slot',
+                modelMapDefaultSlot: 'Bare slug / unknown name (independent)',
+                modelMapClickToFillHint: 'Click a candidate → fills the focused input',
+                modelMapFillHereFirst: 'Focus the input you want to fill first, then click a candidate',
+                modelMapTesting: 'Testing…', modelMapReset: 'Reset',
+                modelMapTestOk: 'OK', modelMapTestFailed: 'Failed',
+                modelMapSent: 'sent', modelMapServed: 'served', modelMapTokens: 'tokens', modelMapLatency: 'latency',
+                modelMapAccount: 'account',
                 searchPlaceholder: 'Search account / owner...',
                 allPlatforms: 'All platforms', allStatuses: 'All statuses',
                 statusActive: 'Active (has requests)', statusShared: 'Shared', statusPrivate: 'Private',
@@ -805,7 +995,7 @@
             document.querySelectorAll('[data-i18n-title]').forEach(el => { el.title = t(el.dataset.i18nTitle); });
             document.querySelectorAll('[data-i18n-html]').forEach(el => { el.innerHTML = t(el.dataset.i18nHtml); });
             // pageTitle tracks the active tab, not a fixed data-i18n key.
-            const titles = { upstreams: 'navAccounts', stats: 'navStats', capacity: 'navCapacity', playground: 'navPlayground', setup: 'navSetup', apikeys: 'navApiKeys', onboarding: 'navOnboarding' };
+            const titles = { upstreams: 'navAccounts', modelmap: 'navModelMap', stats: 'navStats', capacity: 'navCapacity', playground: 'navPlayground', setup: 'navSetup', apikeys: 'navApiKeys', onboarding: 'navOnboarding' };
             document.getElementById('pageTitle').textContent = t(titles[window.__currentTab] || 'navAccounts');
         }
 
@@ -817,6 +1007,7 @@
         function rerenderCurrent() {
             const tab = window.__currentTab;
             if (tab === 'upstreams') { loadAccounts(); loadChains(); }
+            else if (tab === 'modelmap') loadModelMap();
             else if (tab === 'stats') loadStats();
             else if (tab === 'capacity') loadCapacity();
             else if (tab === 'apikeys') loadApiKeys();
@@ -1072,6 +1263,7 @@
             window.__currentTab = tabId;
             const titles = {
                 'upstreams': 'navAccounts',
+                'modelmap': 'navModelMap',
                 'stats': 'navStats',
                 'capacity': 'navCapacity',
                 'playground': 'navPlayground',
@@ -1084,6 +1276,8 @@
             if (tabId === 'upstreams') {
                 loadAccounts();
                 loadChains();
+            } else if (tabId === 'modelmap') {
+                loadModelMap();
             } else if (tabId === 'stats') {
                 loadStats();
             } else if (tabId === 'capacity') {
@@ -1120,6 +1314,7 @@
         function escapeHtml(s) {
             return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
         }
+        function escapeAttr(s) { return escapeHtml(s).replace(/"/g, '&quot;'); }
 
         // Token-level JSON syntax highlighting (keys / strings / numbers /
         // keywords). Input is raw JSON text; output is safe HTML.
@@ -1300,13 +1495,16 @@
             const rl = acc.rate_limit;
             const usage = acc.usage || {};
             const provider = acc.provider || 'codex';
-            const providerNames = { codex: 'Codex', claude: 'Claude', cursor: 'Cursor', ollama: 'Ollama', glm: 'GLM', kimi: 'Kimi' };
+            const providerNames = { codex: 'Codex', claude: 'Claude', cursor: 'Cursor', ollama: 'Ollama', glm: 'GLM', kimi: 'Kimi', trae: 'Trae', minimax: 'MiniMax', deepseek: 'DeepSeek' };
             const badge = (rl && rl.plan_type) ? rl.plan_type : (providerNames[provider] || provider);
             const badgeColor = provider === 'claude' ? 'bg-purple-100 text-purple-700'
                 : provider === 'cursor' ? 'bg-emerald-100 text-emerald-700'
                 : provider === 'ollama' ? 'bg-gray-100 text-gray-700'
                 : provider === 'glm' ? 'bg-amber-100 text-amber-700'
                 : provider === 'kimi' ? 'bg-slate-200 text-slate-700'
+                : provider === 'trae' ? 'bg-sky-100 text-sky-700'
+                : provider === 'minimax' ? 'bg-rose-100 text-rose-700'
+                : provider === 'deepseek' ? 'bg-indigo-100 text-indigo-700'
                 : 'bg-blue-100 text-blue-700';
             const lastUsed = usage.last_used ? new Date(usage.last_used).toLocaleString() : t('never');
             const health = acc.health || {};
@@ -1419,7 +1617,7 @@
                 // whose JSON key order is randomized per response, so without
                 // this the cards reshuffle on every refresh. Sort by a fixed
                 // provider order, then created_at, then id.
-                const providerRank = { codex: 0, claude: 1, cursor: 2, glm: 3, kimi: 4, ollama: 5 };
+                const providerRank = { codex: 0, claude: 1, cursor: 2, glm: 3, kimi: 4, trae: 5, minimax: 6, deepseek: 7, ollama: 8 };
                 window.__allAccounts.sort((a, b) => {
                     const pa = providerRank[a.provider] ?? 99;
                     const pb = providerRank[b.provider] ?? 99;
@@ -2180,8 +2378,107 @@
             }
         });
 
+        // ==================== Trae connect modal ====================
+        function openTraeModal() {
+            const m = document.getElementById('traeModal');
+            m.classList.remove('hidden'); m.classList.add('flex');
+        }
+        function closeTraeModal() {
+            const m = document.getElementById('traeModal');
+            m.classList.add('hidden'); m.classList.remove('flex');
+        }
+        document.getElementById('connectTraeBtn').addEventListener('click', openTraeModal);
+        document.getElementById('traeCancelBtn').addEventListener('click', closeTraeModal);
+        document.getElementById('traeModal').addEventListener('click', (e) => {
+            if (e.target.id === 'traeModal') closeTraeModal();
+        });
+        document.getElementById('traeSaveBtn').addEventListener('click', async () => {
+            // Unlike Kimi there is nothing to require here: the sidecar's API key
+            // is optional (it stays open until keys are generated in its panel),
+            // and a blank base_url falls back to the loopback default server-side.
+            const btn = document.getElementById('traeSaveBtn');
+            const orig = btn.textContent; btn.textContent = t('importing'); btn.disabled = true;
+            try {
+                const res = await fetch('/v1/provider/connect/trae', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${gatewayToken()}` },
+                    body: JSON.stringify({
+                        account_label: document.getElementById('traeLabel').value.trim(),
+                        api_key: document.getElementById('traeApiKey').value.trim(),
+                        base_url: document.getElementById('traeBaseUrl').value.trim(),
+                        share_enabled: document.getElementById('traeShareEnabled').checked,
+                        skip_probe: document.getElementById('traeSkipProbe').checked,
+                        daily_token_limit: null,
+                    }),
+                });
+                const d = await res.json();
+                if (res.ok) {
+                    showToast(t('traeConnected'));
+                    closeTraeModal();
+                    document.getElementById('traeApiKey').value = '';
+                    loadAccounts();
+                } else {
+                    showToast(d.error || t('fetchModelsFailed'), 'error');
+                }
+            } catch (e) {
+                showToast(e.message, 'error');
+            } finally {
+                btn.textContent = orig; btn.disabled = false;
+            }
+        });
+
+        // ============ MiniMax / DeepSeek connect modals ============
+        // Both are plain Anthropic-compatible key providers with identical form
+        // shapes (key + optional base_url + label + share + skip-probe), so one
+        // wiring function serves both instead of two copy-pasted blocks.
+        function wireAnthropicKeyModal(provider) {
+            const modal = document.getElementById(`${provider}Modal`);
+            const open = () => { modal.classList.remove('hidden'); modal.classList.add('flex'); };
+            const close = () => { modal.classList.add('hidden'); modal.classList.remove('flex'); };
+            const cap = provider.charAt(0).toUpperCase() + provider.slice(1);
+            document.getElementById(`connect${cap}Btn`).addEventListener('click', open);
+            document.getElementById(`${provider}CancelBtn`).addEventListener('click', close);
+            modal.addEventListener('click', (e) => { if (e.target === modal) close(); });
+            document.getElementById(`${provider}SaveBtn`).addEventListener('click', async () => {
+                const keyInput = document.getElementById(`${provider}ApiKey`);
+                const apiKey = keyInput.value.trim();
+                if (!apiKey) { showToast(t(`${provider}ApiKey`), 'error'); return; }
+                const btn = document.getElementById(`${provider}SaveBtn`);
+                const orig = btn.textContent; btn.textContent = t('importing'); btn.disabled = true;
+                try {
+                    const res = await fetch(`/v1/provider/connect/${provider}`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${gatewayToken()}` },
+                        body: JSON.stringify({
+                            account_label: document.getElementById(`${provider}Label`).value.trim(),
+                            api_key: apiKey,
+                            base_url: document.getElementById(`${provider}BaseUrl`).value.trim(),
+                            share_enabled: document.getElementById(`${provider}ShareEnabled`).checked,
+                            skip_probe: document.getElementById(`${provider}SkipProbe`).checked,
+                            daily_token_limit: null,
+                        }),
+                    });
+                    const d = await res.json();
+                    if (res.ok) {
+                        showToast(t(`${provider}Connected`));
+                        close();
+                        keyInput.value = '';
+                        loadAccounts();
+                    } else {
+                        showToast(d.error || t('fetchModelsFailed'), 'error');
+                    }
+                } catch (e) {
+                    showToast(e.message, 'error');
+                } finally {
+                    btn.textContent = orig; btn.disabled = false;
+                }
+            });
+        }
+        wireAnthropicKeyModal('minimax');
+        wireAnthropicKeyModal('deepseek');
+
         // ==================== Provider priority chains ====================
-        const CHAIN_PROVIDER_NAMES = { codex: 'Codex', claude: 'Claude', cursor: 'Cursor', ollama: 'Ollama', glm: 'GLM', kimi: 'Kimi' };
+        const CHAIN_PROVIDER_NAMES = { codex: 'Codex', claude: 'Claude', cursor: 'Cursor', ollama: 'Ollama', glm: 'GLM', kimi: 'Kimi', trae: 'Trae', minimax: 'MiniMax', deepseek: 'DeepSeek' };
         window.__chains = null;        // { codex:{mode,providers}, claude:{mode,providers} }
         window.__chainAllowed = null;  // { codex:[...], claude:[...] }
 
@@ -2288,11 +2585,313 @@
             } catch (e) { showToast(e.message, 'error'); }
         }
 
+        // ==================== Provider model mapping ====================
+        // Rows come straight from GET /v1/provider/model-map, which already
+        // resolved override > env > built-in and tagged each value with its
+        // source. Edits live in window.__modelMapEdits until "save" PUTs them.
+        window.__modelMap = null;        // [{provider,label,rule,slots:[...],...}]
+        window.__modelMapEdits = {};     // provider -> {default_model,haiku_model,models}
+        window.__modelMapTests = {};     // provider -> test result (or {pending:true})
+
+        const MODEL_MAP_SRC_LABEL = { override: 'srcOverride', env: 'srcEnv', builtin: 'srcBuiltin', live: 'srcLive' };
+        const MODEL_MAP_SRC_STYLE = {
+            override: 'bg-indigo-50 text-indigo-700 border-indigo-200',
+            env: 'bg-amber-50 text-amber-700 border-amber-200',
+            builtin: 'bg-gray-100 text-gray-600 border-gray-200',
+            live: 'bg-emerald-50 text-emerald-700 border-emerald-200',
+        };
+
+        async function loadModelMap() {
+            try {
+                const res = await fetch('/v1/provider/model-map', { headers: { 'Authorization': `Bearer ${gatewayToken()}` } });
+                if (!res.ok) return;
+                const d = await res.json();
+                window.__modelMap = d.providers || [];
+                // Seed the edit buffer from what's stored, so an untouched box
+                // shows the operator's own override (not the resolved value).
+                window.__modelMapEdits = {};
+                for (const p of window.__modelMap) {
+                    const slots = {};
+                    for (const s of p.slots) slots[s.slot] = s.override_value || '';
+                    window.__modelMapEdits[p.provider] = {
+                        slots,
+                        models: (p.catalog_override || []).join(', '),
+                    };
+                }
+                renderModelMap();
+            } catch (e) { /* leave panel empty on failure */ }
+        }
+
+        function modelMapSrcBadge(source) {
+            const style = MODEL_MAP_SRC_STYLE[source] || MODEL_MAP_SRC_STYLE.builtin;
+            return `<span class="px-1.5 py-0.5 rounded border text-[10px] leading-none ${style}">${t(MODEL_MAP_SRC_LABEL[source] || 'srcBuiltin')}</span>`;
+        }
+
+        // Per-provider meta line — small, dimmed, single row. Mirrors what
+        // appears at the top of every cards panel (rule + sources).
+        function modelMapMetaBits(parts) {
+            return parts.map((p, i) =>
+                `<span class="inline-flex items-center gap-1">${p}</span>`
+            ).join('<span class="text-gray-300 mx-1">·</span>');
+        }
+
+        function renderModelMapSlot(provider, slot) {
+            const edit = window.__modelMapEdits[provider] || { slots: {} };
+            const typed = edit.slots[slot.slot] ?? '';
+            const isDefaultSlot = slot.slot === 'default';
+            // The "default" row is visually a separator between the provider's
+            // bare-slug fallback and the three Claude tiers — give it a muted
+            // label and a hint-style border so the eye knows it's the
+            // independent row, not one of the three tiers.
+            const labelClass = isDefaultSlot
+                ? 'text-xs font-medium text-gray-400 w-20 shrink-0 uppercase tracking-wider'
+                : 'text-sm font-medium text-gray-700 w-20 shrink-0';
+            const inputBorderClass = isDefaultSlot
+                ? 'border-dashed border-gray-300'
+                : 'border-gray-300';
+            return `
+                <div class="flex items-center gap-3 py-1.5" data-slot-row="${escapeAttr(slot.slot)}">
+                    <span class="${labelClass}">${escapeHtml(slot.label)}</span>
+                    <input type="text" value="${escapeAttr(typed)}" placeholder="${escapeAttr(slot.builtin)}"
+                        oninput="modelMapEditSlot('${provider}','${slot.slot}',this.value)"
+                        onfocus="modelMapNoteFocus('${provider}','${slot.slot}')"
+                        data-modelmap-input="${escapeAttr(provider)}:${escapeAttr(slot.slot)}"
+                        class="flex-1 min-w-0 bg-white border ${inputBorderClass} rounded-md px-2.5 py-1.5 text-sm focus:border-indigo-500 focus:ring-2 focus:ring-indigo-200 outline-none">
+                    <code class="text-sm text-gray-800 w-40 truncate text-right" title="${escapeAttr(slot.value)}">${escapeHtml(slot.value)}</code>
+                    ${modelMapSrcBadge(slot.source)}
+                </div>`;
+        }
+
+        // Tracks which slot input is currently focused, so clicking a candidate
+        // chip knows where to put the model id. Without this the chip has to
+        // guess, and "guess where the user meant" is the kind of magic that
+        // bites people when they have several inputs to fill in a row.
+        function modelMapNoteFocus(provider, slot) {
+            window.__modelMapFocusedSlot = { provider, slot };
+        }
+        function modelMapFocusedSlot(provider) {
+            const f = window.__modelMapFocusedSlot;
+            if (!f) return null;
+            if (f.provider !== provider) return null;
+            return f.slot;
+        }
+
+        function renderModelMapTest(provider) {
+            const r = window.__modelMapTests[provider];
+            if (!r) return '';
+            if (r.pending) return `
+                <div class="mt-3 border border-gray-200 rounded-md px-3 py-2 text-xs text-gray-500 flex items-center gap-2 bg-gray-50">
+                    <svg class="animate-spin w-3.5 h-3.5 text-gray-400" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"></path></svg>
+                    ${t('modelMapTesting')}
+                </div>`;
+            const ok = r.ok;
+            const box = ok
+                ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                : 'bg-rose-50 border-rose-200 text-rose-800';
+            const header = ok ? t('modelMapTestOk') : t('modelMapTestFailed');
+            const statusColor = ok ? 'text-emerald-700' : 'text-rose-700';
+            const row = (label, val, mono = true) => val == null || val === '' ? '' :
+                `<div class="flex items-baseline gap-2 text-xs"><span class="text-gray-500 w-16 shrink-0">${label}</span><span class="${mono ? 'font-mono text-gray-800' : 'text-gray-800'} break-all">${escapeHtml(val)}</span></div>`;
+            const rows = [
+                row('HTTP', String(r.status)),
+                row(t('modelMapSent'), r.sent_model || '-'),
+                row(t('modelMapServed'), r.served_model),
+                row(t('modelMapLatency'), `${r.latency_ms} ms`),
+                row(t('modelMapTokens'), r.tokens ? `${r.tokens.input_tokens || 0} in / ${r.tokens.output_tokens || 0} out` : null),
+                row(t('modelMapAccount'), r.account_id),
+            ].join('');
+            const err = !ok && r.error ? `<div class="mt-2 text-[11px] font-mono text-rose-700 break-all bg-rose-50/50 border-t border-rose-200 -mx-3 -mb-2 px-3 py-2 rounded-b-md">${escapeHtml(r.error)}</div>` : '';
+            return `
+                <div class="mt-3 border rounded-md ${box}">
+                    <div class="px-3 py-2 flex items-center gap-2 text-xs font-medium">
+                        <span class="inline-flex w-2 h-2 rounded-full ${ok ? 'bg-emerald-500' : 'bg-rose-500'}"></span>
+                        <span>${header}</span>
+                        <span class="${statusColor} font-mono">HTTP ${r.status}</span>
+                    </div>
+                    <div class="px-3 pb-2 space-y-1">${rows}</div>
+                    ${err}
+                </div>`;
+        }
+
+        // Catalog id chip — clickable. Clicking fills the currently focused slot
+// input (see `modelMapNoteFocus`); if nothing is focused, the user gets a
+// short toast so they know to click an input first. The chip is a real
+// <button type="button"> so it has keyboard / a11y semantics, not a styled
+// <code>.
+function renderModelMapChips(provider, ids) {
+            if (!ids || ids.length === 0) return '<span class="text-gray-400 text-xs">—</span>';
+            return ids.map(id =>
+                `<button type="button"
+                    onclick="modelMapFillSlot('${escapeAttr(provider)}','${escapeAttr(id)}')"
+                    title="${escapeAttr(t('modelMapClickToFillHint'))}"
+                    class="inline-flex items-center px-1.5 py-0.5 rounded bg-gray-100 text-gray-700 text-[11px] hover:bg-indigo-100 hover:text-indigo-800 active:bg-indigo-200 transition cursor-pointer border border-transparent hover:border-indigo-200">${escapeHtml(id)}</button>`
+            ).join('');
+        }
+
+// Fill the focused slot input with `id`. If no input in this provider's
+// row is focused, ask the operator to focus one first — silently picking
+// a default slot is the kind of magic that misroutes traffic.
+function modelMapFillSlot(provider, id) {
+            const slot = modelMapFocusedSlot(provider);
+            if (!slot) {
+                showToast(t('modelMapFillHereFirst'), 'error');
+                return;
+            }
+            const sel = `input[data-modelmap-input="${cssEscape(provider)}:${cssEscape(slot)}"]`;
+            const el = document.querySelector(sel);
+            if (!el) {
+                showToast(t('modelMapFillHereFirst'), 'error');
+                return;
+            }
+            el.value = id;
+            modelMapEditSlot(provider, slot, id);
+            // Keep the focus on the input so the operator can keep clicking
+            // other candidates into the same slot, or Tab away cleanly.
+            el.focus();
+        }
+
+// CSS.escape polyfill for older browsers (CDN tailwind targets evergreen
+// only, but selector queries with arbitrary values need escaping).
+function cssEscape(s) {
+            if (window.CSS && CSS.escape) return CSS.escape(s);
+            return String(s).replace(/[^a-zA-Z0-9_-]/g, c => '\\' + c);
+        }
+
+        function renderModelMapProvider(p) {
+            const edit = window.__modelMapEdits[p.provider] || { slots: {}, models: '' };
+            const slotRows = p.slots.map(s => renderModelMapSlot(p.provider, s)).join('');
+            const catalogIds = p.catalog_value || [];
+            const catalogPinned = p.catalog_source === 'override' || p.catalog_source === 'env';
+            const slotTable = p.slots.map(s => `
+                <tr class="text-xs align-top">
+                    <td class="py-1.5 pr-2 font-medium text-gray-700">${escapeHtml(s.label)}</td>
+                    <td class="py-1.5 pr-2 text-gray-600 leading-snug">${escapeHtml(s.matches)}</td>
+                    <td class="py-1.5 pr-2 text-gray-500 break-all">${escapeHtml(s.env)}</td>
+                    <td class="py-1.5 text-gray-500 break-all">${escapeHtml(s.builtin)}</td>
+                </tr>`).join('');
+            return `
+                <div class="bg-white border border-gray-200 rounded-xl shadow-sm overflow-hidden">
+                    <div class="px-5 py-3 flex items-center gap-3">
+                        <div class="flex items-center gap-2 min-w-0 flex-1">
+                            <h4 class="text-sm font-semibold text-gray-900">${escapeHtml(p.label)}</h4>
+                            <code class="text-[11px] px-1.5 py-0.5 rounded bg-gray-100 text-gray-500">${escapeHtml(p.provider)}</code>
+                        </div>
+                        <details class="relative">
+                            <summary class="list-none cursor-pointer text-gray-400 hover:text-gray-700 p-1 rounded select-none" title="${t('modelMapDetails')}">
+                                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                            </summary>
+                            <div class="absolute right-0 top-full mt-1 z-10 w-[34rem] max-w-[90vw] bg-white border border-gray-200 rounded-lg shadow-lg p-4 text-xs text-gray-700 space-y-3">
+                                <p class="text-gray-600 leading-relaxed">${escapeHtml(p.rule)}</p>
+                                <table class="w-full table-fixed">
+                                    <colgroup><col style="width:4rem"><col><col style="width:8rem"><col style="width:7rem"></colgroup>
+                                    <thead class="text-[10px] uppercase tracking-wide text-gray-400">
+                                        <tr><th class="text-left py-1 pr-2 font-medium">档</th><th class="text-left py-1 pr-2 font-medium">匹配</th><th class="text-left py-1 pr-2 font-medium">env</th><th class="text-left py-1 font-medium">内置</th></tr>
+                                    </thead>
+                                    <tbody>${slotTable}</tbody>
+                                </table>
+                                <div class="pt-2 border-t border-gray-100">
+                                    <span class="text-[10px] uppercase tracking-wide text-gray-400">${t('modelMapCatalog')}</span>
+                                    <div class="mt-1 text-gray-600">${escapeHtml(p.catalog_env)}</div>
+                                </div>
+                            </div>
+                        </details>
+                        <button onclick="modelMapTest('${p.provider}')"
+                            class="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md border border-gray-300 text-gray-700 hover:bg-gray-50 hover:border-gray-400 transition">
+                            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                            ${t('modelMapTest')}
+                        </button>
+                    </div>
+                    <div class="px-5 pb-4 space-y-1">${slotRows}</div>
+                    <div class="px-5 py-3 border-t border-gray-100 bg-gray-50/40">
+                        <div class="flex items-center gap-2 mb-2">
+                            <span class="text-xs font-medium text-gray-700">${t('modelMapCatalog')}</span>
+                            ${modelMapSrcBadge(p.catalog_source)}
+                            ${p.catalog_live ? `<span class="text-[11px] text-gray-400">${t('modelMapCatalogLive')}</span>` : ''}
+                            ${catalogPinned ? `<span class="text-[11px] text-amber-700">钉死</span>` : ''}
+                        </div>
+                        <textarea rows="2" placeholder="${escapeAttr(p.catalog_builtin && p.catalog_builtin.length ? p.catalog_builtin.join(', ') : t('modelMapCatalogHint'))}"
+                            oninput="modelMapEditCatalog('${p.provider}',this.value)"
+                            class="w-full bg-white border border-gray-300 rounded-md px-2.5 py-1.5 text-sm focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 outline-none">${escapeHtml(edit.models || '')}</textarea>
+                        <div class="mt-2 flex flex-wrap gap-1.5">${renderModelMapChips(p.provider, catalogIds)}</div>
+                    </div>
+                    <div class="px-5 py-3 border-t border-gray-100">
+                        ${renderModelMapTest(p.provider)}
+                    </div>
+                </div>`;
+        }
+
+        function renderModelMap() {
+            const el = document.getElementById('modelMapPanel');
+            if (!el || !window.__modelMap) return;
+            el.innerHTML = `
+                <div class="flex items-center justify-end gap-2 mb-4">
+                    <button onclick="loadModelMap()" class="px-3 py-1.5 text-sm rounded-md border border-gray-300 text-gray-700 hover:bg-gray-100">${t('modelMapReset')}</button>
+                    <button onclick="saveModelMap()" class="px-3 py-1.5 text-sm rounded-md text-white bg-indigo-600 hover:bg-indigo-700">${t('modelMapSave')}</button>
+                </div>
+                <div class="grid grid-cols-1 xl:grid-cols-2 gap-4">
+                    ${window.__modelMap.map(renderModelMapProvider).join('')}
+                </div>`;
+        }
+
+        // Edits only mutate the buffer — no re-render, so the caret stays put
+        // while typing. The resolved-value column refreshes after save.
+        function modelMapEditSlot(provider, slot, value) {
+            const e = window.__modelMapEdits[provider] || (window.__modelMapEdits[provider] = { slots: {}, models: '' });
+            e.slots[slot] = value;
+        }
+        function modelMapEditCatalog(provider, value) {
+            const e = window.__modelMapEdits[provider] || (window.__modelMapEdits[provider] = { slots: {}, models: '' });
+            e.models = value;
+        }
+
+        async function saveModelMap() {
+            const providers = {};
+            for (const [provider, e] of Object.entries(window.__modelMapEdits)) {
+                providers[provider] = {
+                    default_model: (e.slots.default || '').trim(),
+                    opus_model: (e.slots.opus || '').trim(),
+                    sonnet_model: (e.slots.sonnet || '').trim(),
+                    fable_model: (e.slots.fable || '').trim(),
+                    models: (e.models || '').split(',').map(s => s.trim()).filter(Boolean),
+                };
+            }
+            try {
+                const res = await fetch('/v1/provider/model-map', {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${gatewayToken()}` },
+                    body: JSON.stringify({ providers }),
+                });
+                const d = await res.json();
+                if (!res.ok) { showToast(d.error || t('fetchModelsFailed'), 'error'); return; }
+                showToast(t('modelMapSaved'));
+                await loadModelMap();   // re-resolve so the source badges are truthful
+            } catch (e) { showToast(e.message, 'error'); }
+        }
+
+        // Fires a real 1-token request through the CURRENT stored mapping, so it
+        // only reflects saved edits — the button is meant to be pressed after save.
+        async function modelMapTest(provider) {
+            window.__modelMapTests[provider] = { pending: true };
+            renderModelMap();
+            try {
+                const res = await fetch('/v1/provider/model-map/test', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${gatewayToken()}` },
+                    body: JSON.stringify({ provider }),
+                });
+                const d = await res.json();
+                window.__modelMapTests[provider] = d.provider ? d : { ok: false, status: res.status, latency_ms: 0, error: d.error || '' };
+            } catch (e) {
+                window.__modelMapTests[provider] = { ok: false, status: 0, latency_ms: 0, error: e.message };
+            }
+            renderModelMap();
+        }
+
         // Playground Page
         async function loadModels(manual = false) {
             const select = document.getElementById('model');
             const provider = document.getElementById('provider').value || 'codex';
-            const fallback = provider === 'claude' ? 'claude-sonnet-4-5' : provider === 'cursor' ? 'cursor' : provider === 'ollama' ? 'ollama' : provider === 'glm' ? 'glm' : provider === 'kimi' ? 'kimi' : 'gpt-5.5';
+            const fallback = provider === 'claude' ? 'claude-sonnet-4-5' : provider === 'cursor' ? 'cursor' : provider === 'ollama' ? 'ollama' : provider === 'glm' ? 'glm' : provider === 'kimi' ? 'kimi' : provider === 'trae' ? 'trae' : provider === 'minimax' ? 'minimax' : provider === 'deepseek' ? 'deepseek' : 'gpt-5.5';
             select.innerHTML = `<option>${t('loading')}</option>`;
             try {
                 const res = await fetch(`/v1/provider/models/${provider}`, { headers: { 'Authorization': `Bearer ${gatewayToken()}` } });
