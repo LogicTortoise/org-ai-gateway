@@ -33,9 +33,12 @@ use crate::routes::accounts::connect_codex_auth_json;
 use crate::routes::accounts::connect_codex_local;
 use crate::routes::accounts::connect_cursor;
 use crate::routes::accounts::connect_cursor_local;
+use crate::routes::accounts::connect_deepseek;
 use crate::routes::accounts::connect_glm;
 use crate::routes::accounts::connect_kimi;
+use crate::routes::accounts::connect_minimax;
 use crate::routes::accounts::connect_ollama;
+use crate::routes::accounts::connect_trae;
 use crate::routes::accounts::delete_account;
 use crate::routes::accounts::list_accounts;
 use crate::routes::accounts::toggle_share;
@@ -54,9 +57,12 @@ use crate::routes::mock_auth::mock_auth_session;
 use crate::routes::models_api::get_claude_models;
 use crate::routes::models_api::get_codex_models;
 use crate::routes::models_api::get_cursor_models;
+use crate::routes::models_api::get_deepseek_models;
 use crate::routes::models_api::get_glm_models;
 use crate::routes::models_api::get_kimi_models;
+use crate::routes::models_api::get_minimax_models;
 use crate::routes::models_api::get_ollama_models;
+use crate::routes::models_api::get_trae_models;
 use crate::routes::models_api::proxy_models_codex;
 use crate::routes::models_api::proxy_models_openai;
 use crate::routes::proxy::proxy_chat_completions;
@@ -95,9 +101,11 @@ async fn main() {
     let capacity_file = PathBuf::from("./data/capacity.ndjson");
     let api_key_file = PathBuf::from("./data/api_keys.ndjson");
     let chain_file = PathBuf::from("./data/provider_chains.json");
+    let model_config_file = PathBuf::from("./data/provider_models.json");
     let initial_accounts = load_accounts(&account_file).await;
     let initial_capacity = crate::capacity::load_capacity_history(&capacity_file).await;
     let initial_chains = crate::provider::chains::load_chains(&chain_file).await;
+    crate::provider::model_config::load_model_config(&model_config_file).await;
     crate::apikey::init(crate::apikey::load(&api_key_file).await);
     let state = AppState {
         audit_file: PathBuf::from("./data/audit.ndjson"),
@@ -105,6 +113,7 @@ async fn main() {
         api_key_file,
         capacity_file,
         chain_file,
+        model_config_file,
         accounts: Arc::new(RwLock::new(initial_accounts)),
         rate_limits: Arc::new(RwLock::new(HashMap::new())),
         capacity_history: Arc::new(RwLock::new(initial_capacity)),
@@ -118,6 +127,7 @@ async fn main() {
         refresh_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         chains: Arc::new(RwLock::new(initial_chains)),
         chain_rr: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        usage_window_cache: Arc::new(crate::provider::usage_window::UsageWindowCache::new()),
     };
 
     // Background loops are supervised: a panic (or unexpected return) is logged
@@ -178,9 +188,21 @@ async fn main() {
         .route("/v1/provider/connect/ollama", post(connect_ollama))
         .route("/v1/provider/connect/glm", post(connect_glm))
         .route("/v1/provider/connect/kimi", post(connect_kimi))
+        .route("/v1/provider/connect/trae", post(connect_trae))
+        .route("/v1/provider/connect/minimax", post(connect_minimax))
+        .route("/v1/provider/connect/deepseek", post(connect_deepseek))
         .route(
             "/v1/provider/chains",
             get(get_chains).put(update_chains),
+        )
+        .route(
+            "/v1/provider/model-map",
+            get(crate::routes::model_config_api::get_model_map)
+                .put(crate::routes::model_config_api::update_model_map),
+        )
+        .route(
+            "/v1/provider/model-map/test",
+            post(crate::routes::model_config_api::test_model_map),
         )
         .route("/v1/provider/accounts", get(list_accounts))
         .route("/v1/provider/accounts/:id", delete(delete_account))
@@ -195,6 +217,9 @@ async fn main() {
         .route("/v1/provider/models/ollama", get(get_ollama_models))
         .route("/v1/provider/models/glm", get(get_glm_models))
         .route("/v1/provider/models/kimi", get(get_kimi_models))
+        .route("/v1/provider/models/trae", get(get_trae_models))
+        .route("/v1/provider/models/minimax", get(get_minimax_models))
+        .route("/v1/provider/models/deepseek", get(get_deepseek_models))
         .route("/v1/gateway/relay", post(relay))
         .route("/v1/client/codex/bootstrap", post(codex_bootstrap))
         .route("/v1/responses", post(proxy_responses))

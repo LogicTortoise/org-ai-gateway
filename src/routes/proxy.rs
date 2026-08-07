@@ -16,11 +16,14 @@ use crate::provider::codex::send_codex_upstream_with_refresh;
 use crate::provider::chains::ordered_attempts;
 use crate::provider::chains::ChainSlot;
 use crate::provider::cursor::CursorFormat;
+use crate::provider::deepseek;
 use crate::provider::glm;
 use crate::provider::kimi;
+use crate::provider::minimax;
 use crate::provider::ollama::ollama_canonical_model;
 use crate::provider::ollama::ollama_http_client;
 use crate::provider::ollama::send_ollama_upstream;
+use crate::provider::trae;
 use crate::retry::ErrorClass;
 use crate::retry::apply_account_failure;
 use crate::retry::eligible_accounts;
@@ -141,6 +144,50 @@ async fn serve_with_chain(
                     .await
                 } else {
                     serve_kimi(state, client_format, user_id, payload, client_wants_stream, shared_only).await
+                }
+            }
+            "trae" => {
+                // Trae is Claude-only: its sidecar speaks Anthropic `/v1/messages`
+                // and nothing OpenAI-shaped, so there is no adapter path. The
+                // chain validator already restricts `trae` to the Claude slot, so
+                // the else branch is belt-and-suspenders — skip to the next
+                // provider rather than mangling the request into a format Trae
+                // can't serve.
+                if matches!(client_format, CursorFormat::Claude) {
+                    serve_native_provider(
+                        state.clone(),
+                        "trae",
+                        client_format,
+                        user_id.to_string(),
+                        payload.clone(),
+                        client_wants_stream,
+                        shared_only,
+                    )
+                    .await
+                } else {
+                    ProviderOutcome::NextProvider(None)
+                }
+            }
+            "minimax" | "deepseek" => {
+                // Claude-only providers: only their Anthropic-compatible surface
+                // is wired (a buffered passthrough where tool calls survive), so
+                // there is no adapter path. The chain validator already restricts
+                // both to the Claude slot, so the else branch is
+                // belt-and-suspenders — skip to the next provider rather than
+                // mangling the request into a format they can't serve.
+                if matches!(client_format, CursorFormat::Claude) {
+                    serve_native_provider(
+                        state.clone(),
+                        provider,
+                        client_format,
+                        user_id.to_string(),
+                        payload.clone(),
+                        client_wants_stream,
+                        shared_only,
+                    )
+                    .await
+                } else {
+                    ProviderOutcome::NextProvider(None)
                 }
             }
             "ollama" => {
@@ -426,7 +473,7 @@ async fn serve_cursor(
         reset_backoff(state, &account.id).await;
         let output_chars = result.text.chars().count();
         write_proxy_audit(
-            state, user_id, &account, "cursor", payload, prompt_chars, output_chars,
+            state, user_id, &account, "cursor", &upstream_model, prompt_chars, output_chars,
             "success", TokenUsage::default(),
         )
         .await;
@@ -449,7 +496,7 @@ async fn serve_cursor(
     if last_error.is_some() {
         if let Some((account, status_label)) = pending_failure_audit {
             write_proxy_audit(
-                state, user_id, &account, "cursor", payload, prompt_chars, 0,
+                state, user_id, &account, "cursor", &upstream_model, prompt_chars, 0,
                 &status_label, TokenUsage::default(),
             )
             .await;
@@ -600,7 +647,7 @@ async fn serve_ollama(
             estimated_input
         };
         write_proxy_audit(
-            state, user_id, &account, "ollama", payload, request_json_chars, result.text.len(),
+            state, user_id, &account, "ollama", &upstream_model, request_json_chars, result.text.len(),
             "success", result.usage,
         )
         .await;
@@ -741,7 +788,7 @@ async fn serve_glm(
             estimated_input
         };
         write_proxy_audit(
-            state, user_id, &account, "glm", payload, request_json_chars, result.text.len(),
+            state, user_id, &account, "glm", &upstream_model, request_json_chars, result.text.len(),
             "success", result.usage,
         )
         .await;
@@ -881,7 +928,7 @@ async fn serve_kimi(
             estimated_input
         };
         write_proxy_audit(
-            state, user_id, &account, "kimi", payload, request_json_chars, result.text.len(),
+            state, user_id, &account, "kimi", &upstream_model, request_json_chars, result.text.len(),
             "success", result.usage,
         )
         .await;
@@ -961,6 +1008,23 @@ async fn serve_native_provider(
     client_wants_stream: bool,
     shared_only: bool,
 ) -> ProviderOutcome {
+    // Anthropic server tools (`web_search_20250305`, `code_execution_*`, …) only
+    // work on first-party Anthropic. Strip them before anything else touches the
+    // payload, so the audited request size and every retry reflect what actually
+    // goes on the wire. Gated on an explicit provider list rather than "not
+    // claude": Codex speaks the Responses format, whose ordinary function tools
+    // legitimately carry `type: "function"` and must not be stripped.
+    let mut payload = payload;
+    if crate::provider::is_third_party_anthropic(provider) {
+        let removed = crate::provider::strip_anthropic_server_tools(&mut payload);
+        if removed > 0 {
+            info!(
+                "stripped {} anthropic server-tool item(s) before sending to {}",
+                removed, provider
+            );
+        }
+    }
+
     // Per-user quota gate. `owned_only` = over a token budget but the user has
     // their own accounts: keep serving, but never on borrowed capacity.
     let owned_only = match crate::quota::enforce_user_quota(&state, provider, &user_id, !shared_only).await {
@@ -1100,6 +1164,22 @@ async fn serve_native_provider(
             "kimi" => kimi::send_kimi_anthropic(&account, &attempt_payload)
                 .await
                 .map(|resp| (resp, account.clone())),
+            // Trae rides the local trae2anthropic sidecar's `/v1/messages` — the
+            // only path it has. Same raw passthrough, and deliberately no Claude
+            // fingerprint (the upstream is Trae's agent API, not Anthropic).
+            "trae" => trae::send_trae_anthropic(&account, &attempt_payload)
+                .await
+                .map(|resp| (resp, account.clone())),
+            // MiniMax / DeepSeek: same raw Anthropic passthrough, and deliberately
+            // no Claude fingerprint — neither is Anthropic, so injecting the Claude
+            // Code system blocks / obfuscated tool names would only corrupt the
+            // request. `send_*_anthropic` rewrites `model` to a real upstream id.
+            "minimax" => minimax::send_minimax_anthropic(&account, &attempt_payload)
+                .await
+                .map(|resp| (resp, account.clone())),
+            "deepseek" => deepseek::send_deepseek_anthropic(&account, &attempt_payload)
+                .await
+                .map(|resp| (resp, account.clone())),
             _ => send_claude_upstream_with_refresh(&state, &account, &attempt_payload).await,
         };
 
@@ -1232,12 +1312,22 @@ async fn serve_native_provider(
                 .await;
             }
             let tokens = crate::usage::tokens::parse_usage(provider, &body_str);
+            // Audit the model that ANSWERED, not the one the client asked for.
+            // The two differ constantly on this path: the chain degrades a
+            // `claude-*` request onto DeepSeek/MiniMax/Trae (whose senders
+            // rewrite `model` on their own copy of the payload, so `payload`
+            // here still says `claude-*`), and even first-party Anthropic
+            // resolves a floating alias to the dated snapshot that ran. The
+            // response body is the only place that truth appears; the derived
+            // mapping is the fallback for bodies that don't echo it.
+            let effective_model = crate::usage::tokens::parse_response_model(&body_str)
+                .unwrap_or_else(|| effective_model_fallback(&payload, provider));
             write_proxy_audit(
                 &state,
                 &user_id,
                 &account_for_request,
                 provider,
-                &payload,
+                &effective_model,
                 request_json_chars,
                 body.len(),
                 "success",
@@ -1359,12 +1449,15 @@ async fn serve_native_provider(
     // Write the single failure audit record (one client request, one record).
     if last_error.is_some() {
         if let Some((account, output_len, status_label)) = pending_failure_audit {
+            // No usable response body to read the served model out of, so the
+            // derived mapping is all there is — which is still the right answer:
+            // it names the model this provider WOULD have run.
             write_proxy_audit(
                 &state,
                 &user_id,
                 &account,
                 provider,
-                &payload,
+                &effective_model_fallback(&payload, provider),
                 request_json_chars,
                 output_len,
                 &status_label,
@@ -1404,13 +1497,25 @@ fn build_error_payload(
                 "共享池中的账号 ({}) Token 已过期或无效，请联系共享者重新导入 auth.json。",
                 account_label
             )
-        } else if provider == "glm" || provider == "kimi" {
+        } else if provider == "trae" {
+            // A 401 here is the local sidecar rejecting the gateway's key, NOT a
+            // Trae login problem — the Trae accounts themselves live inside the
+            // sidecar's admin panel and never reach this gateway.
+            format!(
+                "Trae sidecar ({}) 拒绝了本网关的 API Key，请在 trae2anthropic 管理面板确认 Key 后重新连接该账号。",
+                account_label
+            )
+        } else if matches!(provider, "glm" | "kimi" | "minimax" | "deepseek") {
             // Key-auth metered providers: a 401 is a bad/expired API key, not an
             // OAuth token — so the credentials.json advice doesn't apply.
+            let display = match provider {
+                "minimax" => "MiniMax".to_string(),
+                "deepseek" => "DeepSeek".to_string(),
+                other => other.to_uppercase(),
+            };
             format!(
                 "共享池中的 {} 账号 ({}) API Key 无效或已过期，请重新连接该账号。",
-                provider.to_uppercase(),
-                account_label
+                display, account_label
             )
         } else {
             format!(
@@ -1480,6 +1585,19 @@ fn apply_passthrough_headers(response: &mut Response, headers: &[(String, Header
     }
 }
 
+/// Derive the model id the request will run on for `provider`, given the
+/// payload the client sent. Used as the fallback when no response body is
+/// available (the response is what really knows — see
+/// `usage::tokens::parse_response_model`). The rewrite happens here, on the
+/// audit copy, NOT on the wire copy — every `send_*` helper either forwards
+/// the client's model verbatim (claude/codex/GLM/Kimi Anthropic) or mutates
+/// its own clone (Trae/MiniMax/DeepSeek), so the caller's `payload` is
+/// always the client's raw request.
+fn effective_model_fallback(payload: &Value, provider: &str) -> String {
+    let raw = payload.get("model").and_then(|v| v.as_str()).unwrap_or("");
+    crate::provider::normalize_model_for_provider(raw, provider)
+}
+
 // The params map one-to-one onto AuditRecord fields; a builder would only
 // restate them.
 #[allow(clippy::too_many_arguments)]
@@ -1488,21 +1606,16 @@ async fn write_proxy_audit(
     user_id: &str,
     account: &UpstreamAccount,
     provider: &str,
-    payload: &Value,
+    model: &str,
     prompt_length: usize,
     output_length: usize,
     status_label: &str,
     tokens: TokenUsage,
 ) {
-    let model = payload
-        .get("model")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
     let audit = AuditRecord {
         request_id: Uuid::new_v4().to_string(),
         user_id: user_id.to_string(),
-        model,
+        model: model.to_string(),
         routed_provider: provider.to_string(),
         upstream_account_id: account.id.clone(),
         upstream_owner_user_id: account.owner_user_id.clone(),

@@ -43,7 +43,9 @@ pub(crate) async fn get_capacity(State(state): State<AppState>, headers: HeaderM
     let token_burn = provider_token_burn(&audit_records, now);
 
     let mut providers: Vec<ProviderCapacity> = Vec::new();
-    for provider in ["claude", "codex", "cursor"] {
+    for provider in [
+        "claude", "codex", "cursor", "glm", "kimi", "deepseek", "minimax",
+    ] {
         let provider_accounts: Vec<&UpstreamAccount> =
             accounts.iter().filter(|a| a.provider == provider).collect();
         if provider_accounts.is_empty() {

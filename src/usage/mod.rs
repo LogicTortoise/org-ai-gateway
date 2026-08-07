@@ -84,6 +84,7 @@ pub(crate) fn parse_rate_limit_headers(headers: &HeaderMap) -> Option<RateLimitS
         credits_has_credits: b(headers, "x-codex-credits-has-credits"),
         credits_unlimited: b(headers, "x-codex-credits-unlimited"),
         credits_balance: s(headers, "x-codex-credits-balance"),
+        recent_rate_limit_errors_5h: None,
         captured_at: Some(Utc::now()),
     };
 
@@ -144,6 +145,7 @@ pub(crate) fn parse_rate_limit_headers(headers: &HeaderMap) -> Option<RateLimitS
         credits_has_credits: None,
         credits_unlimited: None,
         credits_balance: None,
+        recent_rate_limit_errors_5h: None,
         captured_at: Some(Utc::now()),
     };
 
@@ -194,6 +196,7 @@ pub(crate) fn parse_rate_limit_headers(headers: &HeaderMap) -> Option<RateLimitS
             credits_has_credits: None,
             credits_unlimited: None,
             credits_balance: None,
+            recent_rate_limit_errors_5h: None,
             captured_at: Some(Utc::now()),
         };
         if generic.primary_used_percent.is_some() || generic.secondary_used_percent.is_some() {
@@ -233,6 +236,7 @@ pub(crate) fn synthesize_rate_limit_from_error(
             credits_has_credits: None,
             credits_unlimited: None,
             credits_balance: None,
+            recent_rate_limit_errors_5h: None,
             captured_at: Some(now),
         });
     }
@@ -253,6 +257,7 @@ pub(crate) fn synthesize_rate_limit_from_error(
             credits_has_credits: None,
             credits_unlimited: None,
             credits_balance: None,
+            recent_rate_limit_errors_5h: None,
             captured_at: Some(now),
         });
     }
@@ -336,6 +341,7 @@ pub(crate) async fn fetch_codex_usage_snapshot(account: &UpstreamAccount) -> Opt
             credits_has_credits: None,
             credits_unlimited: None,
             credits_balance: None,
+            recent_rate_limit_errors_5h: None,
             captured_at: Some(Utc::now()),
         });
     }
@@ -379,6 +385,7 @@ pub(crate) async fn fetch_codex_usage_snapshot(account: &UpstreamAccount) -> Opt
         credits_has_credits: None,
         credits_unlimited: None,
         credits_balance: None,
+        recent_rate_limit_errors_5h: None,
         captured_at: Some(Utc::now()),
     })
 }
@@ -423,6 +430,7 @@ pub(crate) async fn fetch_claude_usage_snapshot(account: &UpstreamAccount) -> Op
             credits_has_credits: None,
             credits_unlimited: None,
             credits_balance: None,
+            recent_rate_limit_errors_5h: None,
             captured_at: Some(Utc::now()),
         });
     }
@@ -471,6 +479,7 @@ pub(crate) async fn fetch_claude_usage_snapshot(account: &UpstreamAccount) -> Op
         credits_has_credits: None,
         credits_unlimited: None,
         credits_balance: None,
+        recent_rate_limit_errors_5h: None,
         captured_at: Some(Utc::now()),
     })
 }
@@ -615,6 +624,7 @@ fn cursor_snapshot(
         credits_has_credits: None,
         credits_unlimited: None,
         credits_balance,
+        recent_rate_limit_errors_5h: None,
         captured_at: Some(Utc::now()),
     }
 }
@@ -999,8 +1009,23 @@ async fn probe_one_account(state: &AppState, account: &UpstreamAccount) {
         _ => None,
     };
     let Some(snapshot) = snapshot else {
-        // No signal (network blip / provider with no usage endpoint) — leave
-        // health untouched rather than guess.
+        // No signal from codex/claude probes. The four API-key endpoint
+        // providers (glm/kimi/deepseek/minimax) don't have a usage endpoint —
+        // synthesize their snapshot from the audit log instead so the
+        // selector's local-window check still has fresh data even when no
+        // audit-write has happened in the last cache TTL.
+        if crate::provider::usage_window::is_local_window_provider(&account.provider) {
+            if let Some(local) =
+                crate::provider::usage_window::aggregate_account_window(state, &account.id).await
+            {
+                crate::capacity::store_rate_limit(
+                    state,
+                    &account.id,
+                    local.into_rate_limit_snapshot(),
+                )
+                .await;
+            }
+        }
         return;
     };
     let auth_invalid = snapshot

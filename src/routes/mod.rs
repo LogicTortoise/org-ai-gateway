@@ -6,6 +6,7 @@ pub(crate) mod chains_api;
 pub(crate) mod health;
 pub(crate) mod mock_auth;
 pub(crate) mod models_api;
+pub(crate) mod model_config_api;
 pub(crate) mod proxy;
 pub(crate) mod relay;
 pub(crate) mod setup;

@@ -975,6 +975,223 @@ pub(crate) async fn connect_kimi(
 }
 
 
+/// Connect a MiniMax account: an API key plus an optional Anthropic-compatible
+/// base URL. See `connect_anthropic_key_provider` for the shared body.
+pub(crate) async fn connect_minimax(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<ConnectAnthropicKeyRequest>,
+) -> impl IntoResponse {
+    connect_anthropic_key_provider(state, headers, "minimax", "MiniMax", payload).await
+}
+
+/// Connect a DeepSeek account: an API key plus an optional Anthropic-compatible
+/// base URL. See `connect_anthropic_key_provider` for the shared body.
+pub(crate) async fn connect_deepseek(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<ConnectAnthropicKeyRequest>,
+) -> impl IntoResponse {
+    connect_anthropic_key_provider(state, headers, "deepseek", "DeepSeek", payload).await
+}
+
+/// Shared connect body for the Claude-slot-only, API-key endpoint providers
+/// (MiniMax / DeepSeek). They are configured identically — one api key, one
+/// optional Anthropic-compatible base URL that defaults to the vendor's public
+/// endpoint — so unlike GLM/Kimi/Trae there is nothing provider-specific worth
+/// duplicating. `display` is only used in user-facing error text.
+///
+/// Note there is no `base_url_alt`: only the Anthropic surface is wired, so a
+/// second (OpenAI-compatible) base URL would have nothing to point at.
+async fn connect_anthropic_key_provider(
+    state: AppState,
+    headers: HeaderMap,
+    provider: &'static str,
+    display: &str,
+    payload: ConnectAnthropicKeyRequest,
+) -> Response {
+    let user_id = match extract_user_id(&headers) {
+        Ok(uid) => uid,
+        Err(err) => return unauthorized(err).into_response(),
+    };
+
+    let api_key = payload.api_key.trim().to_string();
+    if api_key.is_empty() {
+        return bad_request(json!({ "error": "api_key 不能为空" })).into_response();
+    }
+
+    // Optional; empty means "use the vendor's built-in default endpoint".
+    let base_url = {
+        let raw = payload.base_url.trim();
+        if raw.is_empty() {
+            String::new()
+        } else if !(raw.starts_with("http://") || raw.starts_with("https://")) {
+            return bad_request(json!({
+                "error": "base_url 必须以 http:// 或 https:// 开头",
+            }))
+            .into_response();
+        } else {
+            raw.trim_end_matches('/').to_string()
+        }
+    };
+
+    let account_label = if payload.account_label.trim().is_empty() {
+        provider.to_string()
+    } else {
+        payload.account_label.trim().to_string()
+    };
+
+    if !payload.skip_probe {
+        let probe = UpstreamAccount {
+            id: String::new(),
+            owner_user_id: user_id.clone(),
+            provider: provider.to_string(),
+            account_label: account_label.clone(),
+            access_token: String::new(),
+            refresh_token: String::new(),
+            id_token: String::new(),
+            account_id: String::new(),
+            api_key: api_key.clone(),
+            base_url: base_url.clone(),
+            base_url_alt: String::new(),
+            share_enabled: payload.share_enabled,
+            share_limit_percent: None,
+            daily_token_limit: None,
+            created_at: Utc::now(),
+            runtime: AccountRuntime::default(),
+        };
+        let probed = match provider {
+            "minimax" => crate::provider::minimax::probe_minimax(&probe).await,
+            _ => crate::provider::deepseek::probe_deepseek(&probe).await,
+        };
+        if let Err(e) = probed {
+            return bad_request(json!({
+                "error": format!("无法连接 {}: {}", display, e),
+                "hint": "请检查 api_key（或勾选「跳过探测」）",
+            }))
+            .into_response();
+        }
+    }
+
+    let creds = ConnectCreds {
+        access_token: String::new(),
+        refresh_token: String::new(),
+        id_token: String::new(),
+        account_id: String::new(),
+        api_key,
+        base_url,
+        base_url_alt: String::new(),
+        expires_at: None,
+    };
+    finish_connect(
+        &state,
+        user_id,
+        provider,
+        account_label,
+        creds,
+        payload.share_enabled,
+        payload.share_limit_percent,
+        payload.daily_token_limit,
+    )
+    .await
+    .into_response()
+}
+
+
+/// Connect a Trae account — i.e. a local `trae2anthropic` sidecar endpoint.
+///
+/// Two deliberate differences from `connect_kimi`:
+///   * **`api_key` is optional.** The sidecar only enforces auth once a key has
+///     been generated in its admin panel; with none configured its API is open,
+///     so an empty key is a valid local setup rather than a mistake.
+///   * **Only one base URL.** The sidecar exposes just an Anthropic-compatible
+///     surface, so there is no `base_url_alt` to fill in. Empty `base_url` falls
+///     back to `TRAE_BASE_URL`, then to the sidecar's default loopback address.
+///
+/// The Trae logins themselves (tokens, quotas, rotation, load balancing) are
+/// managed inside the sidecar's admin panel — this gateway sees one upstream.
+pub(crate) async fn connect_trae(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<ConnectTraeRequest>,
+) -> impl IntoResponse {
+    let user_id = match extract_user_id(&headers) {
+        Ok(uid) => uid,
+        Err(err) => return unauthorized(err),
+    };
+
+    // Optional on purpose — see the doc comment above.
+    let api_key = payload.api_key.trim().to_string();
+    let base_url = {
+        let raw = payload.base_url.trim();
+        if raw.is_empty() {
+            String::new()
+        } else if !(raw.starts_with("http://") || raw.starts_with("https://")) {
+            return bad_request(json!({
+                "error": "base_url 必须以 http:// 或 https:// 开头",
+            }));
+        } else {
+            raw.trim_end_matches('/').to_string()
+        }
+    };
+
+    let account_label = if payload.account_label.trim().is_empty() {
+        "trae".to_string()
+    } else {
+        payload.account_label.trim().to_string()
+    };
+
+    if !payload.skip_probe {
+        let probe = UpstreamAccount {
+            id: String::new(),
+            owner_user_id: user_id.clone(),
+            provider: "trae".to_string(),
+            account_label: account_label.clone(),
+            access_token: String::new(),
+            refresh_token: String::new(),
+            id_token: String::new(),
+            account_id: String::new(),
+            api_key: api_key.clone(),
+            base_url: base_url.clone(),
+            base_url_alt: String::new(),
+            share_enabled: payload.share_enabled,
+            share_limit_percent: None,
+            daily_token_limit: None,
+            created_at: Utc::now(),
+            runtime: AccountRuntime::default(),
+        };
+        if let Err(e) = crate::provider::trae::probe_trae(&probe).await {
+            return bad_request(json!({
+                "error": e,
+                "hint": "请确认 trae2anthropic sidecar 已启动（默认 http://127.0.0.1:8788），或勾选「跳过探测」",
+            }));
+        }
+    }
+
+    let creds = ConnectCreds {
+        access_token: String::new(),
+        refresh_token: String::new(),
+        id_token: String::new(),
+        account_id: String::new(),
+        api_key,
+        base_url,
+        base_url_alt: String::new(),
+        expires_at: None,
+    };
+    finish_connect(
+        &state,
+        user_id,
+        "trae",
+        account_label,
+        creds,
+        payload.share_enabled,
+        payload.share_limit_percent,
+        payload.daily_token_limit,
+    )
+    .await
+}
+
+
 pub(crate) async fn delete_account(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1196,6 +1413,59 @@ pub(crate) struct ConnectKimiRequest {
     #[serde(default)]
     pub(crate) base_url_alt: String,
     /// Skip the connect-time reachability/auth probe (useful offline).
+    #[serde(default)]
+    pub(crate) skip_probe: bool,
+}
+
+/// Connect payload shared by the Claude-slot-only, API-key endpoint providers
+/// (MiniMax / DeepSeek). Only `api_key` is required; `base_url` defaults to the
+/// vendor's public Anthropic-compatible endpoint. There is no `base_url_alt` —
+/// only the Anthropic surface is wired for these providers.
+#[derive(Debug, Deserialize)]
+pub(crate) struct ConnectAnthropicKeyRequest {
+    #[serde(default)]
+    pub(crate) account_label: String,
+    #[serde(default)]
+    pub(crate) share_enabled: bool,
+    #[serde(default)]
+    pub(crate) share_limit_percent: Option<f64>,
+    #[serde(default)]
+    pub(crate) daily_token_limit: Option<u64>,
+    /// The vendor API key. The only required field.
+    #[serde(default)]
+    pub(crate) api_key: String,
+    /// Anthropic-compatible base prefix; defaults to `<PROVIDER>_BASE_URL`, then
+    /// to the vendor's public endpoint when empty. `/v1/messages` is appended.
+    #[serde(default)]
+    pub(crate) base_url: String,
+    /// Skip the connect-time reachability/auth probe (useful offline).
+    #[serde(default)]
+    pub(crate) skip_probe: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ConnectTraeRequest {
+    #[serde(default)]
+    pub(crate) account_label: String,
+    #[serde(default)]
+    pub(crate) share_enabled: bool,
+    #[serde(default)]
+    pub(crate) share_limit_percent: Option<f64>,
+    #[serde(default)]
+    pub(crate) daily_token_limit: Option<u64>,
+    /// The `trae2anthropic` sidecar's API key — **optional**. The sidecar leaves
+    /// its API open until a key is generated in its admin panel, so empty is a
+    /// valid local configuration (see `connect_trae`).
+    #[serde(default)]
+    pub(crate) api_key: String,
+    /// Sidecar base prefix; defaults to `TRAE_BASE_URL`, then to the sidecar's
+    /// own default (`http://127.0.0.1:8788`) when empty. `/v1/messages` and
+    /// `/v1/models` are appended. There is no `base_url_alt`: the sidecar exposes
+    /// only an Anthropic-compatible surface.
+    #[serde(default)]
+    pub(crate) base_url: String,
+    /// Skip the connect-time reachability probe (useful when the sidecar isn't
+    /// running yet).
     #[serde(default)]
     pub(crate) skip_probe: bool,
 }

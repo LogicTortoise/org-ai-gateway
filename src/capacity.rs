@@ -407,6 +407,12 @@ pub(crate) async fn run_capacity_maintenance(state: AppState) {
         tick.tick().await;
         ticks += 1;
         prune_history(&state).await;
+        // Recompute local 5h/7d windows for API-key endpoint providers
+        // (glm/kimi/deepseek/minimax). Their caps aren't parsed from upstream
+        // headers — they're derived from the audit log, so this tick is what
+        // makes old tokens slide out of the window even when no new traffic
+        // arrives. See `provider::usage_window`.
+        crate::provider::usage_window::refresh_all_local_windows(&state).await;
         refresh_outlooks(&state).await;
         if ticks % 5 == 0 {
             save_capacity_history(&state).await;
@@ -494,5 +500,25 @@ mod burn_tests {
         let captured = now - chrono::Duration::seconds(120);
         let outlook = window_outlook(&[], 10.0, Some(600), Some(captured), 3, true, now);
         assert_eq!(outlook.reset_after_seconds, Some(480));
+    }
+
+    #[test]
+    fn local_window_provider_with_unset_caps_yields_none_outlook() {
+        // glm/kimi/deepseek/minimax with no env caps declared:
+        // primary/secondary_used_percent both None → outlook primary/secondary
+        // also None (no wall to project). The selector's recent-429 fallback
+        // is the only signal left in that case.
+        let now = Utc::now();
+        let snapshot = RateLimitSnapshot {
+            primary_used_percent: None,
+            secondary_used_percent: None,
+            recent_rate_limit_errors_5h: Some(0),
+            ..RateLimitSnapshot::default()
+        };
+        for provider in ["glm", "kimi", "deepseek", "minimax"] {
+            let outlook = compute_account_outlook(provider, &snapshot, &[], now);
+            assert!(outlook.primary.is_none(), "{provider}: primary must be None");
+            assert!(outlook.secondary.is_none(), "{provider}: secondary must be None");
+        }
     }
 }

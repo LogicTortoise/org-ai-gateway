@@ -6,10 +6,14 @@ use crate::provider::claude::fetch_claude_models;
 use crate::provider::codex::fetch_codex_models;
 use crate::provider::cursor::fetch_cursor_models;
 use crate::provider::ollama::fetch_ollama_models;
+use crate::provider::deepseek::deepseek_model_catalog;
 use crate::provider::glm::fetch_glm_models;
 use crate::provider::glm::glm_model_catalog;
 use crate::provider::kimi::fetch_kimi_models;
 use crate::provider::kimi::kimi_model_catalog;
+use crate::provider::minimax::minimax_model_catalog;
+use crate::provider::trae::fetch_trae_models;
+use crate::provider::trae::trae_model_catalog;
 
 pub(crate) async fn get_codex_models(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let user_id = match extract_user_id(&headers) {
@@ -270,6 +274,88 @@ pub(crate) async fn get_kimi_models(State(state): State<AppState>, headers: Head
         StatusCode::OK,
         Json(ProviderModelsResponse {
             provider: "kimi".to_string(),
+            account_id,
+            owner_user_id: user_id,
+            models,
+        }),
+    )
+        .into_response()
+}
+
+/// Trae models: prefer the LIVE list from the connected sidecar's `/v1/models`
+/// (authoritative — the sidecar owns the id → real Trae config-name mapping),
+/// falling back to the static catalog (`TRAE_MODELS` override, else the built-in
+/// list mirroring the sidecar's `models.json`) when no account is connected or
+/// the sidecar is unreachable.
+pub(crate) async fn get_trae_models(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let user_id = match extract_user_id(&headers) {
+        Ok(uid) => uid,
+        Err(err) => {
+            return (StatusCode::UNAUTHORIZED, Json(json!({ "error": err }))).into_response();
+        }
+    };
+
+    let mut account_id = String::new();
+    let mut models = trae_model_catalog();
+    if let Some(account) = select_healthy_account(&state, "trae", &user_id, None, false, false).await {
+        account_id = account.id.clone();
+        match fetch_trae_models(&account).await {
+            Ok(live) if !live.is_empty() => models = live,
+            Ok(_) => {}
+            Err(e) => warn!("trae live model list failed, using static catalog: {}", e),
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(ProviderModelsResponse {
+            provider: "trae".to_string(),
+            account_id,
+            owner_user_id: user_id,
+            models,
+        }),
+    )
+        .into_response()
+}
+
+/// MiniMax models. STATIC only: MiniMax's Anthropic-compatible surface exposes no
+/// `/models` endpoint, so there is no live list to prefer — the catalog comes from
+/// `MINIMAX_MODELS` if set, else the built-in list. `account_id` is still filled
+/// in when an account exists so the UI can show which one a selection would use.
+pub(crate) async fn get_minimax_models(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    provider_static_models(state, headers, "minimax", minimax_model_catalog()).await
+}
+
+/// DeepSeek models. STATIC only, deliberately: DeepSeek's `GET /models` lists the
+/// ids of their OpenAI surface (`deepseek-chat`, `deepseek-reasoner`), not the ids
+/// this Anthropic surface documents, so a live fetch would offer models that then
+/// get silently remapped. Override with `DEEPSEEK_MODELS`.
+pub(crate) async fn get_deepseek_models(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    provider_static_models(state, headers, "deepseek", deepseek_model_catalog()).await
+}
+
+/// Shared body for providers whose catalog is static (no live `/models` fetch).
+async fn provider_static_models(
+    state: AppState,
+    headers: HeaderMap,
+    provider: &str,
+    models: Vec<ModelInfo>,
+) -> Response {
+    let user_id = match extract_user_id(&headers) {
+        Ok(uid) => uid,
+        Err(err) => {
+            return (StatusCode::UNAUTHORIZED, Json(json!({ "error": err }))).into_response();
+        }
+    };
+    let account_id = select_healthy_account(&state, provider, &user_id, None, false, false)
+        .await
+        .map(|a| a.id)
+        .unwrap_or_default();
+
+    (
+        StatusCode::OK,
+        Json(ProviderModelsResponse {
+            provider: provider.to_string(),
             account_id,
             owner_user_id: user_id,
             models,

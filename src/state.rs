@@ -10,6 +10,9 @@ pub(crate) struct AppState {
     pub(crate) capacity_file: PathBuf,
     /// Provider-priority chains config file (`provider_chains.json`).
     pub(crate) chain_file: PathBuf,
+    /// Runtime model-mapping overrides file (`provider_models.json`) — the
+    /// operator's live edits that sit on top of the model env vars.
+    pub(crate) model_config_file: PathBuf,
     pub(crate) accounts: Arc<RwLock<Vec<UpstreamAccount>>>,
     /// Latest real rate-limit snapshot per account internal id, captured from the
     /// `x-codex-*` response headers ChatGPT returns on each `responses` call.
@@ -52,5 +55,9 @@ pub(crate) struct AppState {
     /// Per-slot round-robin rotation counters (keyed by `ChainSlot::as_str`).
     /// Incremented once per request in round-robin mode to rotate the start.
     pub(crate) chain_rr: Arc<tokio::sync::Mutex<HashMap<String, usize>>>,
+    /// TTL cache for the `usage_window::aggregate_account_window` result per
+    /// account. Stops the 1-minute maintenance loop and concurrent dashboard
+    /// reads from re-scanning the whole audit file on every tick.
+    pub(crate) usage_window_cache: Arc<crate::provider::usage_window::UsageWindowCache>,
 }
 

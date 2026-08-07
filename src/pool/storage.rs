@@ -61,6 +61,16 @@ pub(crate) async fn append_audit(state: &AppState, record: &AuditRecord) -> Resu
         .map_err(|e| e.to_string())?;
     file.flush().await.map_err(|e| e.to_string())?;
 
+    // Invalidate the local-window cache for this account so the next read
+    // recomputes against the just-written row. The recompute itself is NOT
+    // triggered here — that would force a full audit-file scan on every
+    // request. Instead, `capacity::run_capacity_maintenance` (every minute)
+    // and `usage::probe_one_account` (every `GATEWAY_HEALTH_PROBE_SECS`)
+    // pick up the invalidation on their next tick.
+    if crate::provider::usage_window::is_local_window_provider(&record.routed_provider) {
+        state.usage_window_cache.invalidate(&record.upstream_account_id);
+    }
+
     Ok(())
 }
 

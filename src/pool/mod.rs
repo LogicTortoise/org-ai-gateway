@@ -7,21 +7,51 @@ pub(crate) mod storage;
 /// (weekly) window is skipped. Defined once — `account_eligible_for_affinity`
 /// and `select_account_for_request` must agree or sticky sessions would pin to
 /// accounts the selector refuses.
-const PRIMARY_HARD_EXCLUDE_PERCENT: f64 = 95.0;
-const SECONDARY_HARD_EXCLUDE_PERCENT: f64 = 99.0;
+pub(crate) const PRIMARY_HARD_EXCLUDE_PERCENT: f64 = 95.0;
+pub(crate) const SECONDARY_HARD_EXCLUDE_PERCENT: f64 = 99.0;
 
 /// Whether a provider's usage percentage represents a true rate-limit window
 /// that should hard-exclude / cool down an account at high utilization.
 ///
-/// Cursor and Ollama are the exceptions:
+/// Three providers stay on the deny list forever:
 /// - Cursor's percentage is the *included spend allowance* (e.g. the $20 plan
 ///   credit), not a usability cap — team/on-demand accounts keep working past
 ///   100% by paying for overage. A genuine block surfaces as a failed request
 ///   and cools the account down through the normal failure path instead.
 /// - Ollama is a local, non-metered upstream: it has no rate-limit windows at
 ///   all (and never carries a snapshot), so usage percent must never gate it.
+/// - Trae routes through a local sidecar that owns its per-login quota; the
+///   sidecar auto-disables an exhausted account itself, so the gateway can't
+///   meaningfully measure it and shouldn't try.
+///
+/// Everything else (claude, codex, **glm, kimi, deepseek, minimax**) gates.
+/// The four API-key endpoint providers do not return upstream percentage
+/// headers — instead, `provider::usage_window` synthesizes a `RateLimitSnapshot`
+/// from the audit log on the `state.rate_limits` map, and the scheduler reads
+/// that snapshot through the same code path as the real headers.
 pub(crate) fn usage_percent_gates_selection(provider: &str) -> bool {
-    !matches!(provider, "cursor" | "ollama" | "glm" | "kimi")
+    !matches!(provider, "cursor" | "ollama" | "trae")
+}
+
+/// Whether this account should be excluded because its local-window snapshot
+/// reports it's at the wall. Reads `primary_used_percent` first (the gate is
+/// the same 95/99 thresholds Claude uses), and falls back to "many recent 429s"
+/// when no `*_PRIMARY_LIMIT_TOKENS` cap has been declared (so the dashboard
+/// still warns about a quota that's clearly exhausted upstream even when we
+/// can't put a percentage on it).
+pub(crate) fn account_excluded_by_local_window(snapshot: &RateLimitSnapshot) -> bool {
+    let primary = snapshot.primary_used_percent.unwrap_or(0.0).clamp(0.0, 100.0);
+    let secondary = snapshot.secondary_used_percent.unwrap_or(0.0).clamp(0.0, 100.0);
+    if primary >= PRIMARY_HARD_EXCLUDE_PERCENT || secondary >= SECONDARY_HARD_EXCLUDE_PERCENT {
+        return true;
+    }
+    if snapshot.primary_used_percent.is_some() || snapshot.secondary_used_percent.is_some() {
+        // A cap is declared and we're below the wall — don't fall back to the
+        // error-count heuristic, which is a noisy proxy at best.
+        return false;
+    }
+    snapshot.recent_rate_limit_errors_5h.unwrap_or(0)
+        >= crate::provider::usage_window::RECENT_ERROR_FALLBACK_THRESHOLD
 }
 
 /// Sticky-session rebalance thresholds: a bound account is "pressured" when
@@ -428,15 +458,15 @@ pub(crate) fn should_rebalance_affinity(
     let Some(snapshot) = rate_limits.get(&preferred.id) else {
         return false;
     };
-    let primary = snapshot.primary_used_percent.unwrap_or(0.0).clamp(0.0, 100.0);
-    let secondary = snapshot.secondary_used_percent.unwrap_or(0.0).clamp(0.0, 100.0);
-    let exhaust_soon = outlooks
-        .get(&preferred.id)
-        .map(|o| o.primary_exhaust_within(AFFINITY_MIGRATE_EXHAUST_MINUTES))
-        .unwrap_or(false);
-    let pressured = primary >= AFFINITY_MIGRATE_PRIMARY_PERCENT
-        || secondary >= AFFINITY_MIGRATE_SECONDARY_PERCENT
-        || exhaust_soon;
+    // Local-window providers (glm/kimi/deepseek/minimax) feed a derived
+    // snapshot into the same `rate_limits` map, so this single check covers
+    // both real and synthetic windows without special-casing per provider.
+    let pressured = snapshot.primary_used_percent.unwrap_or(0.0) >= AFFINITY_MIGRATE_PRIMARY_PERCENT
+        || snapshot.secondary_used_percent.unwrap_or(0.0) >= AFFINITY_MIGRATE_SECONDARY_PERCENT
+        || outlooks
+            .get(&preferred.id)
+            .map(|o| o.primary_exhaust_within(AFFINITY_MIGRATE_EXHAUST_MINUTES))
+            .unwrap_or(false);
     if !pressured {
         return false;
     }
@@ -633,10 +663,18 @@ pub(crate) fn account_eligible_for_affinity(
     let Some(snapshot) = rate_limits.get(&account.id) else {
         return true;
     };
-    let primary = snapshot.primary_used_percent.unwrap_or(0.0).clamp(0.0, 100.0);
-    let secondary = snapshot.secondary_used_percent.unwrap_or(0.0).clamp(0.0, 100.0);
+    // Two parallel exclusion paths share the same 95/99 thresholds:
+    // 1) Providers that publish their own usage headers (claude/codex) —
+    //    `usage_percent_gates_selection` is true, so the percent check kicks
+    //    in directly off the snapshot.
+    // 2) The four API-key endpoint providers (glm/kimi/deepseek/minimax) —
+    //    they return no headers, so `provider::usage_window` synthesizes the
+    //    snapshot from the audit log. The numbers aren't "real" upstream
+    //    percentages (they're local-window sums against operator-set caps,
+    //    with a recent-429 fallback when no cap is declared), but the
+    //    exclusion logic is identical: same wall, same threshold.
     if usage_percent_gates_selection(provider)
-        && (primary >= PRIMARY_HARD_EXCLUDE_PERCENT || secondary >= SECONDARY_HARD_EXCLUDE_PERCENT)
+        && (account_excluded_by_local_window(snapshot))
     {
         return false;
     }
@@ -678,6 +716,7 @@ mod share_policy_tests {
         RateLimitSnapshot {
             primary_used_percent: Some(primary),
             secondary_used_percent: Some(secondary),
+            recent_rate_limit_errors_5h: Some(0),
             ..RateLimitSnapshot::default()
         }
     }
@@ -945,6 +984,67 @@ mod share_policy_tests {
         let picked = select_account_for_request(&accounts, "bob", "claude", &limits, &HashMap::new());
         assert_eq!(picked.map(|p| p.id), Some("a2".to_string()));
     }
+
+    /// Build an account whose `provider` is one of the four local-window
+    /// endpoints (glm / kimi / deepseek / minimax). All existing tests use
+    /// "claude"; the local-window selector path is otherwise unreachable.
+    fn local_account(id: &str, provider: &str) -> UpstreamAccount {
+        let mut a = account(id, "alice", true, None);
+        a.provider = provider.to_string();
+        a
+    }
+
+    #[test]
+    fn minimax_at_95_percent_is_excluded() {
+        // Mirrors cursor_at_100_percent_is_still_selectable but flipped:
+        // a minimax account above the 95% wall MUST be skipped, same as a
+        // claude/codex account would be. The percent is synthesised by
+        // `provider::usage_window` from the audit log + env cap.
+        let accounts = vec![local_account("m1", "minimax")];
+        let mut limits = HashMap::new();
+        limits.insert("m1".to_string(), snapshot(96.0, 30.0));
+        // Hard-excluded from the affinity funnel.
+        assert!(!account_eligible_for_affinity("minimax", &accounts[0], &limits));
+        // Last-resort still picks it (serving on a nearly-full account beats
+        // a hard outage for the whole pool — see `select_account_for_request`).
+        let last_resort =
+            select_account_for_request(&accounts, "alice", "minimax", &limits, &HashMap::new());
+        assert_eq!(last_resort.map(|p| p.id), Some("m1".to_string()));
+        // Below the wall it stays in the normal eligible funnel.
+        limits.insert("m1".to_string(), snapshot(80.0, 30.0));
+        assert!(account_eligible_for_affinity("minimax", &accounts[0], &limits));
+        let picked =
+            select_account_for_request(&accounts, "alice", "minimax", &limits, &HashMap::new());
+        assert_eq!(picked.map(|p| p.id), Some("m1".to_string()));
+    }
+
+    #[test]
+    fn glm_no_limit_but_recent_429s_excludes_account() {
+        // No env caps → primary_used_percent stays None, so the percent-based
+        // gate never fires. The selector MUST still exclude an account that
+        // has been 429'd >=5 times in the last 5h (the
+        // RECENT_ERROR_FALLBACK_THRESHOLD path).
+        let accounts = vec![local_account("g1", "glm")];
+        let mut snap = RateLimitSnapshot::default();
+        let mut limits = HashMap::new();
+        // 4 errors: still selectable.
+        snap.recent_rate_limit_errors_5h = Some(
+            crate::provider::usage_window::RECENT_ERROR_FALLBACK_THRESHOLD - 1,
+        );
+        limits.insert("g1".to_string(), snap.clone());
+        assert!(account_eligible_for_affinity("glm", &accounts[0], &limits));
+        // 5 errors: excluded.
+        snap.recent_rate_limit_errors_5h = Some(
+            crate::provider::usage_window::RECENT_ERROR_FALLBACK_THRESHOLD,
+        );
+        limits.insert("g1".to_string(), snap);
+        assert!(!account_eligible_for_affinity("glm", &accounts[0], &limits));
+        // Sanity: the same snapshot on a non-local-window provider (claude)
+        // does NOT flip exclusion — claude's exclusion is driven purely by
+        // primary_used_percent, not by recent 429s.
+        let claude_accounts = vec![local_account("c1", "claude")];
+        assert!(account_eligible_for_affinity("claude", &claude_accounts[0], &limits));
+    }
 }
 
 pub(crate) fn select_account_for_request(
@@ -1086,21 +1186,29 @@ pub(crate) fn select_account_for_request(
 
         for account in group {
             let snapshot = snapshot_for(rate_limits, account);
-            let primary = snapshot
-                .and_then(|s| s.primary_used_percent)
-                .unwrap_or(0.0)
-                .clamp(0.0, 100.0);
+
+            // Hard-exclude at the wall. The check is provider-agnostic: the four
+            // API-key providers (glm/kimi/deepseek/minimax) feed their locally
+            // derived snapshot in via `provider::usage_window`, so the same 95/99
+            // thresholds do the right thing for them too. See
+            // `usage_percent_gates_selection` for the providers we intentionally
+            // skip (cursor/ollama/trae).
+            if usage_percent_gates_selection(provider) {
+                if let Some(s) = snapshot {
+                    if account_excluded_by_local_window(s) {
+                        continue;
+                    }
+                }
+            }
+
+            // Pulled out of the (now-deleted) inline block above so the
+            // tier-selector's secondary_pct still has the right shape (it's
+            // what `account_score` and the (tier, below-threshold) ladder key
+            // off). Account score itself stays unchanged.
             let secondary = snapshot
                 .and_then(|s| s.secondary_used_percent)
                 .unwrap_or(0.0)
                 .clamp(0.0, 100.0);
-
-            if usage_percent_gates_selection(provider)
-                && (primary >= PRIMARY_HARD_EXCLUDE_PERCENT
-                    || secondary >= SECONDARY_HARD_EXCLUDE_PERCENT)
-            {
-                continue;
-            }
 
             let candidate = ScoredCandidate {
                 account,

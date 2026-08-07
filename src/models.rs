@@ -19,6 +19,15 @@ pub(crate) struct RateLimitSnapshot {
     pub(crate) credits_has_credits: Option<bool>,
     pub(crate) credits_unlimited: Option<bool>,
     pub(crate) credits_balance: Option<String>,
+    /// Local-window side channel: number of upstream rate-limit responses in
+    /// the past 5h. Only populated by `provider::usage_window` for the four
+    /// API-key endpoint providers (glm/kimi/deepseek/minimax), who don't
+    /// return their own percentage headers. `None` everywhere else so the
+    /// existing scheduler paths (claude/codex/cursor) keep their current
+    /// behaviour. Read by the selector as a `should_exclude_for_local_window`
+    /// fallback when no `*_PRIMARY_LIMIT_TOKENS` cap has been declared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) recent_rate_limit_errors_5h: Option<u32>,
     pub(crate) captured_at: Option<DateTime<Utc>>,
 }
 

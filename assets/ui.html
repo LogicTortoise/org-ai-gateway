@@ -2016,9 +2016,18 @@
 
         function capProviderMeta() {
             return {
-                claude: { name: 'Claude', badge: 'bg-purple-100 text-purple-700', primary: t('win5h'), secondary: t('winWeek') },
-                codex:  { name: 'Codex',  badge: 'bg-blue-100 text-blue-700',     primary: t('win5h'), secondary: t('winWeek') },
-                cursor: { name: 'Cursor', badge: 'bg-emerald-100 text-emerald-700', primary: t('winMonthQuota'), secondary: '' },
+                claude:   { name: 'Claude',   badge: 'bg-purple-100 text-purple-700',   primary: t('win5h'), secondary: t('winWeek') },
+                codex:    { name: 'Codex',    badge: 'bg-blue-100 text-blue-700',       primary: t('win5h'), secondary: t('winWeek') },
+                cursor:   { name: 'Cursor',   badge: 'bg-emerald-100 text-emerald-700', primary: t('winMonthQuota'), secondary: '' },
+                // API-key endpoint providers: usage is derived locally from the
+                // audit log (provider::usage_window). Both windows are operator-
+                // configured caps; undeclared caps render as "not applicable"
+                // and the secondary badge is intentionally blank to match the
+                // rest of the dashboard.
+                glm:      { name: 'GLM',      badge: 'bg-rose-100 text-rose-700',       primary: t('win5h'), secondary: t('winWeek') },
+                kimi:     { name: 'Kimi',     badge: 'bg-amber-100 text-amber-700',     primary: t('win5h'), secondary: t('winWeek') },
+                deepseek: { name: 'DeepSeek', badge: 'bg-sky-100 text-sky-700',         primary: t('win5h'), secondary: t('winWeek') },
+                minimax:  { name: 'MiniMax',  badge: 'bg-indigo-100 text-indigo-700',   primary: t('win5h'), secondary: t('winWeek') },
             };
         }
 

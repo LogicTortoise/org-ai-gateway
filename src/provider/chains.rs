@@ -40,10 +40,18 @@ impl ChainSlot {
     /// Providers that can legally serve this slot. GLM and ollama serve both
     /// (via the Anthropic passthrough / OpenAI adapter as appropriate); cursor
     /// rides the format adapter; the native provider only serves its own slot.
+    /// `trae` is Claude-only: its sidecar exposes an Anthropic-compatible
+    /// `/v1/messages` and nothing OpenAI-shaped, so it has no Codex path.
+    /// `minimax` / `deepseek` are Claude-only by choice: both DO have
+    /// OpenAI-compatible endpoints, but only their Anthropic surface is wired,
+    /// because that path is a buffered passthrough where tool calls survive while
+    /// the OpenAI adapter path is text-only.
     pub(crate) fn allowed_providers(self) -> &'static [&'static str] {
         match self {
             ChainSlot::Codex => &["codex", "glm", "kimi", "ollama", "cursor"],
-            ChainSlot::Claude => &["claude", "glm", "kimi", "ollama", "cursor"],
+            ChainSlot::Claude => {
+                &["claude", "glm", "kimi", "minimax", "deepseek", "trae", "ollama", "cursor"]
+            }
         }
     }
 }
@@ -215,6 +223,48 @@ mod tests {
     fn empty_falls_back_to_native() {
         let mut pc = ProviderChains::default();
         pc.apply_validated(ChainSlot::Codex, ChainMode::Failover, &["bogus".into()]);
+        assert_eq!(pc.codex.providers, vec!["codex"]);
+    }
+
+    #[test]
+    fn trae_is_claude_slot_only() {
+        let mut pc = ProviderChains::default();
+        // Legal in the Claude slot: the sidecar speaks Anthropic /v1/messages.
+        pc.apply_validated(
+            ChainSlot::Claude,
+            ChainMode::Failover,
+            &["claude".into(), "trae".into()],
+        );
+        assert_eq!(pc.claude.providers, vec!["claude", "trae"]);
+
+        // Illegal in the Codex slot — it has no OpenAI-shaped endpoint, so it is
+        // filtered out rather than being handed a request it can't serve.
+        pc.apply_validated(
+            ChainSlot::Codex,
+            ChainMode::Failover,
+            &["codex".into(), "trae".into()],
+        );
+        assert_eq!(pc.codex.providers, vec!["codex"]);
+    }
+
+    #[test]
+    fn minimax_and_deepseek_are_claude_slot_only() {
+        let mut pc = ProviderChains::default();
+        // Legal in the Claude slot: both speak Anthropic /v1/messages.
+        pc.apply_validated(
+            ChainSlot::Claude,
+            ChainMode::Failover,
+            &["claude".into(), "minimax".into(), "deepseek".into()],
+        );
+        assert_eq!(pc.claude.providers, vec!["claude", "minimax", "deepseek"]);
+
+        // Only their Anthropic surface is wired, so the Codex slot filters them
+        // out rather than handing them a request they can't serve.
+        pc.apply_validated(
+            ChainSlot::Codex,
+            ChainMode::Failover,
+            &["codex".into(), "minimax".into(), "deepseek".into()],
+        );
         assert_eq!(pc.codex.providers, vec!["codex"]);
     }
 }

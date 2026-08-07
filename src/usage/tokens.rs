@@ -44,10 +44,17 @@ fn sse_json_events(body: &str) -> Vec<Value> {
 }
 
 /// Parse token usage for a provider from a fully-buffered response body.
+///
+/// `trae` / `minimax` / `deepseek` share the CLAUDE parsers, not GLM/Kimi's
+/// dual-shape ones: each is wired to an Anthropic-compatible endpoint only, so
+/// their bodies always carry Anthropic-shaped `usage` (including
+/// `cache_read_input_tokens` / `cache_creation_input_tokens`) and there is no
+/// OpenAI shape to fall back to.
 pub(crate) fn parse_usage(provider: &str, body: &str) -> TokenUsage {
+    let anthropic_only = matches!(provider, "claude" | "trae" | "minimax" | "deepseek");
     let events = sse_json_events(body);
     if !events.is_empty() {
-        return if provider == "claude" {
+        return if anthropic_only {
             parse_claude_events(&events)
         } else if provider == "glm" || provider == "kimi" {
             parse_glm_events(&events)
@@ -56,7 +63,7 @@ pub(crate) fn parse_usage(provider: &str, body: &str) -> TokenUsage {
         };
     }
     if let Ok(v) = serde_json::from_str::<Value>(body) {
-        return if provider == "claude" {
+        return if anthropic_only {
             parse_claude_json(&v)
         } else if provider == "glm" || provider == "kimi" {
             parse_glm_json(&v)
@@ -65,6 +72,47 @@ pub(crate) fn parse_usage(provider: &str, body: &str) -> TokenUsage {
         };
     }
     TokenUsage::default()
+}
+
+/// The model id the upstream says it actually ran, pulled out of a fully
+/// buffered response body.
+///
+/// This is the ONLY authoritative answer to "which model served this request".
+/// The `model` the client asked for routinely isn't it: the chain degrades a
+/// `claude-sonnet-4-5` request onto DeepSeek (served by `deepseek-v4-pro`), a
+/// bare `kimi` expands to a configured default, and Anthropic answers a floating
+/// alias with the dated snapshot that ran (`claude-sonnet-4-5-20250929`). Only
+/// the response knows.
+///
+/// One scan covers every shape the gateway buffers, because they all spell it
+/// `model`, just at different depths:
+///   * Anthropic SSE  — `message_start` → `/message/model`
+///   * Codex SSE      — `response.*`    → `/response/model`
+///   * OpenAI SSE     — each chunk      → `/model`
+///   * any single JSON — the same three pointers
+///
+/// Returns `None` for unparseable bodies and error payloads (which carry no
+/// `model`); callers fall back to `normalize_model_for_provider`.
+pub(crate) fn parse_response_model(body: &str) -> Option<String> {
+    fn from_value(v: &Value) -> Option<String> {
+        for ptr in ["/message/model", "/response/model", "/model"] {
+            if let Some(m) = v.pointer(ptr).and_then(|m| m.as_str()) {
+                let m = m.trim();
+                if !m.is_empty() {
+                    return Some(m.to_string());
+                }
+            }
+        }
+        None
+    }
+
+    // SSE first: the events carry the model, the raw concatenated body isn't JSON.
+    for ev in sse_json_events(body) {
+        if let Some(m) = from_value(&ev) {
+            return Some(m);
+        }
+    }
+    from_value(&serde_json::from_str::<Value>(body).ok()?)
 }
 
 // ---- GLM (Zhipu / z.ai) + Kimi (Moonshot) ----
@@ -318,6 +366,47 @@ mod tests {
         let body = "{\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}";
         let u = parse_usage("claude", body);
         assert_eq!(u.billable_tokens, 15);
+    }
+
+    #[test]
+    fn response_model_anthropic_message_start() {
+        // Real Anthropic shape: model lives at message_start.message.model.
+        let body = "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_01\",\"model\":\"claude-sonnet-4-5-20250929\",\"usage\":{\"input_tokens\":10}}}\n\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n";
+        assert_eq!(
+            parse_response_model(body).as_deref(),
+            Some("claude-sonnet-4-5-20250929"),
+        );
+    }
+
+    #[test]
+    fn response_model_anthropic_single_json() {
+        let body = "{\"id\":\"msg_01\",\"model\":\"claude-sonnet-4-5\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}";
+        assert_eq!(
+            parse_response_model(body).as_deref(),
+            Some("claude-sonnet-4-5"),
+        );
+    }
+
+    #[test]
+    fn response_model_codex_response_completed() {
+        // Codex: model lives under response.* on the terminal event.
+        let body = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.5\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n\n";
+        assert_eq!(parse_response_model(body).as_deref(), Some("gpt-5.5"));
+    }
+
+    #[test]
+    fn response_model_openai_chunk() {
+        // OpenAI-compat stream: model is at the chunk root.
+        let body = "data: {\"id\":\"cmpl-1\",\"model\":\"glm-4.6\",\"choices\":[]}\n\ndata: [DONE]\n\n";
+        assert_eq!(parse_response_model(body).as_deref(), Some("glm-4.6"));
+    }
+
+    #[test]
+    fn response_model_none_when_body_has_no_model() {
+        // Error payloads carry no model.
+        assert!(parse_response_model("{\"error\":\"boom\"}").is_none());
+        // And of course garbage bytes.
+        assert!(parse_response_model("not json").is_none());
     }
 }
 

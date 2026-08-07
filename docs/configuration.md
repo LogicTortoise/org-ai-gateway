@@ -84,6 +84,8 @@ GATEWAY_OWNER_PROTECTION=on GATEWAY_HTTP_TIMEOUT_SECS=900 ./scripts/restart.sh -
 | `GLM_FABLE_MODEL` | `glm-5.2` | **fable 档**（`claude-fable-*`） |
 | `GLM_MODELS` | 内置目录 | 逗号分隔，覆盖 model 目录 |
 | `GLM_TIMEOUT_SECS` | `600` | 超时（秒） |
+| `GLM_PRIMARY_LIMIT_TOKENS` | 不限 | **5h 窗口 token 上限**（网关本地聚合用；不设 = 不参与撞墙预判，仅作 burn rate 观测） |
+| `GLM_WEEKLY_LIMIT_TOKENS` | 不限 | **周窗口 token 上限**（同上） |
 
 ### Kimi（Moonshot）
 | 变量 | 默认 | 说明 |
@@ -96,6 +98,8 @@ GATEWAY_OWNER_PROTECTION=on GATEWAY_HTTP_TIMEOUT_SECS=900 ./scripts/restart.sh -
 | `KIMI_FABLE_MODEL` | `kimi-k2-0711-preview` | **fable 档**（`claude-fable-*`） |
 | `KIMI_MODELS` | 内置目录 | 逗号分隔，覆盖 model 目录 |
 | `KIMI_TIMEOUT_SECS` | `600` | 超时（秒） |
+| `KIMI_PRIMARY_LIMIT_TOKENS` | 不限 | **5h 窗口 token 上限**（网关本地聚合用；不设 = 不参与撞墙预判，仅作 burn rate 观测） |
+| `KIMI_WEEKLY_LIMIT_TOKENS` | 不限 | **周窗口 token 上限**（同上） |
 
 ### Trae（trae2anthropic sidecar）
 
@@ -130,6 +134,8 @@ Trae 不是直连的云端 API：Trae IDE 用的是私有的 `api/agent/v3` agen
 | `MINIMAX_FABLE_MODEL` | `MiniMax-M3` | **fable 档**（`claude-fable-*`） |
 | `MINIMAX_MODELS` | 内置目录 | 逗号分隔，覆盖 model 目录（MiniMax 的 Anthropic 面没有 `/models`，所以目录是静态的） |
 | `MINIMAX_TIMEOUT_SECS` | `600` | 超时（秒） |
+| `MINIMAX_PRIMARY_LIMIT_TOKENS` | 不限 | **5h 窗口 token 上限**（网关本地聚合用；不设 = 不参与撞墙预判，仅作 burn rate 观测） |
+| `MINIMAX_WEEKLY_LIMIT_TOKENS` | 不限 | **周窗口 token 上限**（同上） |
 
 **只走 Claude slot。** 网关只把它接到 Anthropic 形状的 `/v1/messages` 上——那条路是带 tool_use 的原样透传；接到 Codex 链要走的 OpenAI 适配层只能转纯文本，工具调用会丢，所以 chains 校验直接拒绝 MiniMax 进 Codex slot。
 
@@ -148,6 +154,8 @@ Trae 不是直连的云端 API：Trae IDE 用的是私有的 `api/agent/v3` agen
 | `DEEPSEEK_FABLE_MODEL` | `deepseek-v4-flash` | **fable 档**（Claude Code 最便宜的 tier） |
 | `DEEPSEEK_MODELS` | 内置目录 | 逗号分隔，覆盖 model 目录 |
 | `DEEPSEEK_TIMEOUT_SECS` | `600` | 超时（秒） |
+| `DEEPSEEK_PRIMARY_LIMIT_TOKENS` | 不限 | **5h 窗口 token 上限**（网关本地聚合用；不设 = 不参与撞墙预判，仅作 burn rate 观测） |
+| `DEEPSEEK_WEEKLY_LIMIT_TOKENS` | 不限 | **周窗口 token 上限**（同上） |
 
 **只走 Claude slot**，理由同 MiniMax。
 
@@ -224,6 +232,35 @@ Trae / MiniMax / DeepSeek 同理，且**只能**用 `failover`：
 所以瞬时故障的正解是**原账号退避重试**，实现在 `src/routes/proxy.rs` 的 `TRANSIENT_SAME_ACCOUNT_BACKOFF_SECS`（15s / 45s / 90s，每请求共享 3 次预算，期间用 `forced_account` 把请求钉在缓存热的那个账号上）。只有退避耗尽、或遇到 429 这类真正的额度信号，才轮到换账号 → 换 provider。
 
 **结论**：不要为了"提高成功率"往 claude 链里加 kimi/glm。链是额度兜底，退避是故障兜底，两者不要混。
+
+---
+
+## 本地聚合窗口（GLM / Kimi / DeepSeek / MiniMax 的 5h + 周撞墙预判）
+
+Codex / Claude / Cursor 都在响应头里告诉网关自己用了多少，dashboard 和选择器直接读这些头就够了。GLM / Kimi / DeepSeek / MiniMax 是直连的 API Key 端点，**不返回任何限流头**（DeepSeek、GLM 官方文档明确没有 `x-ratelimit-*` 之类的字段；MiniMax 的 Anthropic 兼容端点也只在 429 响应体里给一个 `error.code=2056` 的 "5h usage limit exceeded"，response header 全空）。所以这四家走 **网关本地按审计 token 自聚合 5h / 7d 用量**的路径，跟上游真正用的 RPM/TPM 滑动窗口不是一回事，但能抓住最常见的撞墙场景（"这个号被打满了"），并跟 Claude 用同一道 95 / 99 阈值决定选择器要不要主动绕开。
+
+实现位置：`src/provider/usage_window.rs`。两路生产者各管自己的失效条件：
+
+- **被动**（`pool/storage.rs::append_audit`）：每次审计写入后只 `invalidate_cache` 该账号的缓存项，不立即重算——避免每次请求都扫整个 audit 文件。
+- **主动**（`capacity::run_capacity_maintenance` 每分钟一次；`usage::probe_one_account` 探测周期兜底）：把缓存填回去。
+
+**配套 env**：每家一对：
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `GLM_PRIMARY_LIMIT_TOKENS` / `GLM_WEEKLY_LIMIT_TOKENS` | 不限 | GLM 5h / 周窗口 token 上限 |
+| `KIMI_PRIMARY_LIMIT_TOKENS` / `KIMI_WEEKLY_LIMIT_TOKENS` | 不限 | Kimi 同上 |
+| `DEEPSEEK_PRIMARY_LIMIT_TOKENS` / `DEEPSEEK_WEEKLY_LIMIT_TOKENS` | 不限 | DeepSeek 同上 |
+| `MINIMAX_PRIMARY_LIMIT_TOKENS` / `MINIMAX_WEEKLY_LIMIT_TOKENS` | 不限 | MiniMax 同上 |
+
+**默认行为**：`0` / 未设 / 解析失败 → 该窗口 `used_percent = None`，dashboard 显示"不适用"，选择器不靠它做硬排除。
+
+**兜底机制**：即使两 env 都不设，选择器仍会用"近 5h 限流错误次数 >= 5"（audit status 含 `rate_limit` 或 `429`）作为撞墙信号的兜底，避免那种"号明显被上游打 429 了但本地 percentage 还是 0%"的盲区。
+
+**注意事项**：
+- `recent_rate_limit_errors_5h` 不写进 capacity history（避免污染历史样本），只在实时 `RateLimitSnapshot` 里携带。
+- 这条路径只用来"预判"撞墙；真的撞墙时仍然由 `retry.rs` 的现有逻辑（`looks_rate_limited` / `TRANSIENT_SAME_ACCOUNT_BACKOFF_SECS`）负责退避重试 + 换号，跟 Claude 完全一致。
+- 上游 RPM/TPM 真实窗口和这里用的"过去 5h 总 token"不是一回事；用户配的上限要按自己账号的实际 quota 拍脑袋设（参考 `usage::tokens` 计费的真实 billable = `input_uncached + output`，不是 input 总量）。
 
 ---
 

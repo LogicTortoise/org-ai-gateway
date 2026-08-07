@@ -4,9 +4,14 @@ pub(crate) mod chains;
 pub(crate) mod claude;
 pub(crate) mod codex;
 pub(crate) mod cursor;
+pub(crate) mod deepseek;
 pub(crate) mod glm;
 pub(crate) mod kimi;
+pub(crate) mod minimax;
+pub(crate) mod model_config;
 pub(crate) mod ollama;
+pub(crate) mod trae;
+pub(crate) mod usage_window;
 
 /// The upstream providers the gateway can route to. Accounts persist the
 /// provider as a string (`UpstreamAccount.provider`), so this enum is the
@@ -37,6 +42,26 @@ pub(crate) enum Provider {
     /// URLs default to Moonshot's public ones; an "account" is effectively just
     /// an api key. Serves as a Claude Code fallback via the Claude chain.
     Kimi,
+    /// Trae (ByteDance Trae IDE models), reached through a local `trae2anthropic`
+    /// sidecar. Unlike GLM/Kimi it serves the **Claude slot only** — the sidecar
+    /// exposes an Anthropic-compatible `/v1/messages` and nothing OpenAI-shaped,
+    /// so there is no Codex adapter path. An "account" is the sidecar's base URL
+    /// plus an OPTIONAL api key (the sidecar's own auth is opt-in); the real Trae
+    /// logins and their quotas live inside the sidecar's admin panel. Exists as a
+    /// Claude Code 额度降级 fallback. See `trae.rs` for why it's a sidecar.
+    Trae,
+    /// MiniMax (MiniMax-M series). An API-key endpoint provider (no OAuth/refresh)
+    /// serving the **Claude slot only**: it is wired to MiniMax's
+    /// Anthropic-compatible `/anthropic/v1/messages` as a buffered passthrough so
+    /// tool calls survive. Their OpenAI-ish endpoint is deliberately NOT wired —
+    /// it would only reach the text-only adapter. An "account" is effectively just
+    /// an api key (the base URL defaults to MiniMax's public endpoint).
+    Minimax,
+    /// DeepSeek. Structurally identical to MiniMax — an API-key endpoint provider
+    /// (no OAuth/refresh) serving the **Claude slot only** via DeepSeek's
+    /// Anthropic-compatible `/anthropic/v1/messages`, the same surface their docs
+    /// point Claude Code at. An "account" is effectively just an api key.
+    Deepseek,
 }
 
 impl Provider {
@@ -48,6 +73,9 @@ impl Provider {
             "ollama" => Some(Self::Ollama),
             "glm" => Some(Self::Glm),
             "kimi" => Some(Self::Kimi),
+            "trae" => Some(Self::Trae),
+            "minimax" => Some(Self::Minimax),
+            "deepseek" => Some(Self::Deepseek),
             _ => None,
         }
     }
@@ -60,6 +88,9 @@ impl Provider {
             Self::Ollama => "ollama",
             Self::Glm => "glm",
             Self::Kimi => "kimi",
+            Self::Trae => "trae",
+            Self::Minimax => "minimax",
+            Self::Deepseek => "deepseek",
         }
     }
 }
@@ -92,6 +123,21 @@ pub(crate) fn route_provider(model: &str, preferred_provider: Option<&str>) -> S
         return Provider::Kimi.as_str().to_string();
     }
 
+    if minimax::is_minimax_model(model) {
+        return Provider::Minimax.as_str().to_string();
+    }
+
+    if deepseek::is_deepseek_model(model) {
+        return Provider::Deepseek.as_str().to_string();
+    }
+
+    // Checked before the `contains("claude")` catch-all, though the two can't
+    // actually collide: `is_trae_model` only accepts the explicit `trae` /
+    // `trae/<model>` forms, never the vendor model ids Trae resells.
+    if trae::is_trae_model(model) {
+        return Provider::Trae.as_str().to_string();
+    }
+
     if model.to_ascii_lowercase().contains("claude") {
         return Provider::Claude.as_str().to_string();
     }
@@ -107,8 +153,116 @@ pub(crate) fn normalize_model_for_provider(model: &str, provider: &str) -> Strin
         Some(Provider::Ollama) => ollama::ollama_canonical_model(model),
         Some(Provider::Glm) => glm::glm_canonical_model(model),
         Some(Provider::Kimi) => kimi::kimi_canonical_model(model),
+        Some(Provider::Trae) => trae::trae_canonical_model(model),
+        Some(Provider::Minimax) => minimax::minimax_canonical_model(model),
+        Some(Provider::Deepseek) => deepseek::deepseek_canonical_model(model),
         _ => model.to_string(),
     }
+}
+
+/// Whether a provider's Anthropic-compatible surface is a third-party imitation
+/// rather than Anthropic itself. Everything on this list is reached through the
+/// Claude slot's raw `/v1/messages` passthrough, and none of it implements
+/// Anthropic's server-side tools — see `strip_anthropic_server_tools`.
+pub(crate) fn is_third_party_anthropic(provider: &str) -> bool {
+    matches!(provider, "glm" | "kimi" | "trae" | "minimax" | "deepseek")
+}
+
+/// Remove Anthropic *server tools* from an Anthropic-shaped payload, returning
+/// how many items were dropped.
+///
+/// Server tools (`web_search_20250305`, `web_fetch_*`, `code_execution_*`,
+/// `computer_*`, …) are executed by Anthropic's own backend, so they exist only
+/// on first-party Anthropic. Claude Code declares them in every request when the
+/// matching feature is on — that's real traffic here, see the pinned-name note
+/// in `fingerprint::claude::obfuscate_tool_names`. Forwarding them to a
+/// third-party Anthropic-compatible upstream at best wastes prompt tokens on a
+/// tool that can never fire, and at worst 400s the request on an unrecognized
+/// `type`.
+///
+/// Three things get cleaned, because dropping only the first would leave the
+/// payload self-inconsistent:
+///   1. the declarations in `tools`,
+///   2. a `tool_choice` pointing at one of them,
+///   3. the `server_tool_use` / `*_tool_result` blocks an earlier first-party
+///      turn already produced — a session that falls back to a cheap provider
+///      mid-conversation carries those in its transcript.
+///
+/// Client-declared tools are untouched, including client-side MCP tools: those
+/// arrive as ordinary custom tools (`mcp__minimax__web_search`), and the client,
+/// not the upstream, executes them. That's exactly why a client-side MCP is the
+/// working substitute for the built-in web search on these providers.
+pub(crate) fn strip_anthropic_server_tools(payload: &mut Value) -> usize {
+    let mut removed = 0usize;
+    let mut dropped_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // A client-declared tool has no `type` at all, or `type: "custom"`. Anything
+    // else is one of Anthropic's own — same rule the fingerprint's pinned-name
+    // set uses, kept identical on purpose.
+    let mut tools_now_empty = false;
+    if let Some(tools) = payload.get_mut("tools").and_then(|t| t.as_array_mut()) {
+        tools.retain(|tool| {
+            let is_server = match tool.get("type").and_then(|t| t.as_str()) {
+                Some(t) => t != "custom",
+                None => false,
+            };
+            if is_server {
+                if let Some(name) = tool.get("name").and_then(|n| n.as_str()) {
+                    dropped_names.insert(name.to_string());
+                }
+                removed += 1;
+            }
+            !is_server
+        });
+        tools_now_empty = tools.is_empty();
+    }
+    if tools_now_empty {
+        // An empty `tools` array is not universally accepted, and a `tool_choice`
+        // with nothing to choose from certainly isn't. Drop both keys.
+        if let Some(obj) = payload.as_object_mut() {
+            obj.remove("tools");
+            obj.remove("tool_choice");
+        }
+    } else if !dropped_names.is_empty() {
+        let stale = payload
+            .pointer("/tool_choice/name")
+            .and_then(|n| n.as_str())
+            .is_some_and(|n| dropped_names.contains(n));
+        if stale {
+            payload["tool_choice"] = json!({ "type": "auto" });
+        }
+    }
+
+    if let Some(messages) = payload.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        for msg in messages.iter_mut() {
+            let Some(content) = msg.get_mut("content").and_then(|c| c.as_array_mut()) else {
+                continue;
+            };
+            content.retain(|block| {
+                let drop = match block.get("type").and_then(|t| t.as_str()) {
+                    Some("server_tool_use") | Some("mcp_tool_use") => true,
+                    // Every server tool names its result block `<tool>_tool_result`
+                    // (`web_search_tool_result`, `code_execution_tool_result`, …).
+                    // The client-side block is the bare `tool_result`, which is
+                    // shorter than the suffix and so never matches.
+                    Some(t) => t.ends_with("_tool_result"),
+                    None => false,
+                };
+                if drop {
+                    removed += 1;
+                }
+                !drop
+            });
+            if content.is_empty() {
+                // Server tool blocks can be a turn's entire content. An empty
+                // content array is rejected, and deleting the message would break
+                // user/assistant alternation, so leave a marker behind.
+                *content = vec![json!({ "type": "text", "text": "[server tool output removed]" })];
+            }
+        }
+    }
+
+    removed
 }
 
 /// Whether an account label is still an auto-generated default (no real
@@ -375,6 +529,111 @@ pub(crate) async fn run_token_refresh_loop(
                     e
                 ),
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod server_tool_tests {
+    use super::*;
+
+    #[test]
+    fn strips_declarations_and_repoints_tool_choice() {
+        let mut payload = json!({
+            "model": "claude-sonnet-4-5",
+            "tools": [
+                { "type": "web_search_20250305", "name": "web_search", "max_uses": 8 },
+                { "name": "Read", "input_schema": { "type": "object" } },
+                { "type": "custom", "name": "Bash", "input_schema": { "type": "object" } }
+            ],
+            "tool_choice": { "type": "tool", "name": "web_search" }
+        });
+        assert_eq!(strip_anthropic_server_tools(&mut payload), 1);
+
+        // Only the server tool is gone; both client shapes (no `type`, and the
+        // explicit `type: "custom"`) survive.
+        let names: Vec<&str> = payload["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["Read", "Bash"]);
+        // tool_choice pointed at the tool we removed, so it falls back to auto.
+        assert_eq!(payload["tool_choice"], json!({ "type": "auto" }));
+    }
+
+    #[test]
+    fn drops_tools_key_entirely_when_only_server_tools_were_declared() {
+        let mut payload = json!({
+            "tools": [{ "type": "web_search_20250305", "name": "web_search" }],
+            "tool_choice": { "type": "auto" }
+        });
+        assert_eq!(strip_anthropic_server_tools(&mut payload), 1);
+        // An empty `tools` (and a tool_choice with nothing to choose) is worse
+        // than no tools at all.
+        assert!(payload.get("tools").is_none());
+        assert!(payload.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn strips_server_tool_blocks_from_the_transcript() {
+        // A session that used web search on real Claude and then fell back.
+        let mut payload = json!({
+            "messages": [
+                { "role": "user", "content": [{ "type": "text", "text": "search it" }] },
+                { "role": "assistant", "content": [
+                    { "type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search", "input": {} },
+                    { "type": "web_search_tool_result", "tool_use_id": "srvtoolu_1", "content": [] },
+                    { "type": "text", "text": "found it" }
+                ]},
+                { "role": "assistant", "content": [
+                    { "type": "server_tool_use", "id": "srvtoolu_2", "name": "web_search", "input": {} }
+                ]}
+            ]
+        });
+        assert_eq!(strip_anthropic_server_tools(&mut payload), 3);
+
+        assert_eq!(payload["messages"][1]["content"].as_array().unwrap().len(), 1);
+        assert_eq!(payload["messages"][1]["content"][0]["text"], "found it");
+        // A turn made entirely of server-tool blocks keeps a placeholder rather
+        // than becoming an empty (invalid) content array or vanishing and
+        // breaking role alternation.
+        assert_eq!(payload["messages"].as_array().unwrap().len(), 3);
+        assert_eq!(payload["messages"][2]["content"][0]["type"], "text");
+    }
+
+    #[test]
+    fn leaves_client_tools_and_client_tool_results_alone() {
+        // Client-side MCP tools arrive as plain custom tools, and their results
+        // are the bare `tool_result` block — the whole substitute-for-web-search
+        // story depends on these surviving.
+        let mut payload = json!({
+            "tools": [{ "name": "mcp__MiniMax__web_search", "input_schema": { "type": "object" } }],
+            "messages": [
+                { "role": "assistant", "content": [
+                    { "type": "tool_use", "id": "toolu_1", "name": "mcp__MiniMax__web_search", "input": {} }
+                ]},
+                { "role": "user", "content": [
+                    { "type": "tool_result", "tool_use_id": "toolu_1", "content": "ok" }
+                ]}
+            ]
+        });
+        assert_eq!(strip_anthropic_server_tools(&mut payload), 0);
+        assert_eq!(payload["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(payload["messages"][0]["content"][0]["type"], "tool_use");
+        assert_eq!(payload["messages"][1]["content"][0]["type"], "tool_result");
+    }
+
+    #[test]
+    fn only_third_party_anthropic_upstreams_get_stripped() {
+        for p in ["glm", "kimi", "trae", "minimax", "deepseek"] {
+            assert!(is_third_party_anthropic(p), "{} should be stripped", p);
+        }
+        // Real Anthropic executes these tools, and Codex's Responses-format
+        // function tools would be destroyed by the same rule.
+        for p in ["claude", "codex", "cursor", "ollama"] {
+            assert!(!is_third_party_anthropic(p), "{} must not be stripped", p);
         }
     }
 }
