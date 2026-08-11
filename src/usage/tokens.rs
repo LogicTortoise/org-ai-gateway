@@ -45,18 +45,20 @@ fn sse_json_events(body: &str) -> Vec<Value> {
 
 /// Parse token usage for a provider from a fully-buffered response body.
 ///
-/// `trae` / `minimax` / `deepseek` share the CLAUDE parsers, not GLM/Kimi's
-/// dual-shape ones: each is wired to an Anthropic-compatible endpoint only, so
-/// their bodies always carry Anthropic-shaped `usage` (including
-/// `cache_read_input_tokens` / `cache_creation_input_tokens`) and there is no
-/// OpenAI shape to fall back to.
+/// `trae` shares the CLAUDE parser: its sidecar exposes an Anthropic-compatible
+/// surface only and never sees an OpenAI shape. `claude` is first-party
+/// Anthropic. `minimax` / `deepseek` ride BOTH an Anthropic-compatible
+/// endpoint AND an OpenAI-compatible endpoint (Codex slot uses the OpenAI one),
+/// so they go through the GLM/Kimi dual-shape parser, which tries Anthropic
+/// first and falls back to OpenAI when no anthropic-style counts appear.
 pub(crate) fn parse_usage(provider: &str, body: &str) -> TokenUsage {
-    let anthropic_only = matches!(provider, "claude" | "trae" | "minimax" | "deepseek");
+    let anthropic_only = matches!(provider, "claude" | "trae");
+    let dual_shape = matches!(provider, "glm" | "kimi" | "minimax" | "deepseek");
     let events = sse_json_events(body);
     if !events.is_empty() {
         return if anthropic_only {
             parse_claude_events(&events)
-        } else if provider == "glm" || provider == "kimi" {
+        } else if dual_shape {
             parse_glm_events(&events)
         } else {
             parse_codex_events(&events)
@@ -65,7 +67,7 @@ pub(crate) fn parse_usage(provider: &str, body: &str) -> TokenUsage {
     if let Ok(v) = serde_json::from_str::<Value>(body) {
         return if anthropic_only {
             parse_claude_json(&v)
-        } else if provider == "glm" || provider == "kimi" {
+        } else if dual_shape {
             parse_glm_json(&v)
         } else {
             parse_codex_json(&v)

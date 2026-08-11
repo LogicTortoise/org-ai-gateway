@@ -123,11 +123,12 @@ Trae 不是直连的云端 API：Trae IDE 用的是私有的 `api/agent/v3` agen
 
 ### MiniMax（开放平台，API Key）
 
-直连 MiniMax 官方的 **Anthropic 兼容端点**（`/anthropic/v1/messages`），不需要 sidecar，只要一把 API Key。网关同时发 `Authorization: Bearer` 和 `x-api-key`，哪种鉴权风格都能接住。
+直连 MiniMax 官方的 **Anthropic 兼容端点**（`/anthropic/v1/messages`）和 **OpenAI 兼容端点**（`/v1/text/chatcompletion_v2`），不需要 sidecar，只要一把 API Key。Anthropic 路径同时发 `Authorization: Bearer` 和 `x-api-key`，两种鉴权风格都能接住。
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `MINIMAX_BASE_URL` | `https://api.minimaxi.com/anthropic` | Anthropic 兼容端点前缀；账号自带的 `base_url` 优先级更高 |
+| `MINIMAX_BASE_URL` | `https://api.minimaxi.com/v1` | **OpenAI 兼容端点**前缀（Codex 路径用）；账号自带的 `base_url` 优先级更高。 |
+| `MINIMAX_ANTHROPIC_BASE_URL` | `https://api.minimaxi.com/anthropic` | **Anthropic 兼容端点**前缀（Claude 路径用）；账号自带的 `base_url_alt` 优先级更高。 |
 | `MINIMAX_DEFAULT_MODEL` | `MiniMax-M3` | **默认档**（裸 `minimax` slug；独立项，不是 Claude tier） |
 | `MINIMAX_OPUS_MODEL` | `MiniMax-M3` | **opus 档**（`claude-opus-*`） |
 | `MINIMAX_SONNET_MODEL` | `MiniMax-M3` | **sonnet + haiku 档**（`claude-sonnet-*`、`claude-haiku-*`） |
@@ -137,31 +138,39 @@ Trae 不是直连的云端 API：Trae IDE 用的是私有的 `api/agent/v3` agen
 | `MINIMAX_PRIMARY_LIMIT_TOKENS` | 不限 | **5h 窗口 token 上限**（网关本地聚合用；不设 = 不参与撞墙预判，仅作 burn rate 观测） |
 | `MINIMAX_WEEKLY_LIMIT_TOKENS` | 不限 | **周窗口 token 上限**（同上） |
 
-**只走 Claude slot。** 网关只把它接到 Anthropic 形状的 `/v1/messages` 上——那条路是带 tool_use 的原样透传；接到 Codex 链要走的 OpenAI 适配层只能转纯文本，工具调用会丢，所以 chains 校验直接拒绝 MiniMax 进 Codex slot。
+**双协议都接：**
+- **Claude 路径**（`/v1/messages`）：原样透传 Anthropic 形状 payload，tool_use 走原生通道完整保留。
+- **Codex 路径**（`/v1/responses`）：通过 Responses↔Chat Completions 适配层转到 `/v1/text/chatcompletion_v2`（**注意不是标准的 `/v1/chat/completions`**，MiniMax 的 OpenAI 端用的是 v2 路径），`function_call`/`function_call_output` 块双向翻译、tool 调用完整保留。
 
 **模型名大小写会自动修正**：MiniMax 的官方 id 是混合大小写（`MiniMax-M3`），客户端传小写 `minimax-m3` 会被 400；网关按内置目录把已知 id 的大小写还原回去。裸 `minimax` 走默认档，从 Claude 链降级过来的 `claude-*` 名字按 3 档改写到对应 `MINIMAX_*_MODEL`。
 
+**老账号迁移提示**：早期版本 `MINIMAX_BASE_URL` 默认指向 Anthropic 端（`https://api.minimaxi.com/anthropic`）。新版本该 env 默认改回 OpenAI 端。如果你的账号还在用老的 Anthropic URL，请在 WebUI 把 `base_url` 改成 `https://api.minimaxi.com/anthropic`，**或者**导出 `MINIMAX_ANTHROPIC_BASE_URL=https://api.minimaxi.com/anthropic`（新 env 显式覆盖 Anthropic 端点），把 `MINIMAX_BASE_URL` 留默认。
+
 ### DeepSeek（开放平台，API Key）
 
-同样是直连官方 **Anthropic 兼容端点**（`/anthropic/v1/messages`），一把 API Key 即可。
+直连 DeepSeek 官方的 **Anthropic 兼容端点**（`/anthropic/v1/messages`）和 **OpenAI 兼容端点**（`/v1/chat/completions`），一把 API Key 即可。
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `DEEPSEEK_BASE_URL` | `https://api.deepseek.com/anthropic` | Anthropic 兼容端点前缀；账号自带的 `base_url` 优先级更高 |
-| `DEEPSEEK_DEFAULT_MODEL` | `deepseek-v4-pro` | **默认档**（裸 `deepseek` slug + 未匹配到任何 Claude 档的外来名，独立项，不是 Claude tier） |
-| `DEEPSEEK_OPUS_MODEL` | `deepseek-v4-pro` | **opus 档**（`claude-opus-*`） |
-| `DEEPSEEK_SONNET_MODEL` | `deepseek-v4-pro` | **sonnet + haiku 档**（`claude-sonnet-*` 和 `claude-haiku-*` 共享一个上游目标） |
-| `DEEPSEEK_FABLE_MODEL` | `deepseek-v4-flash` | **fable 档**（Claude Code 最便宜的 tier） |
-| `DEEPSEEK_MODELS` | 内置目录 | 逗号分隔，覆盖 model 目录 |
+| `DEEPSEEK_BASE_URL` | `https://api.deepseek.com/v1` | **OpenAI 兼容端点**前缀（Codex 路径用）；账号自带的 `base_url` 优先级更高。 |
+| `DEEPSEEK_ANTHROPIC_BASE_URL` | `https://api.deepseek.com/anthropic` | **Anthropic 兼容端点**前缀（Claude 路径用）；账号自带的 `base_url_alt` 优先级更高。 |
+| `DEEPSEEK_OPENAI_MODEL` | `deepseek-chat` | Codex / OpenAI 路径统一发送的上游模型 id。DeepSeek 两面发布 **不同**的 model id（Anthropic 面是 `deepseek-v4-pro`，OpenAI 面是 `deepseek-chat`/`deepseek-reasoner`），所以 OpenAI 路径把全部流量路由到这一个可配置 id，不做 tier 改写。要走 reasoner 就设成 `deepseek-reasoner`。 |
+| `DEEPSEEK_DEFAULT_MODEL` | `deepseek-v4-pro` | Anthropic 路径的 **默认档**（裸 `deepseek` slug；独立项，不是 Claude tier） |
+| `DEEPSEEK_OPUS_MODEL` | `deepseek-v4-pro` | Anthropic 路径的 **opus 档**（`claude-opus-*`） |
+| `DEEPSEEK_SONNET_MODEL` | `deepseek-v4-pro` | Anthropic 路径的 **sonnet + haiku 档**（`claude-sonnet-*` 和 `claude-haiku-*` 共享一个上游目标） |
+| `DEEPSEEK_FABLE_MODEL` | `deepseek-v4-flash` | Anthropic 路径的 **fable 档**（Claude Code 最便宜的 tier） |
+| `DEEPSEEK_MODELS` | 内置目录 | 逗号分隔，覆盖 model 目录（Anthropic 路径的 id 目录） |
 | `DEEPSEEK_TIMEOUT_SECS` | `600` | 超时（秒） |
 | `DEEPSEEK_PRIMARY_LIMIT_TOKENS` | 不限 | **5h 窗口 token 上限**（网关本地聚合用；不设 = 不参与撞墙预判，仅作 burn rate 观测） |
 | `DEEPSEEK_WEEKLY_LIMIT_TOKENS` | 不限 | **周窗口 token 上限**（同上） |
 
-**只走 Claude slot**，理由同 MiniMax。
+**双协议都接：**
+- **Claude 路径**（`/v1/messages`）：原样透传 Anthropic 形状 payload，tool_use 走原生通道完整保留。
+- **Codex 路径**（`/v1/responses`）：通过 Responses↔Chat Completions 适配层转到 `/v1/chat/completions`，`function_call`/`function_call_output` 块双向翻译、tool 调用完整保留。
 
-**按 Claude Code 的 3 档 tier 改写**：`claude-opus-*` → `DEEPSEEK_OPUS_MODEL`；`claude-sonnet-*` 和 `claude-haiku-*`（`claude-haiku-4-5-*` / `claude-3-5-haiku-*` 两种写法都认）→ `DEEPSEEK_SONNET_MODEL`（**haiku 合并到 sonnet** —— 两个 tier 共享一个上游目标，因为大多数第三方厂商没有独立的 sonnet 变体）；`claude-fable-*` → `DEEPSEEK_FABLE_MODEL`；裸 `deepseek` slug 或其它未知名 → `DEEPSEEK_DEFAULT_MODEL`（独立项，不是 Claude tier）。和 DeepSeek 官方给的 Claude Code 迁移配方一致，免得后台小任务按 pro 档计费。想要 1M 上下文就把 `DEEPSEEK_OPUS_MODEL` / `DEEPSEEK_SONNET_MODEL` 设成 `deepseek-v4-pro[1m]`。
+**Anthropic 路径按 Claude Code 的 3 档 tier 改写**：`claude-opus-*` → `DEEPSEEK_OPUS_MODEL`；`claude-sonnet-*` 和 `claude-haiku-*`（`claude-haiku-4-5-*` / `claude-3-5-haiku-*` 两种写法都认）→ `DEEPSEEK_SONNET_MODEL`（**haiku 合并到 sonnet** —— 两个 tier 共享一个上游目标，因为大多数第三方厂商没有独立的 sonnet 变体）；`claude-fable-*` → `DEEPSEEK_FABLE_MODEL`；裸 `deepseek` slug 或其它未知名 → `DEEPSEEK_DEFAULT_MODEL`（独立项，不是 Claude tier）。想要 1M 上下文就把 `DEEPSEEK_OPUS_MODEL` / `DEEPSEEK_SONNET_MODEL` 设成 `deepseek-v4-pro[1m]`。
 
-> `DEEPSEEK_MODELS` 的目录是静态的，这是刻意的：DeepSeek 的 `GET /models` 返回的是它 **OpenAI 面** 的 id（`deepseek-chat` / `deepseek-reasoner`），不是这条 Anthropic 面文档里的 id，拉活列表只会让人选到随后被静默改写的模型名。
+> `DEEPSEEK_MODELS` 的目录是 Anthropic 路径的 id 目录，是刻意的：DeepSeek 的 `GET /models` 返回的是它 **OpenAI 面** 的 id（`deepseek-chat` / `deepseek-reasoner`），不是 Anthropic 面文档里的 id，拉活列表只会让人选到随后被静默改写的模型名。
 
 ### Ollama（本地）
 | 变量 | 默认 | 说明 |
@@ -201,7 +210,7 @@ Trae 不是直连的云端 API：Trae IDE 用的是私有的 `api/agent/v3` agen
 - `mode`：
   - `failover` —— 永远从第一个 provider 开始，只有耗尽/失败才降到下一个（**降级**语义）。
   - `round_robin` —— 每个请求轮换**起始 provider**，分摊负载，再按序降级。
-- `providers`：该 slot 依次尝试的 provider 列表。Claude slot 合法值：`claude`/`glm`/`kimi`/`minimax`/`deepseek`/`trae`/`ollama`/`cursor`；Codex slot：`codex`/`glm`/`kimi`/`ollama`/`cursor`（`trae`/`minimax`/`deepseek` 只接了 Anthropic 形状的端点，不能进 Codex slot）。
+- `providers`：该 slot 依次尝试的 provider 列表。Claude slot 合法值：`claude`/`glm`/`kimi`/`minimax`/`deepseek`/`trae`/`ollama`/`cursor`；Codex slot：`codex`/`glm`/`kimi`/`minimax`/`deepseek`/`ollama`/`cursor`（`trae` 只接了 Anthropic 形状的端点，不能进 Codex slot）。
 - **注意**：链 `mode` 只管 **provider 之间**的轮换/降级；**同一 provider 的多个账号之间**的 round-robin 由 pool 选择器单独完成，与链 mode 无关。
 
 例：想让 Kimi 当 Claude 的**降级账号**（claude 全耗尽才用 kimi），配：
@@ -212,7 +221,7 @@ Trae 不是直连的云端 API：Trae IDE 用的是私有的 `api/agent/v3` agen
 
 （用 `round_robin` 会让 claude 健康时也分流到 kimi，不是降级。）
 
-Trae / MiniMax / DeepSeek 同理，且**只能**用 `failover`：
+Trae / MiniMax / DeepSeek 在 **Claude 链**上同理，且只能用 `failover`：
 
 ```json
 "claude": { "mode": "failover", "providers": ["claude", "minimax", "deepseek", "trae"] }

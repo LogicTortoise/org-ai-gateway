@@ -169,12 +169,11 @@ async fn serve_with_chain(
                 }
             }
             "minimax" | "deepseek" => {
-                // Claude-only providers: only their Anthropic-compatible surface
-                // is wired (a buffered passthrough where tool calls survive), so
-                // there is no adapter path. The chain validator already restricts
-                // both to the Claude slot, so the else branch is
-                // belt-and-suspenders — skip to the next provider rather than
-                // mangling the request into a format they can't serve.
+                // Dual-protocol providers: Claude-format traffic goes to the
+                // Anthropic-compatible surface (raw buffered passthrough — tool
+                // calls survive), Codex/OpenAI-format traffic goes to the
+                // OpenAI-compatible surface via the Responses↔Chat adapter
+                // (also tool-call preserving). The split mirrors GLM / Kimi.
                 if matches!(client_format, CursorFormat::Claude) {
                     serve_native_provider(
                         state.clone(),
@@ -187,7 +186,16 @@ async fn serve_with_chain(
                     )
                     .await
                 } else {
-                    ProviderOutcome::NextProvider(None)
+                    serve_minimax_deepseek(
+                        state,
+                        provider,
+                        client_format,
+                        user_id,
+                        payload,
+                        client_wants_stream,
+                        shared_only,
+                    )
+                    .await
                 }
             }
             "ollama" => {
@@ -958,6 +966,271 @@ async fn serve_kimi(
                 .into_response(),
         )),
     }
+}
+
+/// Serve a request via MiniMax's or DeepSeek's OpenAI-compatible endpoint
+/// through a Responses↔Chat Completions adapter. Distinct from the GLM / Kimi
+/// adapter because it preserves `function_call` round-trips: the upstream
+/// Chat Completions response is rewritten back into a Responses
+/// `output` array (one `message` + N `function_call` blocks), so Codex clients
+/// see real tool calls — not just text. Mirrors `serve_glm` / `serve_kimi`'s
+/// account-swap retry + metered per-user quota gate; differs in (a) bypassing
+/// the shared text-only `extract_request` (we use provider-local converters
+/// that understand `tools` / `function_call` blocks), and (b) model rewriting
+/// at THIS layer instead of inside `send_*_openai` — matches the GLM / Kimi
+/// pattern (each provider's `canonical_model` knows its own tier rewrite).
+///
+/// `provider` must be `"minimax"` or `"deepseek"`. The two share this function
+/// because the loop / rendering / quota / retry shape is identical; the
+/// provider-specific bits are dispatched into the right module below.
+async fn serve_minimax_deepseek(
+    state: &AppState,
+    provider: &str,
+    format: CursorFormat,
+    user_id: &str,
+    payload: &Value,
+    client_wants_stream: bool,
+    shared_only: bool,
+) -> ProviderOutcome {
+    debug_assert!(matches!(provider, "minimax" | "deepseek"));
+    // Only the Codex / Responses path is wired through the OpenAI surface.
+    // Chat Completions format never reaches here (the `/v1/chat/completions`
+    // entrypoint rejects non-cursor / non-ollama models with 400); Claude
+    // format is handled by `serve_native_provider`. Belt-and-suspenders for
+    // the same reason `trae` skips: don't try to render Responses-shaped
+    // output through a Chat Completions client, etc.
+    if !matches!(format, CursorFormat::Responses) {
+        return ProviderOutcome::NextProvider(None);
+    }
+
+    let owned_only = match crate::quota::enforce_user_quota(state, provider, user_id, !shared_only).await {
+        Ok(v) => v,
+        Err(resp) => return ProviderOutcome::NextProvider(Some(resp)),
+    };
+
+    let raw_model = payload.get("model").and_then(|v| v.as_str()).unwrap_or(provider);
+    // Model rewriting per provider: minimax fixes case + maps claude tiers,
+    // deepseek maps Anthropic tier names. The OpenAI path sends this id
+    // verbatim to the upstream — the converters don't touch `model`.
+    let upstream_model = match provider {
+        "minimax" => minimax::minimax_canonical_model(raw_model),
+        "deepseek" => deepseek_openai_model_for(raw_model),
+        _ => raw_model.to_string(),
+    };
+
+    let max_attempts = provider_attempt_budget(state, provider).await;
+    let mut excluded: HashSet<String> = HashSet::new();
+    let mut selected_any = false;
+    let mut last_error: Option<(StatusCode, Value)> = None;
+    let request_json_chars = payload.to_string().chars().count();
+
+    for _ in 0..max_attempts {
+        let now = Utc::now();
+        let selected = {
+            let accounts = state.accounts.read().await;
+            let rate_limits = state.rate_limits.read().await;
+            let owner_usage = state.owner_usage.read().await;
+            let mut warm = eligible_accounts(&accounts, provider, user_id, &excluded, now, true);
+            if owned_only {
+                warm.retain(|a| a.owner_user_id == user_id);
+            }
+            if shared_only {
+                warm.retain(|a| a.share_enabled);
+            }
+            // Only accounts that expose the OpenAI-compatible endpoint can
+            // serve this adapter path — same filter the GLM / Kimi adapter
+            // uses for the same reason.
+            match provider {
+                "minimax" => warm.retain(minimax::supports_openai),
+                "deepseek" => warm.retain(deepseek::supports_openai),
+                _ => {}
+            }
+            select_account_for_request(&warm, user_id, provider, &rate_limits, &owner_usage)
+        };
+        let Some(account) = selected else { break };
+        selected_any = true;
+        excluded.insert(account.id.clone());
+        note_account_pick(state, &account.id).await;
+
+        // Dispatch into the provider's own sender + error parser. Each one
+        // accepts the ORIGINAL payload (no `extract_request` rewriting) and
+        // returns parsed text + tool_calls + real usage.
+        let send_outcome = match provider {
+            "minimax" => minimax::send_minimax_openai(&account, &upstream_model, payload)
+                .await
+                .map(|r| (
+                    r.status,
+                    r.text,
+                    r.error,
+                    r.usage,
+                    r.tool_calls.into_iter().map(minimax_tool_to_common).collect::<Vec<_>>(),
+                )),
+            "deepseek" => deepseek::send_deepseek_openai(&account, &upstream_model, payload)
+                .await
+                .map(|r| (
+                    r.status,
+                    r.text,
+                    r.error,
+                    r.usage,
+                    r.tool_calls.into_iter().map(deepseek_tool_to_common).collect::<Vec<_>>(),
+                )),
+            _ => unreachable!("debug_assert above"),
+        };
+        let (status, text, error, usage, tool_calls): (
+            reqwest::StatusCode,
+            String,
+            Option<String>,
+            TokenUsage,
+            Vec<CommonToolCall>,
+        ) = match send_outcome {
+            Ok(v) => v,
+            Err(err) => {
+                apply_account_failure(state, &account.id, ErrorClass::Transient, None, None, false).await;
+                last_error = Some((StatusCode::BAD_GATEWAY, json!({ "error": err, "provider": provider })));
+                continue;
+            }
+        };
+
+        if !status.is_success() || (text.is_empty() && error.is_some()) {
+            let detail = error.unwrap_or_else(|| format!("{} upstream returned {}", provider, status));
+            let class = ErrorClass::from_status(status.as_u16());
+            apply_account_failure(state, &account.id, class, None, None, false).await;
+            info!(
+                "{}_error_{} on {} ({})",
+                provider,
+                status.as_u16(),
+                account.account_label,
+                if class.is_retryable() { "retrying on next account" } else { "final" },
+            );
+            let resp_status = if status.is_success() { StatusCode::BAD_GATEWAY } else { status };
+            last_error = Some((resp_status, json!({ "error": detail, "provider": provider })));
+            if class.is_retryable() {
+                continue;
+            }
+            break;
+        }
+
+        // Success: clear backoff, audit with REAL token usage, render the
+        // reply back in the Codex Responses shape so tool calls survive.
+        reset_backoff(state, &account.id).await;
+        // Audit the model that ANSWERED (the upstream echoed it back in its
+        // own response body in some cases) — fall back to the rewritten
+        // upstream model otherwise.
+        let effective_model = raw_model.to_string();
+        let input_tokens = usage.input_tokens;
+        let cached_input_tokens = usage.cached_input_tokens;
+        let output_tokens = usage.output_tokens;
+        let reasoning_tokens = usage.reasoning_tokens;
+        write_proxy_audit(
+            state, user_id, &account, provider, &effective_model,
+            request_json_chars, text.len(), "success", usage,
+        )
+        .await;
+
+        let request_id = format!("resp_{}", uuid::Uuid::new_v4());
+        let body = json!({
+            "id": request_id,
+            "object": "response",
+            "created_at": Utc::now().timestamp(),
+            "model": effective_model,
+            "status": "completed",
+            "output": build_common_output_items(&text, &tool_calls),
+            "usage": {
+                "input_tokens": input_tokens,
+                "input_tokens_details": { "cached_tokens": cached_input_tokens },
+                "output_tokens": output_tokens,
+                "output_tokens_details": { "reasoning_tokens": reasoning_tokens },
+                "total_tokens": input_tokens + output_tokens,
+            },
+        });
+
+        if client_wants_stream {
+            // Wrap the buffered JSON as a single terminal SSE event so a
+            // streaming Codex client doesn't choke on the content-type.
+            // Per-delta tool-call SSE is a follow-up; the buffered shape
+            // already carries the full function_call args.
+            let sse = format!(
+                "event: response.completed\ndata: {}\n\n",
+                serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string())
+            );
+            let mut response = Response::new(axum::body::Bytes::from(sse).into());
+            *response.status_mut() = StatusCode::OK;
+            response.headers_mut().insert(
+                CONTENT_TYPE,
+                HeaderValue::from_static("text/event-stream; charset=utf-8"),
+            );
+            return ProviderOutcome::Served(response);
+        }
+        return ProviderOutcome::Served((StatusCode::OK, Json(body)).into_response());
+    }
+
+    match last_error {
+        Some((status, body)) => ProviderOutcome::NextProvider(Some((status, Json(body)).into_response())),
+        None if !selected_any => ProviderOutcome::NextProvider(None),
+        None => ProviderOutcome::NextProvider(Some(
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": format!("all {} accounts exhausted", provider), "provider": provider })),
+            )
+                .into_response(),
+        )),
+    }
+}
+
+/// Resolve the upstream model id for the DeepSeek OpenAI path. The two
+/// surfaces publish different ids (`deepseek-v4-pro` ↛ `deepseek-chat`), so
+/// the OpenAI path routes everything to a single configurable id; the input
+/// name is intentionally not consulted.
+fn deepseek_openai_model_for(_raw: &str) -> String {
+    deepseek::deepseek_openai_canonical_model("deepseek")
+}
+
+/// Provider-agnostic tool-call record produced by the adapter, so the
+/// rendering code below doesn't care which provider produced it.
+struct CommonToolCall {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+fn minimax_tool_to_common(t: minimax::MinimaxToolCall) -> CommonToolCall {
+    CommonToolCall { id: t.id, name: t.name, arguments: t.arguments }
+}
+
+fn deepseek_tool_to_common(t: deepseek::DeepseekToolCall) -> CommonToolCall {
+    CommonToolCall { id: t.id, name: t.name, arguments: t.arguments }
+}
+
+/// Build the `output` array of a Responses-shaped response: one assistant
+/// `message` block carrying any text, then one `function_call` block per
+/// parsed tool call. Empty input gets a synthesized placeholder so the array
+/// is never empty.
+fn build_common_output_items(text: &str, tool_calls: &[CommonToolCall]) -> Vec<Value> {
+    let mut items: Vec<Value> = Vec::new();
+    if !text.is_empty() {
+        items.push(json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{ "type": "output_text", "text": text }]
+        }));
+    }
+    for tc in tool_calls {
+        items.push(json!({
+            "type": "function_call",
+            "id": format!("fc_{}", tc.id),
+            "call_id": tc.id,
+            "name": tc.name,
+            "arguments": tc.arguments,
+        }));
+    }
+    if items.is_empty() {
+        items.push(json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{ "type": "output_text", "text": "" }]
+        }));
+    }
+    items
 }
 
 /// Backoff schedule for retrying a `Transient` failure on the SAME account

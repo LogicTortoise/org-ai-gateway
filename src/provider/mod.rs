@@ -50,17 +50,25 @@ pub(crate) enum Provider {
     /// logins and their quotas live inside the sidecar's admin panel. Exists as a
     /// Claude Code 额度降级 fallback. See `trae.rs` for why it's a sidecar.
     Trae,
-    /// MiniMax (MiniMax-M series). An API-key endpoint provider (no OAuth/refresh)
-    /// serving the **Claude slot only**: it is wired to MiniMax's
-    /// Anthropic-compatible `/anthropic/v1/messages` as a buffered passthrough so
-    /// tool calls survive. Their OpenAI-ish endpoint is deliberately NOT wired —
-    /// it would only reach the text-only adapter. An "account" is effectively just
-    /// an api key (the base URL defaults to MiniMax's public endpoint).
+    /// MiniMax (MiniMax-M series). An API-key endpoint provider (no
+    /// OAuth/refresh) wired to BOTH client protocols: Claude-format traffic
+    /// (`/v1/messages`) routes to MiniMax's Anthropic-compatible endpoint as a
+    /// buffered passthrough (tool calls survive); Codex / OpenAI-format
+    /// traffic (`/v1/responses`) routes to MiniMax's OpenAI-compatible
+    /// `/v1/text/chatcompletion_v2` via a Responses↔Chat adapter that also
+    /// preserves `function_call` round-trips. An "account" is effectively just
+    /// an api key (each surface has its own configurable base URL).
     Minimax,
-    /// DeepSeek. Structurally identical to MiniMax — an API-key endpoint provider
-    /// (no OAuth/refresh) serving the **Claude slot only** via DeepSeek's
-    /// Anthropic-compatible `/anthropic/v1/messages`, the same surface their docs
-    /// point Claude Code at. An "account" is effectively just an api key.
+    /// DeepSeek. Structurally identical to MiniMax — an API-key endpoint
+    /// provider (no OAuth/refresh) wired to BOTH client protocols: Claude-
+    /// format traffic routes to DeepSeek's Anthropic-compatible
+    /// `/anthropic/v1/messages` (the surface their docs point Claude Code at),
+    /// Codex / OpenAI-format traffic routes to their standard
+    /// `/chat/completions` via a Responses↔Chat adapter. The two surfaces
+    /// publish DIFFERENT model ids (`deepseek-v4-pro` vs `deepseek-chat`), so
+    /// the OpenAI path uses a single configurable id (`DEEPSEEK_OPENAI_MODEL`,
+    /// default `deepseek-chat`) — the Anthropic tier rewrite (`opus` → pro,
+    /// `sonnet`/`haiku` → pro, `fable` → flash) stays on the Anthropic path.
     Deepseek,
 }
 

@@ -27,7 +27,7 @@
 - `src/routes/proxy.rs` —— 请求代理执行器：按 chain 依次尝试 provider，处理降级 / 重试 / 审计。
 - `src/provider/chains.rs` —— 调度链模型（`ChainSlot` / `ChainMode` / `ordered_attempts`）与持久化。
 - `src/pool/mod.rs` —— 账号选择、可见性、共享闸门（share cap / 每日额度 / **owner 保护**）。
-- `src/provider/{claude,codex,cursor,glm,kimi,ollama}.rs` —— 各上游实现。
+- `src/provider/{claude,codex,cursor,glm,kimi,minimax,deepseek,ollama}.rs` —— 各上游实现。
 - `src/quota.rs` —— 按用户 token 预算 / RPM 限流。
 - `src/usage/` —— 用量账本、健康探测、容量预测。
 - `data/` —— 运行时状态（`accounts.ndjson` / `audit.ndjson` / `capacity.ndjson` / `provider_chains.json`），已 gitignore。

@@ -9,8 +9,14 @@
 //! Each slot has a `ChainCfg { mode, providers }`. The executor in
 //! `routes::proxy` walks the providers in order (round-robin rotates the start
 //! offset) and serves the request with the first provider whose pool can handle
-//! it, degrading to the next on exhaustion / transient failure. Both GLM and
-//! ollama can appear in BOTH slots; native `codex`/`claude` only in their own.
+//! it, degrading to the next on exhaustion / transient failure. GLM, Kimi,
+//! MiniMax, and DeepSeek each ride BOTH endpoints and serve both slots —
+//! Claude-format traffic routes to their Anthropic-compatible surface as a raw
+//! buffered passthrough (tool calls survive), while Codex / OpenAI-format
+//! traffic routes to their OpenAI-compatible surface through a Responses↔Chat
+//! adapter (also tool-call preserving for minimax / deepseek; text-only for
+//! GLM / Kimi). `trae` is Claude-only (no OpenAI surface). The native
+//! providers (`codex` / `claude`) only serve their own slot.
 use crate::prelude::*;
 
 /// The inbound-protocol slot a request belongs to.
@@ -37,21 +43,19 @@ impl ChainSlot {
         }
     }
 
-    /// Providers that can legally serve this slot. GLM and ollama serve both
-    /// (via the Anthropic passthrough / OpenAI adapter as appropriate); cursor
-    /// rides the format adapter; the native provider only serves its own slot.
-    /// `trae` is Claude-only: its sidecar exposes an Anthropic-compatible
-    /// `/v1/messages` and nothing OpenAI-shaped, so it has no Codex path.
-    /// `minimax` / `deepseek` are Claude-only by choice: both DO have
-    /// OpenAI-compatible endpoints, but only their Anthropic surface is wired,
-    /// because that path is a buffered passthrough where tool calls survive while
-    /// the OpenAI adapter path is text-only.
+    /// Providers that can legally serve this slot. GLM, Kimi, MiniMax, and
+    /// DeepSeek serve both slots (each has both an Anthropic- and an
+    /// OpenAI-compatible surface); ollama and cursor ride their respective
+    /// adapters; `trae` is Claude-only because its sidecar has no OpenAI-
+    /// shaped endpoint. The native provider only serves its own slot.
     pub(crate) fn allowed_providers(self) -> &'static [&'static str] {
         match self {
-            ChainSlot::Codex => &["codex", "glm", "kimi", "ollama", "cursor"],
-            ChainSlot::Claude => {
-                &["claude", "glm", "kimi", "minimax", "deepseek", "trae", "ollama", "cursor"]
-            }
+            ChainSlot::Codex => &[
+                "codex", "glm", "kimi", "minimax", "deepseek", "ollama", "cursor",
+            ],
+            ChainSlot::Claude => &[
+                "claude", "glm", "kimi", "minimax", "deepseek", "trae", "ollama", "cursor",
+            ],
         }
     }
 }
@@ -248,9 +252,12 @@ mod tests {
     }
 
     #[test]
-    fn minimax_and_deepseek_are_claude_slot_only() {
+    fn minimax_and_deepseek_serve_both_slots() {
         let mut pc = ProviderChains::default();
-        // Legal in the Claude slot: both speak Anthropic /v1/messages.
+        // Legal in BOTH slots: both have an Anthropic-compatible
+        // `/v1/messages` (Claude-format passthrough, tool calls survive) AND
+        // an OpenAI-compatible endpoint (Codex / OpenAI-format via the
+        // Responses↔Chat adapter — tool calls also survive).
         pc.apply_validated(
             ChainSlot::Claude,
             ChainMode::Failover,
@@ -258,13 +265,11 @@ mod tests {
         );
         assert_eq!(pc.claude.providers, vec!["claude", "minimax", "deepseek"]);
 
-        // Only their Anthropic surface is wired, so the Codex slot filters them
-        // out rather than handing them a request they can't serve.
         pc.apply_validated(
             ChainSlot::Codex,
             ChainMode::Failover,
             &["codex".into(), "minimax".into(), "deepseek".into()],
         );
-        assert_eq!(pc.codex.providers, vec!["codex"]);
+        assert_eq!(pc.codex.providers, vec!["codex", "minimax", "deepseek"]);
     }
 }
