@@ -530,6 +530,37 @@ pub(crate) async fn send_minimax_openai(
     })
 }
 
+/// Streaming sibling of `send_minimax_openai`: forces `stream: true` on the
+/// wire and returns the upstream `reqwest::Response` so the caller can read
+/// the SSE chunks and translate them event-by-event. The caller is
+/// responsible for parsing the chunk stream — this just opens the pipe.
+pub(crate) async fn send_minimax_openai_streaming(
+    account: &UpstreamAccount,
+    model: &str,
+    payload: &Value,
+) -> Result<reqwest::Response, String> {
+    let base = minimax_openai_base(account);
+    if base.is_empty() {
+        return Err("minimax account has no OpenAI-compatible base_url".to_string());
+    }
+    let api_key = account.bearer();
+    if api_key.is_empty() {
+        return Err("minimax account has empty api key".to_string());
+    }
+    let url = format!("{}{}", base, MINIMAX_OPENAI_PATH);
+    let mut body = build_minimax_openai_body(model, payload);
+    body["stream"] = json!(true);
+    minimax_http_client()
+        .post(&url)
+        .bearer_auth(api_key)
+        .header("Accept", "text/event-stream")
+        .header(CONTENT_TYPE, "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("minimax streaming request failed ({}): {}", url, e))
+}
+
 /// Extract `tool_calls` from a Chat Completions response's `choices[0].message`.
 /// Each upstream entry carries `id` / `function.name` / `function.arguments`
 /// (the arguments are a JSON string, kept verbatim).

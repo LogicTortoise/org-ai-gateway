@@ -502,6 +502,35 @@ pub(crate) async fn send_deepseek_openai(
     })
 }
 
+/// Streaming sibling of `send_deepseek_openai`: forces `stream: true` and
+/// returns the upstream `reqwest::Response` for caller-driven SSE parsing.
+pub(crate) async fn send_deepseek_openai_streaming(
+    account: &UpstreamAccount,
+    model: &str,
+    payload: &Value,
+) -> Result<reqwest::Response, String> {
+    let base = deepseek_openai_base(account);
+    if base.is_empty() {
+        return Err("deepseek account has no OpenAI-compatible base_url".to_string());
+    }
+    let api_key = account.bearer();
+    if api_key.is_empty() {
+        return Err("deepseek account has empty api key".to_string());
+    }
+    let url = format!("{}/chat/completions", base);
+    let mut body = build_deepseek_openai_body(model, payload);
+    body["stream"] = json!(true);
+    deepseek_http_client()
+        .post(&url)
+        .bearer_auth(api_key)
+        .header("Accept", "text/event-stream")
+        .header(CONTENT_TYPE, "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("deepseek streaming request failed ({}): {}", url, e))
+}
+
 fn parse_deepseek_tool_calls(message: Option<&Value>) -> Vec<DeepseekToolCall> {
     let Some(arr) = message.and_then(|m| m.get("tool_calls")).and_then(|v| v.as_array()) else {
         return Vec::new();

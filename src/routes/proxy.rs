@@ -1127,6 +1127,76 @@ async fn serve_minimax_deepseek(
         )
         .await;
 
+        if client_wants_stream {
+            // Per-delta translation: open the upstream Chat Completions
+            // stream and pipe each chunk through
+            // `translate_openai_sse_to_responses`, which emits real Responses
+            // SSE events (`response.output_text.delta`,
+            // `response.function_call_arguments.delta`, …) so a streaming
+            // Codex client sees incremental token-by-token delivery. Audit is
+            // written by the spawned task once translation completes (or
+            // fails); this path bypasses the aggregated JSON body entirely.
+            let send_stream_outcome = match provider {
+                "minimax" => {
+                    minimax::send_minimax_openai_streaming(&account, &upstream_model, payload).await
+                }
+                "deepseek" => {
+                    deepseek::send_deepseek_openai_streaming(&account, &upstream_model, payload).await
+                }
+                _ => unreachable!("debug_assert above"),
+            };
+            match send_stream_outcome {
+                Ok(upstream_resp) => {
+                    let status = upstream_resp.status();
+                    if !status.is_success() {
+                        // Drain the upstream body so the connection can be
+                        // reused (reqwest keeps it in the pool until consumed).
+                        let body = upstream_resp.text().await.unwrap_or_default();
+                        let detail = parse_openai_error_message(&body)
+                            .unwrap_or_else(|| format!("{} upstream returned {}", provider, status));
+                        let class = ErrorClass::from_status(status.as_u16());
+                        apply_account_failure(state, &account.id, class, None, None, false).await;
+                        info!(
+                            "{}_stream_error_{} on {} ({})",
+                            provider,
+                            status.as_u16(),
+                            account.account_label,
+                            if class.is_retryable() { "retrying on next account" } else { "final" },
+                        );
+                        let resp_status = if status.is_success() { StatusCode::BAD_GATEWAY } else { status };
+                        last_error = Some((resp_status, json!({ "error": detail, "provider": provider })));
+                        if class.is_retryable() {
+                            continue;
+                        }
+                        break;
+                    }
+                    // Upstream accepted the stream — clear backoff (already
+                    // done above), hand the live `reqwest::Response` to the
+                    // translator, and return the streaming body. The
+                    // translator writes its own audit record on completion.
+                    let response = stream_openai_to_responses_sse(
+                        state.clone(),
+                        account.clone(),
+                        user_id.to_string(),
+                        provider.to_string(),
+                        raw_model.to_string(),
+                        upstream_resp,
+                        request_json_chars,
+                    )
+                    .await;
+                    return ProviderOutcome::Served(response);
+                }
+                Err(err) => {
+                    // Transport error opening the stream — same penalty as
+                    // the buffered path's transport error.
+                    apply_account_failure(state, &account.id, ErrorClass::Transient, None, None, false).await;
+                    last_error = Some((StatusCode::BAD_GATEWAY, json!({ "error": err, "provider": provider })));
+                    continue;
+                }
+            }
+        }
+
+        // Non-streaming path: render the aggregated Responses JSON.
         let request_id = format!("resp_{}", uuid::Uuid::new_v4());
         let body = json!({
             "id": request_id,
@@ -1143,24 +1213,6 @@ async fn serve_minimax_deepseek(
                 "total_tokens": input_tokens + output_tokens,
             },
         });
-
-        if client_wants_stream {
-            // Wrap the buffered JSON as a single terminal SSE event so a
-            // streaming Codex client doesn't choke on the content-type.
-            // Per-delta tool-call SSE is a follow-up; the buffered shape
-            // already carries the full function_call args.
-            let sse = format!(
-                "event: response.completed\ndata: {}\n\n",
-                serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string())
-            );
-            let mut response = Response::new(axum::body::Bytes::from(sse).into());
-            *response.status_mut() = StatusCode::OK;
-            response.headers_mut().insert(
-                CONTENT_TYPE,
-                HeaderValue::from_static("text/event-stream; charset=utf-8"),
-            );
-            return ProviderOutcome::Served(response);
-        }
         return ProviderOutcome::Served((StatusCode::OK, Json(body)).into_response());
     }
 
@@ -1185,8 +1237,26 @@ fn deepseek_openai_model_for(_raw: &str) -> String {
     deepseek::deepseek_openai_canonical_model("deepseek")
 }
 
+/// Parse OpenAI Chat Completions / Responses-style error bodies, shared by the
+/// minimax and deepseek streaming paths (both their OpenAI surfaces return the
+/// standard `{"error":{"message":"…","type":"…"}}` shape on non-success).
+/// Accepts either a flat `"error": "msg"` (some non-success SSE prelude bodies)
+/// or the nested Anthropic-flavored shape; returns `None` when neither form is
+/// present so the caller can fall back to a generic status-coded message.
+fn parse_openai_error_message(body: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(body).ok()?;
+    let err = v.get("error")?;
+    if let Some(s) = err.as_str() {
+        return Some(s.to_string());
+    }
+    err.get("message")
+        .and_then(|m| m.as_str())
+        .map(|s| s.to_string())
+}
+
 /// Provider-agnostic tool-call record produced by the adapter, so the
 /// rendering code below doesn't care which provider produced it.
+#[derive(Clone)]
 struct CommonToolCall {
     id: String,
     name: String,
@@ -1231,6 +1301,581 @@ fn build_common_output_items(text: &str, tool_calls: &[CommonToolCall]) -> Vec<V
         }));
     }
     items
+}
+
+/// Build the `usage` block of a Responses-shaped response from a parsed
+/// `TokenUsage`. Matches the shape the non-streaming path emits so the client
+/// sees identical billing telemetry regardless of which transport served it.
+fn build_usage_for_responses(usage: &TokenUsage) -> Value {
+    json!({
+        "input_tokens": usage.input_tokens,
+        "input_tokens_details": { "cached_tokens": usage.cached_input_tokens },
+        "output_tokens": usage.output_tokens,
+        "output_tokens_details": { "reasoning_tokens": usage.reasoning_tokens },
+        "total_tokens": usage.input_tokens + usage.output_tokens,
+    })
+}
+
+/// Take ownership of an open `reqwest::Response` carrying the upstream
+/// Chat Completions SSE stream, return an `axum::body::Body` that pulls
+/// translated Responses SSE events from an mpsc channel, and spawn the
+/// translator task that feeds it. Audit is written by the spawned task
+/// once translation completes (success or failure) so the streaming path
+/// keeps parity with the buffered path's `write_proxy_audit` call. The
+/// response status mirrors the upstream's (already validated to be 2xx by
+/// the caller) so 5xx is impossible here; the channel carries only 200 OK
+/// content.
+async fn stream_openai_to_responses_sse(
+    state: AppState,
+    account: UpstreamAccount,
+    user_id: String,
+    provider: String,
+    raw_model: String,
+    upstream: reqwest::Response,
+    request_json_chars: usize,
+) -> Response {
+    let upstream_status = upstream.status();
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(32);
+
+    // Move everything the spawned task needs (state, account, identity) into
+    // the closure — `upstream` is consumed by the translator and can no
+    // longer be borrowed by `serve_minimax_deepseek`'s loop.
+    let provider_for_task = provider.clone();
+    let raw_model_for_task = raw_model.clone();
+    let user_id_for_task = user_id.clone();
+    let account_for_task = account.clone();
+    tokio::spawn(async move {
+        match translate_openai_sse_to_responses(upstream, &raw_model_for_task, tx).await {
+            Ok((text, tool_calls, usage)) => {
+                write_proxy_audit(
+                    &state,
+                    &user_id_for_task,
+                    &account_for_task,
+                    &provider_for_task,
+                    &raw_model_for_task,
+                    request_json_chars,
+                    text.len(),
+                    "success",
+                    usage,
+                )
+                .await;
+                // Drop tool_calls explicitly to make the no-op intentional
+                // (the streaming audit only needs byte counts + usage — the
+                // translated events already carry every tool-call detail to
+                // the client).
+                let _ = tool_calls;
+            }
+            Err(e) => {
+                error!(
+                    "{} streaming translate failed on {}: {}",
+                    provider_for_task, account_for_task.account_label, e
+                );
+                write_proxy_audit(
+                    &state,
+                    &user_id_for_task,
+                    &account_for_task,
+                    &provider_for_task,
+                    &raw_model_for_task,
+                    request_json_chars,
+                    0,
+                    "stream_translate_error",
+                    TokenUsage::default(),
+                )
+                .await;
+            }
+        }
+    });
+
+    // Bridge the mpsc receiver into a `Stream<Item = Result<Bytes, io::Error>>`
+    // for `Body::from_stream`. `futures_util::stream::unfold` is the
+    // tokio-stream-free equivalent of `ReceiverStream`.
+    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    });
+    let body = axum::body::Body::from_stream(stream);
+    let mut response = Response::new(body);
+    *response.status_mut() = upstream_status;
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("text/event-stream; charset=utf-8"),
+    );
+    response
+}
+
+/// Translate a live Chat Completions SSE stream into Responses SSE events.
+/// Reads upstream chunks incrementally (no full buffering), parses each
+/// `data: {…}` frame, and emits:
+///   - `response.created` once, at the start
+///   - per output item:
+///     - `response.output_item.added`
+///     - text → repeated `response.output_text.delta`, then
+///       `response.output_text.done` + `response.content_part.done`
+///     - tool_call → repeated `response.function_call_arguments.delta`, then
+///       `response.function_call_arguments.done`
+///     - `response.output_item.done`
+///   - `response.completed` + `data: [DONE]` at the end
+///
+/// Tracks current-item state (message ↔ function_call) so an item is closed
+/// (`output_item.done`) when the next delta starts a new one, when
+/// `finish_reason` fires, or when the upstream stream ends. The accumulated
+/// text + final tool_calls + parsed usage are returned so the spawned task
+/// can write the audit record.
+///
+/// Returns Err on upstream read failure (the mpsc will close naturally,
+/// axum will end the body); on client disconnect, every subsequent `tx.send`
+/// fails and the translator returns Err immediately to unblock the task.
+async fn translate_openai_sse_to_responses(
+    upstream: reqwest::Response,
+    raw_model: &str,
+    tx: tokio::sync::mpsc::Sender<Result<axum::body::Bytes, std::io::Error>>,
+) -> Result<(String, Vec<CommonToolCall>, TokenUsage), String> {
+    let response_id = format!("resp_{}", uuid::Uuid::new_v4());
+    send_sse_event(
+        &tx,
+        "response.created",
+        &json!({
+            "type": "response.created",
+            "response": {
+                "id": response_id,
+                "object": "response",
+                "created_at": Utc::now().timestamp(),
+                "status": "in_progress",
+                "model": raw_model,
+                "output": [],
+            }
+        }),
+    )
+    .await?;
+
+    let mut bytes_stream = upstream.bytes_stream();
+    let mut buf = String::new();
+    let mut accumulated_text = String::new();
+    let mut final_tool_calls: Vec<CommonToolCall> = Vec::new();
+    let mut final_usage = TokenUsage::default();
+
+    // Per-output-item state. Resets each time `output_item.done` is emitted.
+    let mut current_output_index: usize = 0;
+    let mut current_item_id: Option<String> = None;
+    let mut current_item_type: Option<String> = None;
+    let mut current_item_started: bool = false;
+    let mut current_text: String = String::new();
+    let mut current_tool_call: Option<CommonToolCall> = None;
+
+    loop {
+        let chunk_result = bytes_stream.next().await;
+        let chunk = match chunk_result {
+            Some(Ok(c)) => c,
+            Some(Err(e)) => return Err(format!("upstream read error: {}", e)),
+            None => break,
+        };
+        buf.push_str(&String::from_utf8_lossy(&chunk));
+
+        while let Some(nl_pos) = buf.find('\n') {
+            let line: String = buf[..nl_pos].to_string();
+            buf = buf[nl_pos + 1..].to_string();
+            let line = line.trim_end_matches('\r').to_string();
+            let trimmed = line.trim_start();
+            let Some(rest) = trimmed.strip_prefix("data:") else { continue };
+            let rest = rest.trim_start();
+
+            if rest == "[DONE]" {
+                // Terminal event. Close whatever item is still open.
+                finalize_output_item(
+                    &tx,
+                    &mut current_item_id,
+                    &mut current_item_type,
+                    &mut current_item_started,
+                    &mut current_text,
+                    &mut current_tool_call,
+                    &mut final_tool_calls,
+                    current_output_index,
+                )
+                .await?;
+
+                let response_obj = json!({
+                    "id": response_id,
+                    "object": "response",
+                    "status": "completed",
+                    "model": raw_model,
+                    "output": build_common_output_items(&accumulated_text, &final_tool_calls),
+                    "usage": build_usage_for_responses(&final_usage),
+                });
+                send_sse_event(
+                    &tx,
+                    "response.completed",
+                    &json!({ "type": "response.completed", "response": response_obj }),
+                )
+                .await?;
+                let _ = tx.send(Ok(axum::body::Bytes::from("data: [DONE]\n\n"))).await;
+                return Ok((accumulated_text, final_tool_calls, final_usage));
+            }
+            if rest.is_empty() {
+                continue;
+            }
+
+            let v: Value = match serde_json::from_str(rest) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            // `usage` is often attached to the last delta (or arrives as a
+            // standalone trailing chunk on OpenAI-compatible APIs). Apply it
+            // progressively so the terminal `response.completed` already has
+            // the right counts.
+            if let Some(usage) = v.get("usage") {
+                if let Some(input) = usage.get("prompt_tokens").and_then(|x| x.as_i64()) {
+                    final_usage.input_tokens = input;
+                }
+                if let Some(output) = usage.get("completion_tokens").and_then(|x| x.as_i64()) {
+                    final_usage.output_tokens = output;
+                }
+                if let Some(cached) = usage
+                    .pointer("/prompt_tokens_details/cached_tokens")
+                    .and_then(|x| x.as_i64())
+                {
+                    final_usage.cached_input_tokens = cached;
+                }
+                if let Some(reasoning) = usage
+                    .pointer("/completion_tokens_details/reasoning_tokens")
+                    .and_then(|x| x.as_i64())
+                {
+                    final_usage.reasoning_tokens = reasoning;
+                }
+            }
+
+            let Some(choices) = v.get("choices").and_then(|c| c.as_array()) else { continue };
+            for choice in choices {
+                let Some(delta) = choice.get("delta") else { continue };
+
+                // ─── text delta ───
+                if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
+                    if !content.is_empty() {
+                        if current_item_type.as_deref() != Some("message") {
+                            finalize_output_item(
+                                &tx,
+                                &mut current_item_id,
+                                &mut current_item_type,
+                                &mut current_item_started,
+                                &mut current_text,
+                                &mut current_tool_call,
+                                &mut final_tool_calls,
+                                current_output_index,
+                            )
+                            .await?;
+                            current_output_index += 1;
+                            current_item_id = Some(format!("msg_{}", uuid::Uuid::new_v4()));
+                            current_item_type = Some("message".to_string());
+                            current_item_started = false;
+                            current_text.clear();
+                        }
+                        if !current_item_started {
+                            send_sse_event(
+                                &tx,
+                                "response.output_item.added",
+                                &json!({
+                                    "type": "response.output_item.added",
+                                    "output_index": current_output_index,
+                                    "item": {
+                                        "id": current_item_id.clone().unwrap(),
+                                        "type": "message",
+                                        "role": "assistant",
+                                        "content": [],
+                                    }
+                                }),
+                            )
+                            .await?;
+                            current_item_started = true;
+                        }
+                        current_text.push_str(content);
+                        accumulated_text.push_str(content);
+                        send_sse_event(
+                            &tx,
+                            "response.output_text.delta",
+                            &json!({
+                                "type": "response.output_text.delta",
+                                "item_id": current_item_id.clone().unwrap(),
+                                "output_index": current_output_index,
+                                "content_index": 0,
+                                "delta": content,
+                            }),
+                        )
+                        .await?;
+                    }
+                }
+
+                // ─── tool_calls delta ───
+                if let Some(tcs) = delta.get("tool_calls").and_then(|t| t.as_array()) {
+                    for tc_delta in tcs {
+                        // New tool call: a non-empty `id` marks a new
+                        // function_call item — close whatever's open first.
+                        if let Some(new_id) =
+                            tc_delta.get("id").and_then(|x| x.as_str())
+                        {
+                            if !new_id.is_empty() {
+                                finalize_output_item(
+                                    &tx,
+                                    &mut current_item_id,
+                                    &mut current_item_type,
+                                    &mut current_item_started,
+                                    &mut current_text,
+                                    &mut current_tool_call,
+                                    &mut final_tool_calls,
+                                    current_output_index,
+                                )
+                                .await?;
+                                current_output_index += 1;
+                                current_item_id = Some(format!("fc_{}", uuid::Uuid::new_v4()));
+                                current_item_type = Some("function_call".to_string());
+                                current_item_started = false;
+                                current_tool_call = Some(CommonToolCall {
+                                    id: new_id.to_string(),
+                                    name: String::new(),
+                                    arguments: String::new(),
+                                });
+                            }
+                        }
+                        if let Some(name) = tc_delta
+                            .pointer("/function/name")
+                            .and_then(|x| x.as_str())
+                        {
+                            if !name.is_empty() {
+                                if let Some(ref mut tc) = current_tool_call {
+                                    tc.name = name.to_string();
+                                }
+                            }
+                        }
+                        if let Some(args) = tc_delta
+                            .pointer("/function/arguments")
+                            .and_then(|x| x.as_str())
+                        {
+                            if !args.is_empty() {
+                                if !current_item_started {
+                                    let tc = current_tool_call.clone().unwrap();
+                                    send_sse_event(
+                                        &tx,
+                                        "response.output_item.added",
+                                        &json!({
+                                            "type": "response.output_item.added",
+                                            "output_index": current_output_index,
+                                            "item": {
+                                                "id": current_item_id.clone().unwrap(),
+                                                "type": "function_call",
+                                                "call_id": tc.id,
+                                                "name": tc.name,
+                                                "arguments": "",
+                                            }
+                                        }),
+                                    )
+                                    .await?;
+                                    current_item_started = true;
+                                }
+                                if let Some(ref mut tc) = current_tool_call {
+                                    tc.arguments.push_str(args);
+                                }
+                                send_sse_event(
+                                    &tx,
+                                    "response.function_call_arguments.delta",
+                                    &json!({
+                                        "type": "response.function_call_arguments.delta",
+                                        "item_id": current_item_id.clone().unwrap(),
+                                        "output_index": current_output_index,
+                                        "delta": args,
+                                    }),
+                                )
+                                .await?;
+                            }
+                        }
+                    }
+                }
+
+                // ─── finish_reason closes the current item ───
+                if let Some(reason) = choice.get("finish_reason").and_then(|x| x.as_str()) {
+                    if !reason.is_empty() && reason != "null" {
+                        finalize_output_item(
+                            &tx,
+                            &mut current_item_id,
+                            &mut current_item_type,
+                            &mut current_item_started,
+                            &mut current_text,
+                            &mut current_tool_call,
+                            &mut final_tool_calls,
+                            current_output_index,
+                        )
+                        .await?;
+                        current_output_index += 1;
+                        current_item_id = None;
+                        current_item_type = None;
+                        current_item_started = false;
+                    }
+                }
+            }
+        }
+    }
+
+    // Stream ended without an explicit `[DONE]` (idle timeout, abrupt close).
+    // Still emit the terminal events so a Codex client doesn't hang on
+    // `response.completed`.
+    finalize_output_item(
+        &tx,
+        &mut current_item_id,
+        &mut current_item_type,
+        &mut current_item_started,
+        &mut current_text,
+        &mut current_tool_call,
+        &mut final_tool_calls,
+        current_output_index,
+    )
+    .await?;
+
+    let response_obj = json!({
+        "id": response_id,
+        "object": "response",
+        "status": "completed",
+        "model": raw_model,
+        "output": build_common_output_items(&accumulated_text, &final_tool_calls),
+        "usage": build_usage_for_responses(&final_usage),
+    });
+    send_sse_event(
+        &tx,
+        "response.completed",
+        &json!({ "type": "response.completed", "response": response_obj }),
+    )
+    .await?;
+    let _ = tx.send(Ok(axum::body::Bytes::from("data: [DONE]\n\n"))).await;
+    Ok((accumulated_text, final_tool_calls, final_usage))
+}
+
+/// Close out the currently-open output item (if any) by emitting its
+/// `*.done` events followed by `response.output_item.done`, then push any
+/// completed `function_call` into `tool_calls` so the audit (via the
+/// streaming return tuple) records it. No-op when no item is currently
+/// open; safe to call repeatedly.
+async fn finalize_output_item(
+    tx: &tokio::sync::mpsc::Sender<Result<axum::body::Bytes, std::io::Error>>,
+    current_item_id: &mut Option<String>,
+    current_item_type: &mut Option<String>,
+    current_item_started: &mut bool,
+    current_text: &mut String,
+    current_tool_call: &mut Option<CommonToolCall>,
+    tool_calls: &mut Vec<CommonToolCall>,
+    output_index: usize,
+) -> Result<(), String> {
+    // Edge case: a function_call arrived (with id) but produced no argument
+    // delta before the next item started. Still record it so the audit
+    // doesn't lose the call.
+    if !*current_item_started {
+        if current_item_type.as_deref() == Some("function_call") {
+            if let Some(tc) = current_tool_call.take() {
+                tool_calls.push(tc);
+            }
+        }
+        return Ok(());
+    }
+    let Some(item_id) = current_item_id.take() else { return Ok(()) };
+    let Some(item_type) = current_item_type.take() else { return Ok(()) };
+
+    match item_type.as_str() {
+        "message" => {
+            let full_text = current_text.clone();
+            send_sse_event(
+                tx,
+                "response.output_text.done",
+                &json!({
+                    "type": "response.output_text.done",
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "content_index": 0,
+                    "text": full_text,
+                }),
+            )
+            .await?;
+            send_sse_event(
+                tx,
+                "response.content_part.done",
+                &json!({
+                    "type": "response.content_part.done",
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "content_index": 0,
+                    "part": { "type": "output_text", "text": full_text },
+                }),
+            )
+            .await?;
+            let item = json!({
+                "type": "message",
+                "id": item_id,
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": full_text }],
+            });
+            send_sse_event(
+                tx,
+                "response.output_item.done",
+                &json!({
+                    "type": "response.output_item.done",
+                    "output_index": output_index,
+                    "item": item,
+                }),
+            )
+            .await?;
+            current_text.clear();
+        }
+        "function_call" => {
+            let tc = current_tool_call.take().unwrap_or(CommonToolCall {
+                id: String::new(),
+                name: String::new(),
+                arguments: String::new(),
+            });
+            let full_args = tc.arguments.clone();
+            send_sse_event(
+                tx,
+                "response.function_call_arguments.done",
+                &json!({
+                    "type": "response.function_call_arguments.done",
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "arguments": full_args,
+                }),
+            )
+            .await?;
+            let item = json!({
+                "type": "function_call",
+                "id": item_id,
+                "call_id": tc.id.clone(),
+                "name": tc.name.clone(),
+                "arguments": full_args,
+            });
+            send_sse_event(
+                tx,
+                "response.output_item.done",
+                &json!({
+                    "type": "response.output_item.done",
+                    "output_index": output_index,
+                    "item": item,
+                }),
+            )
+            .await?;
+            tool_calls.push(tc);
+        }
+        _ => return Ok(()),
+    }
+    *current_item_started = false;
+    Ok(())
+}
+
+/// Serialize one Responses SSE event into the wire format
+/// `event: <name>\ndata: <json>\n\n` and push it through the mpsc. Returns
+/// Err when the client has disconnected (the channel is closed), which the
+/// translator propagates so the spawned task can finalize promptly.
+async fn send_sse_event(
+    tx: &tokio::sync::mpsc::Sender<Result<axum::body::Bytes, std::io::Error>>,
+    event: &str,
+    data: &Value,
+) -> Result<(), String> {
+    let payload = serde_json::to_string(data).map_err(|e| format!("encode event: {}", e))?;
+    let sse = format!("event: {}\ndata: {}\n\n", event, payload);
+    tx.send(Ok(axum::body::Bytes::from(sse)))
+        .await
+        .map_err(|e| format!("client dropped: {}", e))
 }
 
 /// Backoff schedule for retrying a `Transient` failure on the SAME account
@@ -1900,5 +2545,100 @@ async fn write_proxy_audit(
     };
     if let Err(e) = append_audit(state, &audit).await {
         error!("failed writing proxy audit record: {}", e);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_openai_error_message_nested() {
+        let body = r#"{"error":{"message":"insufficient balance","type":"upstream_error"}}"#;
+        assert_eq!(
+            parse_openai_error_message(body).as_deref(),
+            Some("insufficient balance")
+        );
+    }
+
+    #[test]
+    fn parse_openai_error_message_flat_string() {
+        // Some non-success bodies collapse the error to a flat string.
+        let body = r#"{"error":"invalid model id"}"#;
+        assert_eq!(
+            parse_openai_error_message(body).as_deref(),
+            Some("invalid model id")
+        );
+    }
+
+    #[test]
+    fn parse_openai_error_message_returns_none_for_non_json() {
+        assert!(parse_openai_error_message("<html>500</html>").is_none());
+        assert!(parse_openai_error_message("{}").is_none());
+        assert!(parse_openai_error_message("").is_none());
+    }
+
+    #[test]
+    fn build_usage_for_responses_sums_total_tokens() {
+        let usage = TokenUsage {
+            input_tokens: 100,
+            cached_input_tokens: 20,
+            output_tokens: 50,
+            reasoning_tokens: 5,
+            ..Default::default()
+        };
+        let v = build_usage_for_responses(&usage);
+        assert_eq!(v["input_tokens"], 100);
+        assert_eq!(v["input_tokens_details"]["cached_tokens"], 20);
+        assert_eq!(v["output_tokens"], 50);
+        assert_eq!(v["output_tokens_details"]["reasoning_tokens"], 5);
+        assert_eq!(v["total_tokens"], 150);
+    }
+
+    #[test]
+    fn build_common_output_items_text_only() {
+        let items = build_common_output_items("hello world", &[]);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["type"], "message");
+        assert_eq!(items[0]["content"][0]["text"], "hello world");
+    }
+
+    #[test]
+    fn build_common_output_items_tool_calls_only() {
+        let tcs = vec![CommonToolCall {
+            id: "call_abc".to_string(),
+            name: "get_weather".to_string(),
+            arguments: r#"{"city":"SF"}"#.to_string(),
+        }];
+        let items = build_common_output_items("", &tcs);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["type"], "function_call");
+        assert_eq!(items[0]["call_id"], "call_abc");
+        assert_eq!(items[0]["name"], "get_weather");
+        assert_eq!(items[0]["arguments"], r#"{"city":"SF"}"#);
+    }
+
+    #[test]
+    fn build_common_output_items_text_then_tool_call() {
+        let tcs = vec![CommonToolCall {
+            id: "call_x".to_string(),
+            name: "lookup".to_string(),
+            arguments: "{}".to_string(),
+        }];
+        let items = build_common_output_items("here you go", &tcs);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["type"], "message");
+        assert_eq!(items[1]["type"], "function_call");
+    }
+
+    #[test]
+    fn build_common_output_items_empty_synthesizes_placeholder() {
+        // Streaming may finish with neither text nor tool calls (e.g. a pure
+        // refusal). The array must still be non-empty so Codex clients that
+        // assert `output.length > 0` don't choke.
+        let items = build_common_output_items("", &[]);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["type"], "message");
+        assert_eq!(items[0]["content"][0]["text"], "");
     }
 }
