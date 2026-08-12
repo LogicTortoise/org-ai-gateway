@@ -84,10 +84,15 @@ pub(crate) async fn codex_apply(headers: HeaderMap) -> impl IntoResponse {
     }
 
     // Embed the caller's bearer straight into the Codex config so the button
-    // is truly one-click. Precedence: if the user later exports `OAG_BEARER=…`
-    // in their shell, the env var wins (Codex checks `env_key` before
-    // `experimental_bearer_token`). The fallback to `user:<id>` only kicks in
-    // for the most-degenerate local-owner case (no API key in the session).
+    // is truly one-click. We deliberately do NOT set `env_key = "OAG_BEARER"`
+    // alongside it: Codex 0.147+'s `ModelProviderInfo::api_key()` treats
+    // `Some(env_key)` as a hard requirement — if the env var is unset, it
+    // returns `Err(EnvVar)` and aborts the turn before reaching the
+    // `experimental_bearer_token` fallback. So setting `env_key` would make
+    // this button a no-op until the user also runs `export OAG_BEARER=…`,
+    // which defeats the purpose. The embedded token alone is enough; rotating
+    // is done by re-clicking the button or editing `config.toml` directly.
+    // See `client_config.rs::merge_gateway_into_config` for the full rationale.
     let bearer = raw_bearer(&headers).unwrap_or_else(|| format!("user:{}", user_id));
     let base_url = format!("{}/v1", request_base_url(&headers));
     let merged = match merge_gateway_into_config(&existing, &base_url, &bearer) {
@@ -120,7 +125,7 @@ pub(crate) async fn codex_apply(headers: HeaderMap) -> impl IntoResponse {
             backup_config_path: backup_config_path.display().to_string(),
             note: "已把对话请求路由到网关；auth.json 未改动，本地仍是你的真实账号，客户端/终端都生效，无需退出重启。
 
-**鉴权已自动写好：** 当前账号的 bearer 已嵌入 `experimental_bearer_token`，Codex 0.144.x 启动时直接用，**无需 export 环境变量**。如果你想换 token（轮换 / 多人分用），在 shell 里 `export OAG_BEARER=…` 覆盖即可——env 优先级高于嵌入。完整还原请点击页面上「恢复」。".to_string(),
+**鉴权已自动写好：** 当前账号的 bearer 已嵌入 `experimental_bearer_token`，Codex 0.144.x / 0.147.x 启动时直接用，**无需 export 环境变量**。想换 token（轮换 / 多人分用）直接再点一次本按钮即可，或者手动编辑 `~/.codex/config.toml` 的 `[model_providers.org-ai-gateway].experimental_bearer_token`。完整还原请点击页面上「恢复」。".to_string(),
         }),
     )
         .into_response()

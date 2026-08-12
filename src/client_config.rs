@@ -16,26 +16,25 @@ pub(crate) const GATEWAY_PROVIDER_KEY: &str = "org-ai-gateway";
 /// this config rather than hardcoded, since the bind address/port varies by
 /// deployment.
 ///
-/// `env_key = "OAG_BEARER"` is the load-bearing piece: without it, Codex 0.144.x
-/// sees `requires_openai_auth=true` + no env key, falls into
-/// `provider_uses_first_party_auth_path` (ChatGPT OAuth flow), and ignores the
-/// `base_url` rewrite — so requests still go to `https://api.openai.com/v1`
-/// even with `model_provider = "org-ai-gateway"` set. With `env_key` set, the
-/// auth resolver in `bearer_auth_for_provider` reads the bearer token from the
-/// env var first, sends it straight to the gateway, and only falls back to
-/// `auth.json` if the env var is unset. `unset OAG_BEARER` therefore reverts
-/// to the original behavior (minus the base_url rewrite — the UI's "恢复"
-/// button is the proper way to fully revert).
+/// `experimental_bearer_token` is the only auth we set in TOML — we
+/// deliberately do NOT set `env_key`. Codex 0.147+'s `ModelProviderInfo::api_key`
+/// treats `Some(env_key)` as a hard requirement: if the named env var is unset,
+/// it returns `Err(EnvVar)` and aborts the turn before reaching the
+/// `experimental_bearer_token` fallback. So writing `env_key = "OAG_BEARER"`
+/// would mean "user MUST `export OAG_BEARER=…` before Codex starts" — i.e.
+/// the button would be effectively a no-op without a manual export. The
+/// embedded `experimental_bearer_token` is enough by itself: Codex's
+/// `bearer_auth_for_provider` reads `api_key()` (returns `None` when env_key
+/// is unset), then falls through to `experimental_bearer_token`, and uses it
+/// as the bearer for every request.
 ///
-/// `experimental_bearer_token` is set in **parallel** so the button is truly
-/// one-click: the caller's `Authorization: Bearer …` (typically their `oag_…`
-/// API key, or a `user:<id>` self-statement for the local owner) gets embedded
-/// straight into `config.toml`. Codex's `bearer_auth_for_provider` checks
-/// `env_key` first, then `experimental_bearer_token`, then `auth.json` — so if
-/// the user later exports `OAG_BEARER=…` with a different token, the env var
-/// wins and the embedded one is silently ignored. The UI's "恢复" button is
-/// the proper revert path; `unset OAG_BEARER` only re-disables the env_key
-/// override.
+/// Trade-off: rotating the bearer requires either editing this TOML directly
+/// or re-clicking the button (the apply handler regenerates the embedded
+/// token). There is no env-var override path. That's acceptable because the
+/// gateway issues per-user tokens at click time and the UI's "恢复" button is
+/// the proper revert path. If a future Codex version restores the 0.144.x
+/// fallback chain (`api_key() → experimental_bearer_token → …`), we can
+/// re-add `env_key` alongside for env-var overrides.
 pub(crate) fn merge_gateway_into_config(
     existing: &str,
     base_url: &str,
@@ -62,7 +61,6 @@ pub(crate) fn merge_gateway_into_config(
     provider["base_url"] = value(base_url);
     provider["wire_api"] = value("responses");
     provider["requires_openai_auth"] = value(true);
-    provider["env_key"] = value("OAG_BEARER");
     provider["experimental_bearer_token"] = value(bearer_token);
     providers[GATEWAY_PROVIDER_KEY] = Item::Table(provider);
 
