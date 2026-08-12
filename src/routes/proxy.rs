@@ -1385,10 +1385,11 @@ async fn translate_openai_sse_to_responses(
             // error chunk on a 200 response — without this branch the
             // translator falls through silently, emits `response.completed`
             // with empty `output`, and Codex marks the turn as a no-op
-            // (`last_agent_message: null`), so the agent looks frozen. Emit a
-            // Responses-style `error` event so the client retries, and return
-            // Err so the spawned task records the failure in the audit instead
-            // of writing a misleading `success` row.
+            // (`last_agent_message: null`), so the agent looks frozen. Emit
+            // a Codex-recognised `response.failed` terminal event so the client
+            // surfaces the upstream error and retries, and return Err so the
+            // spawned task records the failure in the audit instead of writing
+            // a misleading `success` row.
             if let Some(err) = v.get("error") {
                 let msg = if let Some(s) = err.as_str() {
                     s.to_string()
@@ -1404,12 +1405,28 @@ async fn translate_openai_sse_to_responses(
                     .to_string();
                 let _ = send_sse_event(
                     &tx,
-                    "error",
+                    "response.failed",
                     &json!({
-                        "type": "error",
-                        "code": code,
-                        "message": msg,
-                        "param": null,
+                        "type": "response.failed",
+                        "sequence_number": 0,
+                        "response": {
+                            "id": response_id,
+                            "object": "response",
+                            "created_at": Utc::now().timestamp(),
+                            "status": "failed",
+                            "background": false,
+                            "model": raw_model,
+                            "output": [],
+                            "error": {
+                                "code": code,
+                                "message": msg,
+                                "type": "upstream_error",
+                            },
+                            "usage": null,
+                            "user": null,
+                            "metadata": {},
+                            "incomplete_details": null,
+                        },
                     }),
                 )
                 .await;
@@ -1617,10 +1634,12 @@ async fn translate_openai_sse_to_responses(
     // empty body (e.g. minimax / deepseek capacity issues that didn't even
     // emit an error chunk). Emitting `response.completed` with `output: []`
     // would mark the Codex turn as a no-op (`last_agent_message: null`) and
-    // the user sees a frozen agent. Surface as an upstream error to the
-    // client FIRST (so Codex sees a proper `event: error` frame and not a
-    // raw stream cut), THEN return Err so the spawn task records the audit
-    // row and applies the matching failure class to the account.
+    // the user sees a frozen agent. Surface as a `response.failed` terminal
+    // event FIRST (so Codex deserialises it through `process_responses_event`
+    // into a typed `ApiError::Stream` / `Retryable` instead of a raw stream
+    // cut that just says "stream closed before response.completed"), THEN
+    // return Err so the spawn task records the audit row and applies the
+    // matching failure class to the account.
     if accumulated_text.is_empty()
         && final_tool_calls.is_empty()
         && final_usage.input_tokens == 0
@@ -1628,12 +1647,28 @@ async fn translate_openai_sse_to_responses(
     {
         let _ = send_sse_event(
             &tx,
-            "error",
+            "response.failed",
             &json!({
-                "type": "error",
-                "code": "upstream_empty_stream",
-                "message": "upstream returned an empty stream (no SSE chunks before connection close)",
-                "param": null,
+                "type": "response.failed",
+                "sequence_number": 0,
+                "response": {
+                    "id": response_id,
+                    "object": "response",
+                    "created_at": Utc::now().timestamp(),
+                    "status": "failed",
+                    "background": false,
+                    "model": raw_model,
+                    "output": [],
+                    "error": {
+                        "code": "server_is_overloaded",
+                        "message": "upstream returned an empty stream (no SSE chunks before connection close)",
+                        "type": "upstream_error",
+                    },
+                    "usage": null,
+                    "user": null,
+                    "metadata": {},
+                    "incomplete_details": null,
+                },
             }),
         )
         .await;
@@ -2588,9 +2623,11 @@ mod tests {
         // HTTP 200 with an error SSE chunk then close. Without the error
         // branch the translator would silently emit `response.completed` with
         // empty output, and Codex would mark the turn as a no-op — the user
-        // sees a frozen agent. With the fix, the translator emits a real
-        // Responses error event and returns Err so the audit row records the
-        // upstream signal.
+        // sees a frozen agent. With the fix, the translator emits a Codex
+        // `response.failed` terminal event (the shape Codex 0.144's
+        // `process_responses_event` deserialises into a typed `ApiError`,
+        // NOT the wrong `event: error` shape which Codex 0.144 ignores) and
+        // returns Err so the audit row records the upstream signal.
         let url = spawn_one_shot_sse_server(error_chunk("overloaded_error", "当前服务集群负载较高")).await;
         let client = reqwest::Client::new();
         let upstream = client.get(url).send().await.unwrap();
@@ -2600,23 +2637,25 @@ mod tests {
         assert!(msg.starts_with("upstream_stream_error:"), "got: {}", msg);
         assert!(msg.contains("当前服务集群负载较高"), "got: {}", msg);
 
-        // Drain what the translator emitted; the error event must reach the
-        // client before the channel closes, otherwise Codex sees the same
-        // empty success it used to.
-        let mut got_error_event = false;
+        // Drain what the translator emitted; the response.failed event must
+        // reach the client before the channel closes, otherwise Codex sees the
+        // same empty success it used to.
+        let mut got_failure_event = false;
         while let Ok(Some(item)) = tokio::time::timeout(
             std::time::Duration::from_millis(50),
             rx.recv(),
         ).await {
             let Ok(bytes) = item else { break };
             let text = String::from_utf8_lossy(&bytes);
-            if text.contains("\"type\":\"error\"") {
-                got_error_event = true;
-                assert!(text.contains("\"code\":\"overloaded_error\""));
-                assert!(text.contains("当前服务集群负载较高"));
+            if text.contains("event: response.failed") {
+                got_failure_event = true;
+                assert!(text.contains("\"type\":\"response.failed\""), "missing envelope type: {}", text);
+                assert!(text.contains("\"status\":\"failed\""), "missing response.status=failed: {}", text);
+                assert!(text.contains("\"code\":\"overloaded_error\""), "missing error.code: {}", text);
+                assert!(text.contains("当前服务集群负载较高"), "missing error.message: {}", text);
             }
         }
-        assert!(got_error_event, "translator did not emit Responses error event");
+        assert!(got_failure_event, "translator did not emit response.failed event");
     }
 
     #[tokio::test]
@@ -2635,20 +2674,23 @@ mod tests {
         let err = result.expect_err("expected Err on empty stream");
         assert_eq!(err, "upstream_empty_stream");
 
-        // And — critically — the client must have received an `event: error`
-        // SSE frame BEFORE the connection closed. Otherwise Codex sees a
-        // raw stream cut and reports "stream disconnected before completion"
-        // instead of a typed upstream error.
-        let mut got_error_event = false;
+        // And — critically — the client must have received a
+        // `response.failed` terminal event BEFORE the connection closed.
+        // Otherwise Codex sees a raw stream cut and reports "stream
+        // disconnected before completion" instead of a typed upstream error.
+        let mut got_failure_event = false;
         while let Some(item) = rx.recv().await {
             let Ok(bytes) = item else { break };
             let s = String::from_utf8_lossy(&bytes);
-            if s.contains("event: error") && s.contains("upstream_empty_stream") {
-                got_error_event = true;
+            if s.contains("event: response.failed")
+                && s.contains("\"status\":\"failed\"")
+                && s.contains("\"code\":\"server_is_overloaded\"")
+            {
+                got_failure_event = true;
                 break;
             }
         }
-        assert!(got_error_event, "translator did not emit Responses error event before closing");
+        assert!(got_failure_event, "translator did not emit response.failed event before closing");
     }
 
     /// Spin up a single-shot HTTP server that returns one SSE chunk and
