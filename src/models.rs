@@ -157,6 +157,14 @@ pub(crate) struct AuditRecord {
     /// Real token usage parsed from the upstream response (zero when unparsed).
     #[serde(default)]
     pub(crate) tokens: TokenUsage,
+    /// Which client app surfaced this request (Codex CLI, Claude Code, Cursor,
+    /// API key, …). Set by `write_proxy_audit` from the request-scoped task
+    /// local so callers deep in the proxy chain don't need to thread it. Empty
+    /// for records written outside a request scope (background probes) and for
+    /// rows persisted before this field existed; the stats aggregator treats
+    /// empty origin as a single `"unknown"` bucket.
+    #[serde(default)]
+    pub(crate) origin: String,
 }
 
 /// Real token usage for one request, parsed from upstream SSE/JSON.

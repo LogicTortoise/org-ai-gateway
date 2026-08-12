@@ -366,6 +366,10 @@ async fn write_ws_audit(
         status: "success".to_string(),
         created_at: Utc::now(),
         tokens,
+        // The Codex realtime WebSocket relay is a separate entry point from
+        // the HTTP Codex path; label its rows distinctly so the dashboard
+        // can show Codex-CLI vs Codex-WS consumption side by side.
+        origin: crate::auth::ORIGIN_CODEX_WS.to_string(),
     };
     if let Err(e) = crate::pool::storage::append_audit(state, &record).await {
         error!("failed writing codex ws audit record: {}", e);

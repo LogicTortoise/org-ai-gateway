@@ -95,6 +95,10 @@ pub(crate) async fn get_stats(State(state): State<AppState>, headers: HeaderMap)
     let mut by_user: HashMap<String, (u64, u64, u64, u64, u64)> = HashMap::new();
     let mut by_account: HashMap<String, (u64, u64, u64, u64, u64)> = HashMap::new();
     let mut by_day: HashMap<String, (u64, u64, u64, u64, u64)> = HashMap::new();
+    // Per-client-app quota consumption (Codex CLI vs Claude Code vs Cursor vs
+    // API key vs unknown). Empty / missing `origin` is bucketed as `unknown`
+    // so old audit rows still count toward the totals.
+    let mut by_origin: HashMap<String, (u64, u64, u64, u64, u64)> = HashMap::new();
     let account_name_map: HashMap<String, String> = state
         .accounts
         .read()
@@ -157,6 +161,17 @@ pub(crate) async fn get_stats(State(state): State<AppState>, headers: HeaderMap)
             let key = account_name_map.get(&acct).cloned().unwrap_or(acct);
             bump(&mut by_account, key);
         }
+        // Per-app consumption: empty origin (legacy rows before this field
+        // existed, or rows written outside a request scope like background
+        // probes) collapses to a single "unknown" bucket so totals stay whole.
+        let origin_key = r
+            .get("origin")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| "(未知)".to_string());
+        bump(&mut by_origin, origin_key);
     }
 
     enum BucketOrder {
@@ -235,6 +250,7 @@ pub(crate) async fn get_stats(State(state): State<AppState>, headers: HeaderMap)
             by_user: to_buckets(by_user, BucketOrder::ByRequestsDesc),
             by_account: to_buckets(by_account, BucketOrder::ByRequestsDesc),
             by_day: to_buckets(by_day, BucketOrder::ByKeyDesc),
+            by_origin: to_buckets(by_origin, BucketOrder::ByRequestsDesc),
             recent,
         }),
     )
@@ -264,6 +280,10 @@ pub(crate) struct StatsResponse {
     pub(crate) by_user: Vec<StatBucket>,
     pub(crate) by_account: Vec<StatBucket>,
     pub(crate) by_day: Vec<StatBucket>,
+    /// Per-client-app consumption (Codex CLI / Claude Code / Cursor / API key
+    /// / unknown). Sorted by request count descending; paired with
+    /// `total_*_tokens` to compute cache-hit rates per app on the dashboard.
+    pub(crate) by_origin: Vec<StatBucket>,
     pub(crate) recent: Vec<RecentEntry>,
 }
 

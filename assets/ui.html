@@ -756,6 +756,10 @@
                 inputTokens: '输入 Token', outputTokens: '输出 Token', cachedTokens: '缓存 Token',
                 hitRate: (p) => `命中率 ${p}%`,
                 byModel: '按模型', byUser: '按用户', byAccount: '按账号',
+                byApp: '按客户端应用', appUnknown: '未知', appCodexCli: 'Codex CLI', appClaudeCode: 'Claude Code', appCursor: 'Cursor', appOllama: 'Ollama', appApiKey: 'API Key', appCodexWs: 'Codex WS',
+                perAppConsumption: '各客户端额度消耗', perAppHint: '同一上游账号可能被多个客户端共享——这里按入口协议拆分，看谁在烧额度。',
+                perAppCapacitySplit: '按客户端拆分当前账号配额',
+                perAppShare: '份额', perAppShareHint: '该客户端在 5h 入 Token 中的占比',
                 recentRequests: '最近请求',
                 colTime: '时间', colRequester: '请求人', colAccountUsed: '使用账号',
                 colInputTok: '输入Token', colOutputTok: '输出Token',
@@ -926,6 +930,10 @@
                 inputTokens: 'Input tokens', outputTokens: 'Output tokens', cachedTokens: 'Cached tokens',
                 hitRate: (p) => `Hit rate ${p}%`,
                 byModel: 'By model', byUser: 'By user', byAccount: 'By account',
+                byApp: 'By client app', appUnknown: 'Unknown', appCodexCli: 'Codex CLI', appClaudeCode: 'Claude Code', appCursor: 'Cursor', appOllama: 'Ollama', appApiKey: 'API Key', appCodexWs: 'Codex WS',
+                perAppConsumption: 'Per-client quota consumption', perAppHint: 'A single upstream account can be shared across multiple clients — split here by entry protocol to see who is burning through the budget.',
+                perAppCapacitySplit: 'Per-client quota split for this account',
+                perAppShare: 'Share', perAppShareHint: 'This client\'s share of the 5h input-token total',
                 recentRequests: 'Recent requests',
                 colTime: 'Time', colRequester: 'Requester', colAccountUsed: 'Account used',
                 colInputTok: 'Input tokens', colOutputTok: 'Output tokens',
@@ -1473,6 +1481,23 @@
         function fmtWindow(min){ if(!min) return ''; if(min%10080===0) return (min/10080)+t('unitWeek'); if(min%1440===0) return (min/1440)+t('unitDay'); if(min%60===0) return (min/60)+'h'; return min+'m'; }
         function fmtReset(sec){ if(sec==null) return '—'; if(sec<=0) return t('resetDone'); const h=Math.floor(sec/3600), m=Math.floor((sec%3600)/60); if(h>=24){const d=Math.floor(h/24); return d+'d '+(h%24)+'h';} if(h>0) return h+'h '+m+'m'; return m+'m'; }
         function pctColor(p){ if(p>=90) return 'bg-red-500'; if(p>=70) return 'bg-yellow-500'; return 'bg-indigo-500'; }
+        // Map raw `origin` strings written by the proxy (auth.rs::ORIGIN_*) to
+        // a localised display label and a colour dot. The fallback `unknown`
+        // covers audit rows written before the field existed or outside a
+        // request scope (background probes).
+        function appMeta(origin) {
+            const key = (origin || '').toLowerCase();
+            const labels = {
+                codex_cli:   { label: t('appCodexCli'),   dot: 'bg-indigo-500' },
+                claude_code: { label: t('appClaudeCode'), dot: 'bg-purple-500' },
+                cursor:      { label: t('appCursor'),     dot: 'bg-emerald-500' },
+                ollama:      { label: t('appOllama'),     dot: 'bg-amber-500' },
+                api_key:     { label: t('appApiKey'),     dot: 'bg-sky-500' },
+                codex_ws:    { label: t('appCodexWs'),    dot: 'bg-blue-500' },
+            };
+            if (labels[key]) return labels[key];
+            return { label: t('appUnknown'), dot: 'bg-gray-400' };
+        }
         function limitBar(label, p, resetSec){
             const has = (p!=null);
             const val = has ? Math.max(0, Math.min(100, p)) : 0;
@@ -1938,6 +1963,60 @@
 
                 const okRate = d.total_requests ? Math.round(d.success / d.total_requests * 100) : 0;
 
+                // Per-app consumption panel: surfaces the user's main ask
+                // (Codex CLI vs Claude Code split) at the top of the Stats
+                // tab, before the daily chart. Each row is one client app,
+                // coloured by its `appMeta` dot; the rightmost cell is the
+                // provider-normalised cache-hit rate so users can see whether
+                // Codex-CLI traffic and Claude-Code traffic hit cache
+                // similarly.
+                const perAppPanel = () => {
+                    const rows = d.by_origin || [];
+                    if (!rows.length) return '';
+                    const sumIn = rows.reduce((a, r) => a + (r.input_tokens||0), 0) || 1;
+                    const body = rows.map(r => {
+                        const m = appMeta(r.key);
+                        const share = ((r.input_tokens||0) / sumIn * 100).toFixed(1);
+                        const hr = hitRate(r.cached_tokens||0, r.prompt_tokens||0).toFixed(0);
+                        return `
+                        <tr class="hover:bg-gray-50 transition">
+                            <td class="px-4 py-3">
+                                <span class="inline-flex items-center gap-2">
+                                    <span class="w-2 h-2 rounded-full ${m.dot}"></span>
+                                    <span class="text-gray-700 font-medium">${m.label}</span>
+                                </span>
+                            </td>
+                            <td class="px-4 py-3 text-right text-gray-500 whitespace-nowrap">${t('nTimes', r.requests)}</td>
+                            <td class="px-4 py-3 text-right text-gray-500 whitespace-nowrap">${(r.input_tokens||0).toLocaleString()}</td>
+                            <td class="px-4 py-3 text-right text-gray-500 whitespace-nowrap">${(r.output_tokens||0).toLocaleString()}</td>
+                            <td class="px-4 py-3 text-right text-gray-500 whitespace-nowrap">${hr}%</td>
+                            <td class="px-4 py-3 text-right text-gray-500 whitespace-nowrap">${share}%</td>
+                        </tr>`;
+                    }).join('');
+                    return `
+                    <div class="bg-white border border-gray-200 rounded-xl shadow-sm p-6 mb-8">
+                        <div class="mb-4">
+                            <h3 class="text-sm font-semibold text-gray-800">${t('perAppConsumption')}</h3>
+                            <p class="text-xs text-gray-400 mt-1">${t('perAppHint')}</p>
+                        </div>
+                        <div class="overflow-auto">
+                            <table class="w-full text-sm text-left">
+                                <thead class="bg-gray-50/80 text-gray-400 text-xs uppercase">
+                                    <tr>
+                                        <th class="px-4 py-2 font-medium">${t('byApp')}</th>
+                                        <th class="px-4 py-2 font-medium text-right">${t('colRequests')}</th>
+                                        <th class="px-4 py-2 font-medium text-right">${t('colTokenIn')}</th>
+                                        <th class="px-4 py-2 font-medium text-right">${t('colTokenOut')}</th>
+                                        <th class="px-4 py-2 font-medium text-right">${t('cacheHit')}</th>
+                                        <th class="px-4 py-2 font-medium text-right" title="${t('perAppShareHint')}">${t('perAppShare')}</th>
+                                    </tr>
+                                </thead>
+                                <tbody class="divide-y divide-gray-100">${body}</tbody>
+                            </table>
+                        </div>
+                    </div>`;
+                };
+
                 el.innerHTML = `
                     <div class="grid grid-cols-2 gap-6 mb-6">
                         ${card(t('totalRequests'), d.total_requests)}
@@ -1948,6 +2027,7 @@
                         ${card(t('outputTokens'), fmtTok(d.total_output_tokens), (d.total_output_tokens||0).toLocaleString())}
                         ${card(t('cachedTokens'), fmtTok(d.total_cached_tokens), t('hitRate', hitRate(d.total_cached_tokens||0, d.total_prompt_tokens||0).toFixed(1)))}
                     </div>
+                    ${perAppPanel()}
                     ${dailyChart()}
                     ${accountHealth()}
                     <div class="grid grid-cols-1 xl:grid-cols-2 2xl:grid-cols-3 gap-6 mb-8">
@@ -2105,6 +2185,62 @@
             </td>`;
         }
 
+        // Render the per-app split for ONE account as a thin row immediately
+        // beneath the main row. Each chip is one client app's 5h share of this
+        // account's window, scaled by the upstream's overall `primary.used_percent`
+        // so the headline number (e.g. "Claude CLI used 17% of the 5h window")
+        // is consistent with the % shown on the row above.
+        //
+        // Empty `by_origin` (no traffic in the 5h window yet) renders a
+        // muted "—" so the row still occupies its slot.
+        function renderAccountAppSplit(account, meta) {
+            const buckets = account.by_origin || [];
+            const totalTokens5h = buckets.reduce((a, b) => a + (b.tokens_5h || 0), 0);
+            // The upstream's primary window percent is the total contribution
+            // budget we split between apps. When the upstream isn't reporting
+            // (GLM/Kimi-style local-window provider), fall back to the token
+            // burn alone and skip the percent multiplier — the chips still show
+            // the relative share.
+            const pct = account.primary && typeof account.primary.used_percent === 'number'
+                ? account.primary.used_percent
+                : null;
+            const chipWidth = 100 / Math.max(1, buckets.length);
+            const fmtShort = (v) => { v = v || 0; if (v >= 1e6) return (v/1e6).toFixed(1)+'M'; if (v >= 1e3) return (v/1e3).toFixed(1)+'K'; return String(v); };
+            if (!buckets.length) {
+                return `<tr class="bg-gray-50/40">
+                    <td colspan="${meta.secondary ? 4 : 3}" class="px-4 pb-3 text-[11px] text-gray-400">${t('perAppCapacitySplit')} — <span class="text-gray-300">${t('noData')}</span></td>
+                </tr>`;
+            }
+            const chips = buckets.map(b => {
+                const m = appMeta(b.origin);
+                const shareTokens = totalTokens5h > 0 ? ((b.tokens_5h || 0) / totalTokens5h * 100).toFixed(1) : '0.0';
+                const sharePct = pct != null ? ((b.tokens_5h || 0) / totalTokens5h * pct).toFixed(1) : null;
+                const titleLines = [
+                    m.label,
+                    t('nTimes', b.requests || 0),
+                    `5h: ${fmtShort(b.tokens_5h || 0)} tok`,
+                    `24h: ${fmtShort(b.tokens_24h || 0)} tok`,
+                    `7d: ${fmtShort(b.tokens_weekly || 0)} tok`,
+                    sharePct != null ? `${sharePct}% of window` : `${shareTokens}% of 5h tokens`,
+                ].join('\n');
+                return `<div class="flex items-center gap-1.5 px-2 py-1 rounded-md bg-white border border-gray-200 hover:bg-gray-50 transition" style="min-width:120px; max-width:240px; flex:0 0 auto" title="${titleLines.replace(/"/g,'&quot;')}">
+                    <span class="w-1.5 h-1.5 rounded-full ${m.dot} flex-shrink-0"></span>
+                    <div class="flex flex-col min-w-0">
+                        <span class="text-[11px] font-medium text-gray-700 truncate">${m.label}</span>
+                        <span class="text-[10px] text-gray-400 whitespace-nowrap">${sharePct != null ? sharePct + '% / ' : ''}${fmtShort(b.tokens_5h || 0)}</span>
+                    </div>
+                </div>`;
+            }).join('');
+            return `<tr class="bg-gray-50/40 hover:bg-gray-50 transition">
+                <td colspan="${meta.secondary ? 4 : 3}" class="px-4 pb-3">
+                    <div class="flex items-center gap-2 flex-wrap">
+                        <span class="text-[10px] uppercase tracking-wide text-gray-400 font-semibold">${t('perAppCapacitySplit')}</span>
+                        ${chips}
+                    </div>
+                </td>
+            </tr>`;
+        }
+
         function renderProviderCapacity(p) {
             const meta = capProviderMeta()[p.provider] || { name: p.provider, badge: 'bg-gray-100 text-gray-700', primary: t('primaryWindow'), secondary: t('secondaryWindow') };
             const pool = p.pool || {};
@@ -2139,6 +2275,12 @@
                 const risk = a.primary && a.primary.exhaust_before_reset
                     ? `<span class="px-1.5 py-0.5 bg-red-100 text-red-700 text-[10px] font-bold rounded-full">${t('hittingWall')}</span>`
                     : (a.primary && a.primary.used_percent >= 95 ? `<span class="px-1.5 py-0.5 bg-red-100 text-red-700 text-[10px] font-bold rounded-full">${t('excluded')}</span>` : '');
+                // Per-app breakdown row: split this account's 5h window into
+                // Codex CLI vs Claude Code vs Cursor vs API-key shares using
+                // the audit-log-derived `by_origin`. Renders inline beneath
+                // each account row so the eye doesn't need to jump between
+                // tables to compare "which app is burning this account".
+                const splitRow = renderAccountAppSplit(a, meta);
                 return `<tr class="hover:bg-gray-50 transition">
                     <td class="px-4 py-3">
                         <div class="text-gray-800 font-medium truncate max-w-[200px]" title="${a.owner_user_id}/${a.account_label}">${a.account_label}</div>
@@ -2147,7 +2289,7 @@
                     <td class="px-4 py-3"><span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-medium ${statusMeta[0]}">${statusMeta[1]}</span> ${risk}</td>
                     ${capacityWindowCell(a.primary)}
                     ${meta.secondary ? capacityWindowCell(a.secondary) : ''}
-                </tr>`;
+                </tr>${splitRow}`;
             }).join('');
 
             return `<div class="mb-10">

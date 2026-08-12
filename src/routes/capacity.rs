@@ -65,6 +65,11 @@ pub(crate) async fn get_capacity(State(state): State<AppState>, headers: HeaderM
                 .as_ref()
                 .map(|s| compute_account_outlook(provider, s, &series, now))
                 .unwrap_or_default();
+            // Per-app token split for this account — the "independent capacity
+            // calculation per app" the dashboard surfaces. Walked once per
+            // account on each render; audit-ndjson is small enough that this
+            // stays cheap.
+            let by_origin = account_origin_burn(&audit_records, &account.id, now);
             account_views.push(AccountCapacity {
                 id: account.id.clone(),
                 account_label: account.account_label.clone(),
@@ -74,6 +79,7 @@ pub(crate) async fn get_capacity(State(state): State<AppState>, headers: HeaderM
                 plan_type: snapshot.as_ref().and_then(|s| s.plan_type.clone()),
                 captured_at: snapshot.as_ref().and_then(|s| s.captured_at),
                 outlook,
+                by_origin,
             });
         }
 
@@ -137,6 +143,78 @@ fn provider_token_burn(records: &[Value], now: DateTime<Utc>) -> HashMap<String,
         }
     }
     map
+}
+
+/// Sum one account's 5h / 24h / weekly billable-token usage, split by origin
+/// (Codex CLI vs Claude Code vs Cursor vs API key vs …). Used to render the
+/// per-account "independent capacity calculation" the user asked for: each
+/// app's contribution to the upstream's window is computed from the audit log
+/// even when the upstream only reports a single window percentage, so the
+/// dashboard can show e.g. "Codex CLI used 18% of this account's 5h window,
+/// Claude Code used 12%" side by side.
+///
+/// Empty / missing origin (legacy rows, background probes) collapses to
+/// `(unknown)`, matching `routes::stats`.
+fn account_origin_burn(
+    records: &[Value],
+    account_id: &str,
+    now: DateTime<Utc>,
+) -> Vec<OriginBucket> {
+    let primary_cutoff = now - chrono::Duration::hours(crate::provider::usage_window::PRIMARY_WINDOW_HOURS);
+    let day_cutoff = now - chrono::Duration::hours(24);
+    let week_cutoff = now - chrono::Duration::hours(crate::provider::usage_window::SECONDARY_WINDOW_HOURS);
+    // (requests, tokens_5h, tokens_24h, tokens_weekly)
+    let mut map: HashMap<String, (u64, u64, u64, u64)> = HashMap::new();
+    for r in records {
+        if r.get("upstream_account_id").and_then(|v| v.as_str()) != Some(account_id) {
+            continue;
+        }
+        let Some(created_at) = r
+            .get("created_at")
+            .and_then(|v| v.as_str())
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|t| t.with_timezone(&Utc))
+        else {
+            continue;
+        };
+        if created_at < week_cutoff {
+            continue;
+        }
+        let billable = r
+            .pointer("/tokens/billable_tokens")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+            .max(0) as u64;
+        let key = r
+            .get("origin")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("(未知)")
+            .to_string();
+        let e = map.entry(key).or_default();
+        e.0 += 1;
+        if created_at >= primary_cutoff {
+            e.1 += billable;
+        }
+        if created_at >= day_cutoff {
+            e.2 += billable;
+        }
+        e.3 += billable;
+    }
+    let mut out: Vec<OriginBucket> = map
+        .into_iter()
+        .map(|(origin, (requests, tokens_5h, tokens_24h, tokens_weekly))| OriginBucket {
+            origin,
+            requests,
+            tokens_5h,
+            tokens_24h,
+            tokens_weekly,
+        })
+        .collect();
+    // Sort by 5h usage descending so the dashboard's headline app is first.
+    out.sort_by(|a, b| b.tokens_5h.cmp(&a.tokens_5h));
+    out
 }
 
 /// Aggregate one provider's accounts into the pool-level outlook.
@@ -351,10 +429,95 @@ pub(crate) struct AccountCapacity {
     pub(crate) captured_at: Option<DateTime<Utc>>,
     #[serde(flatten)]
     pub(crate) outlook: AccountOutlook,
+    /// Per-app (Codex CLI / Claude Code / Cursor / API key / …) consumption
+    /// for this account. The frontend divides each bucket's `tokens_5h` by
+    /// the sum to render the "Codex vs Claude Code" share of the upstream
+    /// window independently.
+    #[serde(default)]
+    pub(crate) by_origin: Vec<OriginBucket>,
+}
+
+/// One app's contribution to one account's quota window. Sorted descending by
+/// `tokens_5h` so the dominant app appears first in the UI.
+#[derive(Debug, Serialize, Clone)]
+pub(crate) struct OriginBucket {
+    pub(crate) origin: String,
+    pub(crate) requests: u64,
+    pub(crate) tokens_5h: u64,
+    pub(crate) tokens_24h: u64,
+    pub(crate) tokens_weekly: u64,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
 struct TokenBurn {
     billable_tokens_last_24h: u64,
     billable_tokens_last_1h: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build one audit record with the given origin + billable tokens, stamped
+    /// at `minutes_ago` minutes before `now`.
+    fn rec(account_id: &str, origin: &str, billable: u64, minutes_ago: i64, now: DateTime<Utc>) -> Value {
+        let at = now - chrono::Duration::minutes(minutes_ago);
+        json!({
+            "upstream_account_id": account_id,
+            "origin": origin,
+            "tokens": { "billable_tokens": billable },
+            "created_at": at.to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+        })
+    }
+
+    #[test]
+    fn account_origin_burn_sums_per_origin_across_three_windows() {
+        let now = Utc::now();
+        let acct = "acct-1";
+        let records = vec![
+            // Codex CLI: 100 tok inside the 5h window, 200 in 24h, 300 in 7d.
+            rec(acct, "codex_cli", 100, 30, now),
+            rec(acct, "codex_cli", 100, 60 * 10, now), // older than 5h, inside 24h
+            // Older than 24h but inside 7d — pushed 5 minutes past the exact
+            // 24h boundary so the implementation's `>=` cutoff unambiguously
+            // excludes it from the 24h bucket (an exact 24h edge would still
+            // pass, which is the documented behavior).
+            rec(acct, "codex_cli", 100, 60 * 24 + 5, now),
+            // Claude Code: 50 in 5h, 50 in 24h (same row counts in all windows).
+            rec(acct, "claude_code", 50, 60, now),
+        ];
+        let buckets = account_origin_burn(&records, acct, now);
+        assert_eq!(buckets.len(), 2, "two apps in 7d window: {:?}", buckets);
+        let by_origin = |k: &str| buckets.iter().find(|b| b.origin == k).cloned().unwrap();
+        let cc = by_origin("codex_cli");
+        assert_eq!(cc.requests, 3);
+        assert_eq!(cc.tokens_5h, 100, "only the 30-min-ago row is in 5h");
+        assert_eq!(cc.tokens_24h, 200, "the 30min and 10h rows are in 24h");
+        assert_eq!(cc.tokens_weekly, 300, "all three rows are inside the 7d window");
+        let claude = by_origin("claude_code");
+        assert_eq!(claude.requests, 1);
+        assert_eq!(claude.tokens_5h, 50);
+        assert_eq!(claude.tokens_24h, 50);
+        assert_eq!(claude.tokens_weekly, 50);
+        // Sorted descending by 5h: codex_cli first.
+        assert_eq!(buckets[0].origin, "codex_cli");
+    }
+
+    #[test]
+    fn account_origin_burn_filters_to_target_account_and_groups_unknown() {
+        let now = Utc::now();
+        let records = vec![
+            rec("acct-a", "codex_cli", 10, 5, now),
+            rec("acct-b", "codex_cli", 9999, 5, now), // must be ignored
+            // Empty origin: should collapse to the "(未知)" bucket.
+            rec("acct-a", "", 7, 5, now),
+        ];
+        let buckets = account_origin_burn(&records, "acct-a", now);
+        assert_eq!(buckets.len(), 2);
+        let key_set: std::collections::HashSet<_> = buckets.iter().map(|b| b.origin.clone()).collect();
+        assert!(key_set.contains("codex_cli"));
+        assert!(key_set.contains("(未知)"));
+        // Sanity: the leaked `acct-b` row with 9999 tokens must not appear.
+        assert!(buckets.iter().all(|b| b.tokens_5h <= 10));
+    }
 }

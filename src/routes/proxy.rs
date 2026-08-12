@@ -260,8 +260,20 @@ async fn serve_with_chain(
 pub(crate) async fn proxy_responses(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(mut payload): Json<Value>,
+    Json(payload): Json<Value>,
 ) -> impl IntoResponse {
+    let origin = infer_request_origin(&headers, &payload, ChainSlot::Codex);
+    crate::auth::with_request_origin(origin, async move {
+        proxy_responses_inner(state, headers, payload).await
+    })
+    .await
+}
+
+async fn proxy_responses_inner(
+    state: AppState,
+    headers: HeaderMap,
+    mut payload: Value,
+) -> Response {
     let caller = identify_caller(&headers);
     let user_id = caller.id;
     let shared_only = !caller.owner_trusted;
@@ -298,8 +310,20 @@ pub(crate) async fn proxy_responses(
 pub(crate) async fn proxy_claude_messages(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(mut payload): Json<Value>,
+    Json(payload): Json<Value>,
 ) -> impl IntoResponse {
+    let origin = infer_request_origin(&headers, &payload, ChainSlot::Claude);
+    crate::auth::with_request_origin(origin, async move {
+        proxy_claude_messages_inner(state, headers, payload).await
+    })
+    .await
+}
+
+async fn proxy_claude_messages_inner(
+    state: AppState,
+    headers: HeaderMap,
+    mut payload: Value,
+) -> Response {
     let caller = identify_caller(&headers);
     let user_id = caller.id;
     let shared_only = !caller.owner_trusted;
@@ -332,6 +356,18 @@ pub(crate) async fn proxy_chat_completions(
     headers: HeaderMap,
     Json(payload): Json<Value>,
 ) -> impl IntoResponse {
+    let origin = infer_request_origin(&headers, &payload, ChainSlot::Claude);
+    crate::auth::with_request_origin(origin, async move {
+        proxy_chat_completions_inner(state, headers, payload).await
+    })
+    .await
+}
+
+async fn proxy_chat_completions_inner(
+    state: AppState,
+    headers: HeaderMap,
+    payload: Value,
+) -> Response {
     let caller = identify_caller(&headers);
     let user_id = caller.id;
     let shared_only = !caller.owner_trusted;
@@ -361,6 +397,25 @@ fn payload_is_cursor(payload: &Value) -> bool {
         .and_then(|v| v.as_str())
         .map(crate::provider::cursor::is_cursor_model)
         .unwrap_or(false)
+}
+
+/// Pick the right audit origin for an entry handler. Cursor / ollama models
+/// route to their own upstreams regardless of which endpoint the client hit,
+/// so they get their own origin label even when entered through Codex or
+/// Claude slot; otherwise the slot determines whether this is Codex CLI or
+/// Claude Code traffic (with API-key auth overriding as `api_key`).
+fn infer_request_origin(
+    headers: &HeaderMap,
+    payload: &Value,
+    slot: ChainSlot,
+) -> String {
+    if payload_is_ollama(payload) {
+        return crate::auth::ORIGIN_OLLAMA.to_string();
+    }
+    if payload_is_cursor(payload) {
+        return crate::auth::ORIGIN_CURSOR.to_string();
+    }
+    crate::auth::infer_origin(headers, slot).to_string()
 }
 
 /// Returns true if the request's `model` field selects an ollama model
@@ -1116,7 +1171,12 @@ async fn stream_openai_to_responses_sse(
     let raw_model_for_task = raw_model.clone();
     let user_id_for_task = user_id.clone();
     let account_for_task = account.clone();
-    tokio::spawn(async move {
+    // `tokio::task_local!` does NOT propagate into spawned tasks by default,
+    // so explicitly wrap the spawn in `with_request_origin` with the current
+    // request's origin — otherwise the streaming translate's audit row
+    // would land with an empty origin (legacy "unknown" bucket).
+    let spawn_origin = crate::auth::current_origin().unwrap_or_default();
+    tokio::spawn(crate::auth::with_request_origin(spawn_origin, async move {
         match translate_openai_sse_to_responses(upstream, &raw_model_for_task, tx).await {
             Ok((text, tool_calls, usage)) => {
                 write_proxy_audit(
@@ -1156,7 +1216,7 @@ async fn stream_openai_to_responses_sse(
                 .await;
             }
         }
-    });
+    }));
 
     // Bridge the mpsc receiver into a `Stream<Item = Result<Bytes, io::Error>>`
     // for `Body::from_stream`. `futures_util::stream::unfold` is the
@@ -2314,6 +2374,12 @@ async fn write_proxy_audit(
         status: status_label.to_string(),
         created_at: Utc::now(),
         tokens,
+        // Origin is set once per request by the entry handler via
+        // `auth::with_request_origin`; deep callsites just read it from the
+        // task local. Empty when written outside a request scope (e.g. a
+        // background probe) — `routes::stats` then buckets the row as
+        // "unknown" so it still shows up in the totals.
+        origin: crate::auth::current_origin().unwrap_or_default(),
     };
     if let Err(e) = append_audit(state, &audit).await {
         error!("failed writing proxy audit record: {}", e);

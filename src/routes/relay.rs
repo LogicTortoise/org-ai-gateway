@@ -73,6 +73,7 @@ pub(crate) async fn relay(
                 status: format!("upstream_error: {}", err.message),
                 created_at: Utc::now(),
                 tokens: TokenUsage::default(),
+                origin: relay_origin(&headers),
             };
             if let Err(write_err) = append_audit(&state, &failed_audit).await {
                 error!("failed writing upstream-error audit record: {}", write_err);
@@ -97,6 +98,7 @@ pub(crate) async fn relay(
         status: "success".to_string(),
         created_at: Utc::now(),
         tokens: TokenUsage::default(),
+        origin: relay_origin(&headers),
     };
 
     if let Some(snapshot) = upstream_result.rate_limit_snapshot.clone() {
@@ -140,6 +142,24 @@ pub(crate) async fn call_upstream(
             rate_limit_snapshot: None,
         }),
     }
+}
+
+/// Legacy `/v1/gateway/relay` isn't tied to a Codex/Claude slot — it's the
+/// catch-all external-script path. Label rows by auth type so an API-key
+/// integration shows up under "API key" rather than crashing the per-app
+/// breakdown with `unknown` rows.
+fn relay_origin(headers: &HeaderMap) -> String {
+    if let Some(bearer) = headers
+        .get(AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|t| t.strip_prefix("Bearer "))
+        .map(|t| t.trim())
+    {
+        if bearer.starts_with(crate::apikey::KEY_PREFIX) {
+            return crate::auth::ORIGIN_API_KEY.to_string();
+        }
+    }
+    crate::auth::ORIGIN_UNKNOWN.to_string()
 }
 
 

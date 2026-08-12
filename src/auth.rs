@@ -183,4 +183,164 @@ pub(crate) fn jwt_chatgpt_account_id(jwt: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Per-request "origin" classification: which client app surfaced this request
+/// (Codex CLI, Claude Code, Cursor, API key, etc.). Recorded on every audit row
+/// so the dashboard can split quota consumption by app — especially the main
+/// user-facing ask: independent capacity calculation for Codex CLI vs Claude
+/// Code, even though both share the same upstream accounts.
+///
+/// Set once at request entry via `with_request_origin` and read by
+/// `write_proxy_audit` deep in the proxy call stack, so we avoid threading
+/// `origin` through ~20 function signatures.
+pub(crate) const ORIGIN_UNKNOWN: &str = "unknown";
+pub(crate) const ORIGIN_CODEX_CLI: &str = "codex_cli";
+pub(crate) const ORIGIN_CLAUDE_CODE: &str = "claude_code";
+pub(crate) const ORIGIN_CURSOR: &str = "cursor";
+pub(crate) const ORIGIN_OLLAMA: &str = "ollama";
+pub(crate) const ORIGIN_API_KEY: &str = "api_key";
+pub(crate) const ORIGIN_CODEX_WS: &str = "codex_ws";
+
+tokio::task_local! {
+    /// Set by `with_request_origin` at request entry; read by audit writers
+    /// via `current_origin()`. Spawned tasks inside the scope inherit it.
+    static REQUEST_ORIGIN: String;
+}
+
+/// Run `fut` with `origin` set as this task's request origin. Every audit
+/// row written while the future (or anything it spawns) is running will carry
+/// this origin label.
+pub(crate) async fn with_request_origin<F, R>(origin: String, fut: F) -> R
+where
+    F: std::future::Future<Output = R>,
+{
+    REQUEST_ORIGIN.scope(origin, fut).await
+}
+
+/// Read the request origin set by `with_request_origin`, or `None` when the
+/// caller is running outside a scoped request (e.g. a background probe).
+pub(crate) fn current_origin() -> Option<String> {
+    REQUEST_ORIGIN.try_with(|o| o.clone()).ok()
+}
+
+/// Determine the origin label for a request from its auth header and the
+/// protocol slot it entered. API-key auth (`Bearer oag_*`) wins outright so
+/// external integrations stay bucketed even when they hit Codex/Claude paths;
+/// otherwise the slot decides whether this is Codex CLI or Claude Code
+/// traffic. Called once at the entry handler.
+pub(crate) fn infer_origin(
+    headers: &HeaderMap,
+    slot: crate::provider::chains::ChainSlot,
+) -> &'static str {
+    if let Some(bearer) = headers
+        .get(AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|t| t.strip_prefix("Bearer "))
+        .map(|t| t.trim())
+    {
+        // The gateway-issued API key prefix is reserved — any key under it
+        // is recognised via `apikey::resolve`. Checking the literal prefix
+        // here avoids touching the global key store on every non-keyed
+        // request and keeps this function sync + allocation-free in the hot
+        // path.
+        if bearer.starts_with(crate::apikey::KEY_PREFIX) {
+            return ORIGIN_API_KEY;
+        }
+    }
+    match slot {
+        crate::provider::chains::ChainSlot::Codex => ORIGIN_CODEX_CLI,
+        crate::provider::chains::ChainSlot::Claude => ORIGIN_CLAUDE_CODE,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::chains::ChainSlot;
+    use axum::http::HeaderValue;
+
+    fn headers_with_bearer(bearer: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(AUTHORIZATION, HeaderValue::from_str(bearer).unwrap());
+        h
+    }
+
+    #[test]
+    fn api_key_bearer_is_classified_as_api_key_on_either_slot() {
+        let h = headers_with_bearer("Bearer oag_abc123");
+        assert_eq!(infer_origin(&h, ChainSlot::Codex), ORIGIN_API_KEY);
+        assert_eq!(infer_origin(&h, ChainSlot::Claude), ORIGIN_API_KEY);
+    }
+
+    #[test]
+    fn user_bearer_routes_to_slot_origin() {
+        let h = headers_with_bearer("Bearer user:koltyu");
+        assert_eq!(infer_origin(&h, ChainSlot::Codex), ORIGIN_CODEX_CLI);
+        assert_eq!(infer_origin(&h, ChainSlot::Claude), ORIGIN_CLAUDE_CODE);
+    }
+
+    #[test]
+    fn no_auth_header_falls_through_to_slot() {
+        let h = HeaderMap::new();
+        assert_eq!(infer_origin(&h, ChainSlot::Codex), ORIGIN_CODEX_CLI);
+        assert_eq!(infer_origin(&h, ChainSlot::Claude), ORIGIN_CLAUDE_CODE);
+    }
+
+    #[tokio::test]
+    async fn with_request_origin_makes_current_origin_visible_to_inner_future() {
+        let value = with_request_origin(ORIGIN_CODEX_CLI.to_string(), async {
+            current_origin().unwrap_or_default()
+        })
+        .await;
+        assert_eq!(value, ORIGIN_CODEX_CLI);
+    }
+
+    #[tokio::test]
+    async fn current_origin_is_none_outside_scope() {
+        // No scope set in this task → must be `None`.
+        let v = current_origin();
+        assert!(v.is_none());
+    }
+
+    #[tokio::test]
+    async fn spawned_task_does_not_inherit_parent_request_origin() {
+        // `tokio::task_local!` does NOT propagate to tasks spawned within
+        // the scope, whether the spawn is bare or wrapped. The only way to
+        // carry the origin into a spawned task is to wrap the SPAWNED FUTURE
+        // (not the spawn itself) in `with_request_origin`. This test
+        // codifies both halves so future readers don't add a `tokio::spawn`
+        // and assume the origin "just works" — the production spawn sites
+        // (streaming translate, etc.) MUST use the wrap-the-future pattern,
+        // matching what `proxy.rs::proxy_responses` does.
+        with_request_origin(ORIGIN_CLAUDE_CODE.to_string(), async {
+            // Case 1: bare `tokio::spawn` does NOT see the parent's task-local.
+            // `current_origin()` returns `None` outside a scope, so the
+            // `unwrap_or_default()` gives an empty string — the audit writer
+            // would then bucket the row as `unknown` / `""`.
+            let bare = tokio::spawn(async move { current_origin().unwrap_or_default() })
+                .await
+                .unwrap();
+            assert!(
+                bare.is_empty(),
+                "bare spawn must not inherit origin (got {:?})",
+                bare
+            );
+
+            // Case 2: wrapping the spawn future itself (NOT the spawn call)
+            // in `with_request_origin` is the pattern that works. The inner
+            // scope sees the parent task-local as its outer scope, then
+            // `tokio::spawn` runs the wrapped future — the wrapped future
+            // re-enters a scope so the spawned task can read the origin.
+            let origin_for_spawn = current_origin().unwrap_or_default();
+            let wrapped = tokio::spawn(with_request_origin(
+                origin_for_spawn,
+                async move { current_origin().unwrap_or_default() },
+            ))
+            .await
+            .unwrap();
+            assert_eq!(wrapped, ORIGIN_CLAUDE_CODE);
+        })
+        .await;
+    }
+}
+
 
