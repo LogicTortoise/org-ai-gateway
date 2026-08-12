@@ -220,33 +220,80 @@ pub(crate) async fn fetch_codex_models_raw(
 }
 
 
+/// Fields `/backend-api/codex/responses` accepts (Responses API). Anything
+/// else — including OpenAI Chat Completions fields the Codex CLI 0.147+ probe
+/// path can send — is stripped before the upstream call. A stray `max_tokens`
+/// or `temperature` here yields `400 Unsupported parameter` and aborts the
+/// client's in-flight task with no retry path (`ErrorClass::Invalid`).
+///
+/// `max_tokens` is the Chat Completions name; the Responses API equivalent
+/// is `max_output_tokens`. We rename it so the client doesn't have to know
+/// which wire shape the gateway routes through.
+const RESPONSES_API_FIELDS: &[&str] = &[
+    "model",
+    "input",
+    "instructions",
+    "max_output_tokens",
+    "metadata",
+    "parallel_tool_calls",
+    "prompt_cache_key",
+    "reasoning",
+    "safety_identifier",
+    "service_tier",
+    "store",
+    "stream",
+    "temperature",
+    "text",
+    "tool_choice",
+    "tools",
+    "top_p",
+    "truncation",
+    "user",
+];
+
 pub(crate) fn ensure_codex_payload_defaults(payload: &mut Value) {
-    if let Some(obj) = payload.as_object_mut() {
-        if !obj.contains_key("instructions") {
-            obj.insert(
-                "instructions".to_string(),
-                Value::String("You are a helpful assistant.".to_string()),
-            );
-        }
-        // Privacy guard for the shared pool: FORCE store=false, overriding
-        // whatever the client sent. With a shared upstream account, a client
-        // that asked for store=true would have its turn persisted server-side
-        // under the pool account's identity (and could surface in the account
-        // owner's cloud surfaces). Never let that happen.
-        obj.insert("store".to_string(), Value::Bool(false));
-        // Same reason: don't let a turn be chained onto / saved under a
-        // server-side response history keyed to the pool account.
-        obj.remove("previous_response_id");
-        obj.insert("stream".to_string(), Value::Bool(true));
-        if let Some(Value::String(input)) = obj.get("input") {
-            let msg = json!([{
-                "type":"message",
-                "role":"user",
-                "content":[{"type":"input_text","text":input}]
-            }]);
-            obj.insert("input".to_string(), msg);
-        }
+    let obj = match payload.as_object_mut() {
+        Some(o) => o,
+        None => return,
+    };
+
+    // Translate the Chat Completions name to the Responses API equivalent
+    // before the allowlist runs, so a client that sends `max_tokens` (the
+    // legacy OpenAI field name) still gets the right limit applied upstream.
+    if let Some(v) = obj.remove("max_tokens") {
+        obj.entry("max_output_tokens".to_string())
+            .or_insert(v);
     }
+
+    if !obj.contains_key("instructions") {
+        obj.insert(
+            "instructions".to_string(),
+            Value::String("You are a helpful assistant.".to_string()),
+        );
+    }
+    // Privacy guard for the shared pool: FORCE store=false, overriding
+    // whatever the client sent. With a shared upstream account, a client
+    // that asked for store=true would have its turn persisted server-side
+    // under the pool account's identity (and could surface in the account
+    // owner's cloud surfaces). Never let that happen.
+    obj.insert("store".to_string(), Value::Bool(false));
+    // Same reason: don't let a turn be chained onto / saved under a
+    // server-side response history keyed to the pool account.
+    obj.remove("previous_response_id");
+    obj.insert("stream".to_string(), Value::Bool(true));
+    if let Some(Value::String(input)) = obj.get("input") {
+        let msg = json!([{
+            "type":"message",
+            "role":"user",
+            "content":[{"type":"input_text","text":input}]
+        }]);
+        obj.insert("input".to_string(), msg);
+    }
+
+    // Drop fields the upstream rejects. Must run AFTER the defaults above so
+    // our own injections (`instructions`, `store`, `stream`) survive even if
+    // a future version of the Responses API stops accepting one of them.
+    obj.retain(|k, _| RESPONSES_API_FIELDS.contains(&k.as_str()));
 }
 
 
@@ -524,4 +571,83 @@ pub(crate) struct CodexBootstrapResponse {
     pub(crate) codex_config_toml: String,
     pub(crate) codex_auth_json: Value,
     pub(crate) steps: Vec<String>,
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn renames_max_tokens_to_max_output_tokens() {
+        // Codex CLI 0.147+ can send `max_tokens` (Chat Completions name) on
+        // the Responses path; the upstream rejects it with 400. The rename
+        // happens before the allowlist so the new field survives.
+        let mut p = json!({ "model": "gpt-5.6-sol", "max_tokens": 4096 });
+        ensure_codex_payload_defaults(&mut p);
+        assert_eq!(p["max_output_tokens"], 4096);
+        assert!(p.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn rename_preserves_explicit_max_output_tokens() {
+        // If the client already used the right name, don't clobber it with
+        // a stale Chat Completions value.
+        let mut p = json!({ "max_tokens": 100, "max_output_tokens": 8000 });
+        ensure_codex_payload_defaults(&mut p);
+        assert_eq!(p["max_output_tokens"], 8000);
+        assert!(p.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn strips_chat_completions_only_fields() {
+        // These don't exist on the Responses API; forwarding them yields
+        // `400 Unsupported parameter` and aborts the in-flight task.
+        let mut p = json!({
+            "model": "gpt-5.6-sol",
+            "input": "hi",
+            "frequency_penalty": 0.5,
+            "presence_penalty": 0.5,
+            "logit_bias": {"50256": -100},
+            "stop": ["\n\n"],
+            "n": 1,
+            "seed": 42,
+        });
+        ensure_codex_payload_defaults(&mut p);
+        assert!(p.get("frequency_penalty").is_none());
+        assert!(p.get("presence_penalty").is_none());
+        assert!(p.get("logit_bias").is_none());
+        assert!(p.get("stop").is_none());
+        assert!(p.get("n").is_none());
+        assert!(p.get("seed").is_none());
+    }
+
+    #[test]
+    fn keeps_responses_api_fields() {
+        let mut p = json!({
+            "model": "gpt-5.6-sol",
+            "input": "hi",
+            "instructions": "be terse",
+            "temperature": 0.2,
+            "top_p": 0.9,
+            "tools": [{"type": "function", "name": "search"}],
+            "tool_choice": "auto",
+            "parallel_tool_calls": true,
+            "reasoning": {"effort": "low"},
+            "metadata": {"trace_id": "abc"},
+            "prompt_cache_key": "session-1",
+            "text": {"format": {"type": "text"}},
+            "user": "u-1",
+        });
+        ensure_codex_payload_defaults(&mut p);
+        assert_eq!(p["temperature"], 0.2);
+        assert_eq!(p["top_p"], 0.9);
+        assert_eq!(p["parallel_tool_calls"], true);
+        assert_eq!(p["prompt_cache_key"], "session-1");
+        assert_eq!(p["user"], "u-1");
+        // Privacy defaults still apply.
+        assert_eq!(p["store"], false);
+        assert_eq!(p["stream"], true);
+        assert!(p.get("previous_response_id").is_none());
+    }
 }
