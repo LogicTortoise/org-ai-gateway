@@ -431,43 +431,87 @@ fn collect_text_parts(parts: &[Value]) -> String {
 /// body — which the proxy then faithfully pipes back as `text: ""` and
 /// `output_tokens: 0` to the Codex client. Anything already in the wrapped
 /// shape (rare from Codex, but cheap to handle) passes through.
+///
+/// Codex 0.147 (Desktop / vscode) breaks the simple "flat shape" assumption:
+/// its `tools` array mixes several encodings the upstream Responses spec lets
+/// clients invent:
+///
+///   * `{"type":"function", name, ...}` — the normal Responses flat shape.
+///   * `{"type":"custom", name, ...}` — Codex's `apply_patch` and any future
+///     custom tools use this. The OpenAI wire shape is identical to
+///     `type:"function"`, so we just rewrap with the same `{function:{...}}`
+///     form; the tool `name` stays verbatim and Codex dispatches on it.
+///   * `{"type":"namespace", name, tools:[...]}` — Codex groups tools under a
+///     namespace (e.g. `codex_app` with three nested automation functions,
+///     `image_gen` with its gen function). The upstream Responses protocol
+///     asks clients to dispatch by `namespace + tool name`; the spec doesn't
+///     say "send them flat". We have to flatten these so the OpenAI-style
+///     upstream sees ordinary function entries — otherwise **every** tool
+///     Codex ships under a namespace gets silently dropped here, including
+///     the file-edit tool `apply_patch` when it's nested under a namespace,
+///     which is what made backtest-lab sessions look "frozen at a colon" —
+///     the model literally could not have the edit tool to call.
+///   * `{"type":"web_search" / "tool_search" / "file_search", ...}` — Codex's
+///     built-in server tools. MiniMax has no equivalent, so they stay
+///     dropped (better than a 400).
 pub(crate) fn convert_responses_tools(payload: &Value) -> Option<Vec<Value>> {
     let tools = payload.get("tools").and_then(|v| v.as_array())?;
     let mut out = Vec::with_capacity(tools.len());
     for t in tools {
-        let Some(obj) = t.as_object() else { continue };
-        let ty = obj.get("type").and_then(|v| v.as_str()).unwrap_or("function");
-        if ty != "function" {
-            // We only know how to wrap function tools; non-function tools
-            // (e.g. web_search, file_search) don't translate to MiniMax's
-            // Chat Completions surface — drop silently rather than 400.
-            continue;
-        }
-        if obj.contains_key("function") {
-            // Already wrapped (e.g. a client that speaks Chat Completions).
-            out.push(t.clone());
-            continue;
-        }
-        // Flat Responses-API shape: hoist name/description/parameters/strict
-        // under a `function` key.
-        let mut function = serde_json::Map::new();
-        for k in ["name", "description", "parameters", "strict"] {
-            if let Some(v) = obj.get(k) {
-                function.insert(k.to_string(), v.clone());
-            }
-        }
-        // `name` is the only field MiniMax's tool dispatcher actually requires;
-        // an empty `name` is exactly the "function is empty" symptom we're
-        // guarding against, so skip instead of forwarding a broken entry.
-        if function.get("name").and_then(|v| v.as_str()).map(str::is_empty).unwrap_or(true) {
-            continue;
-        }
-        out.push(json!({
-            "type": "function",
-            "function": Value::Object(function),
-        }));
+        convert_one_responses_tool(t, &mut out);
     }
     if out.is_empty() { None } else { Some(out) }
+}
+
+/// Recursive helper so `type:"namespace"` entries can flatten their nested
+/// `tools[]` through the same rewrap path as the top-level array. Anything
+/// that isn't a rewrappable function (server tools, missing names, malformed
+/// entries) is dropped silently — the OpenAI wire shape won't accept them
+/// and 400ing here would just break every Codex request.
+fn convert_one_responses_tool(t: &Value, out: &mut Vec<Value>) {
+    let Some(obj) = t.as_object() else { return };
+    let ty = obj.get("type").and_then(|v| v.as_str()).unwrap_or("function");
+
+    match ty {
+        // Normal Responses flat shape, OR Codex's `type:"custom"` variant
+        // (same on-wire shape, different tag) — both rewrap the same way.
+        "function" | "custom" => {
+            if obj.contains_key("function") {
+                // Already wrapped (rare from Codex, but cheap to handle).
+                out.push(t.clone());
+                return;
+            }
+            let mut function = serde_json::Map::new();
+            for k in ["name", "description", "parameters", "strict"] {
+                if let Some(v) = obj.get(k) {
+                    function.insert(k.to_string(), v.clone());
+                }
+            }
+            // `name` is the only field MiniMax's tool dispatcher actually requires;
+            // an empty `name` is exactly the "function is empty" symptom we're
+            // guarding against, so skip instead of forwarding a broken entry.
+            if function.get("name").and_then(|v| v.as_str()).map(str::is_empty).unwrap_or(true) {
+                return;
+            }
+            out.push(json!({
+                "type": "function",
+                "function": Value::Object(function),
+            }));
+        }
+        // Codex groups tools under namespaces. The OpenAI Chat Completions
+        // surface has no concept of namespaces — flatten to plain functions.
+        "namespace" => {
+            if let Some(nested) = obj.get("tools").and_then(|v| v.as_array()) {
+                for nt in nested {
+                    convert_one_responses_tool(nt, out);
+                }
+            }
+        }
+        // Codex built-in server tools (`web_search`, `tool_search`,
+        // `file_search`, `image_gen` standalone, etc.) — no MiniMax equivalent,
+        // drop silently rather than 400.
+        _ => {}
+    }
 }
 
 /// Build the OpenAI Chat Completions request body for MiniMax from a Responses
@@ -1010,11 +1054,69 @@ mod tests {
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["function"]["name"], "ok");
 
-        // 4. Non-function tools (web_search, etc.) → dropped silently. The
-        //    Chat Completions surface on these providers has no equivalent.
+        // 4. Codex's `type:"custom"` (e.g. `apply_patch`) rewraps the same way
+        //    as `type:"function"` — same on-wire shape, just a different tag
+        //    the OpenAI Responses spec allows. Without this rewrap the only
+        //    file-edit tool Codex Desktop ships was silently dropped, which
+        //    is exactly what made long-running backtest-lab sessions look
+        //    "frozen at a colon" — the model had no edit tool to call.
+        let with_custom = json!({
+            "tools": [
+                { "type": "function", "name": "kept" },
+                { "type": "custom", "name": "apply_patch",
+                  "description": "Apply a patch to a file",
+                  "parameters": { "type": "object", "properties": { "patch": { "type": "string" } } } }
+            ]
+        });
+        let tools = convert_responses_tools(&with_custom).unwrap();
+        assert_eq!(tools.len(), 2);
+        let names: Vec<&str> = tools.iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"kept"));
+        assert!(names.contains(&"apply_patch"),
+            "apply_patch (type:custom) must rewrap, not drop");
+
+        // 5. Codex groups tools under `type:"namespace"` (codex_app,
+        //    image_gen, …). The Chat Completions surface has no namespaces,
+        //    so flatten — every nested function must survive. Without this,
+        //    backtest-lab lost `apply_patch` AND the three Codex-app
+        //    automation tools every turn.
+        let with_namespace = json!({
+            "tools": [
+                { "type": "function", "name": "exec_command" },
+                { "type": "namespace", "name": "codex_app",
+                  "tools": [
+                      { "type": "function", "name": "automation_update",
+                        "description": "manage automations" },
+                      { "type": "function", "name": "list_automations" }
+                  ] },
+                { "type": "namespace", "name": "image_gen",
+                  "tools": [
+                      { "type": "function", "name": "gen_image",
+                        "description": "generate image" }
+                  ] }
+            ]
+        });
+        let tools = convert_responses_tools(&with_namespace).unwrap();
+        assert_eq!(tools.len(), 4,
+            "exec_command + 2 codex_app + 1 image_gen must all survive");
+        let names: std::collections::HashSet<&str> = tools.iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains("exec_command"));
+        assert!(names.contains("automation_update"));
+        assert!(names.contains("list_automations"));
+        assert!(names.contains("gen_image"));
+
+        // 6. Codex built-in server tools (`web_search`, `tool_search`,
+        //    `image_gen` with no nested entry, `file_search`, …) have no
+        //    MiniMax equivalent — drop silently rather than 400.
         let mixed = json!({
             "tools": [
                 { "type": "web_search" },
+                { "type": "tool_search" },
+                { "type": "file_search" },
                 { "type": "function", "name": "keep" }
             ]
         });
@@ -1022,11 +1124,11 @@ mod tests {
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["function"]["name"], "keep");
 
-        // 5. Empty tools array → None (no `tools` field gets added).
+        // 7. Empty tools array → None (no `tools` field gets added).
         let empty = json!({ "tools": [] });
         assert!(convert_responses_tools(&empty).is_none());
 
-        // 6. Missing `tools` key entirely → None.
+        // 8. Missing `tools` key entirely → None.
         let missing = json!({});
         assert!(convert_responses_tools(&missing).is_none());
     }
