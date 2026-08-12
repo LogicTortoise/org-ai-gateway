@@ -421,22 +421,51 @@ fn collect_text_parts(parts: &[Value]) -> String {
     out.join("\n")
 }
 
-/// Convert a Responses API `tools` array into Chat Completions `tools`. The two
-/// shapes are identical for the only tool type the gateway forwards
-/// (`type: "function"`), so this is a passthrough with the `type` field
-/// normalized — Responses allows omitting `type`, Chat Completions documents it
-/// but accepts its absence on most servers.
+/// Convert a Responses API `tools` array into Chat Completions `tools`. The
+/// Codex CLI (Responses API) emits tools in the **flat** shape
+/// (`{type, name, description, parameters, strict}`); MiniMax's Chat
+/// Completions surface expects the **wrapped** shape
+/// (`{type: "function", function: {name, description, parameters, strict}}`).
+/// We have to rewrap or MiniMax answers `status_code: 2013
+/// "invalid params, function is empty"` and returns an empty `choices:null`
+/// body — which the proxy then faithfully pipes back as `text: ""` and
+/// `output_tokens: 0` to the Codex client. Anything already in the wrapped
+/// shape (rare from Codex, but cheap to handle) passes through.
 pub(crate) fn convert_responses_tools(payload: &Value) -> Option<Vec<Value>> {
     let tools = payload.get("tools").and_then(|v| v.as_array())?;
     let mut out = Vec::with_capacity(tools.len());
     for t in tools {
         let Some(obj) = t.as_object() else { continue };
-        // Pass `function` shaped tools through verbatim. Codex only emits
-        // `type: "function"` tools, so we don't need to translate other
-        // shapes.
-        if obj.get("type").and_then(|v| v.as_str()).unwrap_or("function") == "function" {
-            out.push(t.clone());
+        let ty = obj.get("type").and_then(|v| v.as_str()).unwrap_or("function");
+        if ty != "function" {
+            // We only know how to wrap function tools; non-function tools
+            // (e.g. web_search, file_search) don't translate to MiniMax's
+            // Chat Completions surface — drop silently rather than 400.
+            continue;
         }
+        if obj.contains_key("function") {
+            // Already wrapped (e.g. a client that speaks Chat Completions).
+            out.push(t.clone());
+            continue;
+        }
+        // Flat Responses-API shape: hoist name/description/parameters/strict
+        // under a `function` key.
+        let mut function = serde_json::Map::new();
+        for k in ["name", "description", "parameters", "strict"] {
+            if let Some(v) = obj.get(k) {
+                function.insert(k.to_string(), v.clone());
+            }
+        }
+        // `name` is the only field MiniMax's tool dispatcher actually requires;
+        // an empty `name` is exactly the "function is empty" symptom we're
+        // guarding against, so skip instead of forwarding a broken entry.
+        if function.get("name").and_then(|v| v.as_str()).map(str::is_empty).unwrap_or(true) {
+            continue;
+        }
+        out.push(json!({
+            "type": "function",
+            "function": Value::Object(function),
+        }));
     }
     if out.is_empty() { None } else { Some(out) }
 }
@@ -923,10 +952,83 @@ mod tests {
         assert_eq!(msgs[3]["role"], "tool");
         assert_eq!(msgs[3]["tool_call_id"], "call_abc");
         assert!(msgs[3]["content"].as_str().unwrap().contains("temp"));
-        // And the tool definitions ride through untouched.
+        // And the tool definitions get rewrapped to the Chat Completions shape
+        // (Codex emits flat Responses-API tools; MiniMax / Kimi / GLM /
+        // DeepSeek expect `{type:"function", function:{...}}`).
         let tools = convert_responses_tools(&payload).expect("non-empty tools");
         assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0]["name"], "get_weather");
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["function"]["name"], "get_weather");
+        assert_eq!(tools[0]["function"]["description"], "get weather");
+    }
+
+    #[test]
+    fn responses_tools_rewraps_flat_shape_passes_through_wrapped_shape() {
+        // 1. Flat Responses-API shape (what Codex actually sends) → must be
+        //    rewrapped under `function`.
+        let flat = json!({
+            "tools": [
+                { "type": "function",
+                  "name": "exec_command",
+                  "description": "Runs a shell command",
+                  "parameters": { "type": "object", "properties": { "cmd": { "type": "string" } }, "required": ["cmd"] },
+                  "strict": false }
+            ]
+        });
+        let tools = convert_responses_tools(&flat).unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], "function");
+        assert!(tools[0].get("function").is_some(), "missing function wrapper");
+        assert_eq!(tools[0]["function"]["name"], "exec_command");
+        assert_eq!(tools[0]["function"]["description"], "Runs a shell command");
+        assert_eq!(tools[0]["function"]["strict"], false);
+        assert_eq!(
+            tools[0]["function"]["parameters"]["required"][0],
+            "cmd"
+        );
+
+        // 2. Already-wrapped Chat Completions shape → passes through.
+        let wrapped = json!({
+            "tools": [{
+                "type": "function",
+                "function": { "name": "f", "parameters": {} }
+            }]
+        });
+        let tools = convert_responses_tools(&wrapped).unwrap();
+        assert_eq!(tools[0]["function"]["name"], "f");
+
+        // 3. Entry missing `name` (the literal "function is empty" symptom
+        //    the upstream complains about) → must be dropped, not forwarded
+        //    as a broken tool.
+        let nameless = json!({
+            "tools": [
+                { "type": "function", "name": "", "description": "x" },
+                { "type": "function", "name": "ok", "description": "y" }
+            ]
+        });
+        let tools = convert_responses_tools(&nameless).unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["function"]["name"], "ok");
+
+        // 4. Non-function tools (web_search, etc.) → dropped silently. The
+        //    Chat Completions surface on these providers has no equivalent.
+        let mixed = json!({
+            "tools": [
+                { "type": "web_search" },
+                { "type": "function", "name": "keep" }
+            ]
+        });
+        let tools = convert_responses_tools(&mixed).unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["function"]["name"], "keep");
+
+        // 5. Empty tools array → None (no `tools` field gets added).
+        let empty = json!({ "tools": [] });
+        assert!(convert_responses_tools(&empty).is_none());
+
+        // 6. Missing `tools` key entirely → None.
+        let missing = json!({});
+        assert!(convert_responses_tools(&missing).is_none());
     }
 
     #[test]

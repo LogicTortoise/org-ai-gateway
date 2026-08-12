@@ -394,15 +394,39 @@ fn collect_text_parts(parts: &[Value]) -> String {
     out.join("\n")
 }
 
-/// Pass-through `tools` array with `type: function` entries preserved.
+/// Pass-through `tools` array with `type: function` entries rewrapped to the
+/// Chat Completions shape. Codex (Responses API) emits function tools flat
+/// (`{type, name, description, parameters, strict}`); Chat Completions
+/// expects them wrapped (`{type: "function", function: {name, description,
+/// parameters, strict}}`). Forwarding the flat shape makes DeepSeek's
+/// `/v1/chat/completions` reject the request as `invalid params, function is
+/// empty`. Already-wrapped tools pass through unchanged.
 pub(crate) fn convert_responses_tools(payload: &Value) -> Option<Vec<Value>> {
     let tools = payload.get("tools").and_then(|v| v.as_array())?;
     let mut out = Vec::with_capacity(tools.len());
     for t in tools {
         let Some(obj) = t.as_object() else { continue };
-        if obj.get("type").and_then(|v| v.as_str()).unwrap_or("function") == "function" {
-            out.push(t.clone());
+        let ty = obj.get("type").and_then(|v| v.as_str()).unwrap_or("function");
+        if ty != "function" {
+            continue;
         }
+        if obj.contains_key("function") {
+            out.push(t.clone());
+            continue;
+        }
+        let mut function = serde_json::Map::new();
+        for k in ["name", "description", "parameters", "strict"] {
+            if let Some(v) = obj.get(k) {
+                function.insert(k.to_string(), v.clone());
+            }
+        }
+        if function.get("name").and_then(|v| v.as_str()).map(str::is_empty).unwrap_or(true) {
+            continue;
+        }
+        out.push(json!({
+            "type": "function",
+            "function": Value::Object(function),
+        }));
     }
     if out.is_empty() { None } else { Some(out) }
 }
@@ -888,6 +912,7 @@ mod tests {
         assert_eq!(msgs[3]["tool_call_id"], "call_abc");
         let tools = convert_responses_tools(&payload).expect("non-empty tools");
         assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0]["name"], "summarize");
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["function"]["name"], "summarize");
     }
 }

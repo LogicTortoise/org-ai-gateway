@@ -327,17 +327,44 @@ fn collect_text_parts(parts: &[Value]) -> String {
     out.join("\n")
 }
 
-/// Convert a Responses API `tools` array into Chat Completions `tools`. The two
-/// shapes are identical for the only tool type the gateway forwards
-/// (`type: "function"`), so this is a passthrough.
+/// Convert a Responses API `tools` array into Chat Completions `tools`. Codex
+/// (Responses API) emits function tools in the **flat** shape
+/// (`{type, name, description, parameters, strict}`); Chat Completions
+/// expects the **wrapped** shape
+/// (`{type: "function", function: {name, description, parameters, strict}}`).
+/// Forwarding the flat shape verbatim makes GLM / MiniMax / Kimi / DeepSeek
+/// reject the request as `invalid params, function is empty` and return an
+/// empty `choices:null` body. We rewrap. Anything already in wrapped shape
+/// passes through (rare, but cheap to handle).
 pub(crate) fn convert_responses_tools(payload: &Value) -> Option<Vec<Value>> {
     let tools = payload.get("tools").and_then(|v| v.as_array())?;
     let mut out = Vec::with_capacity(tools.len());
     for t in tools {
         let Some(obj) = t.as_object() else { continue };
-        if obj.get("type").and_then(|v| v.as_str()).unwrap_or("function") == "function" {
-            out.push(t.clone());
+        let ty = obj.get("type").and_then(|v| v.as_str()).unwrap_or("function");
+        if ty != "function" {
+            // Non-function tools (web_search, file_search, ...) have no
+            // Chat Completions equivalent on these surfaces — drop silently
+            // rather than 400 the whole request.
+            continue;
         }
+        if obj.contains_key("function") {
+            out.push(t.clone());
+            continue;
+        }
+        let mut function = serde_json::Map::new();
+        for k in ["name", "description", "parameters", "strict"] {
+            if let Some(v) = obj.get(k) {
+                function.insert(k.to_string(), v.clone());
+            }
+        }
+        if function.get("name").and_then(|v| v.as_str()).map(str::is_empty).unwrap_or(true) {
+            continue;
+        }
+        out.push(json!({
+            "type": "function",
+            "function": Value::Object(function),
+        }));
     }
     if out.is_empty() { None } else { Some(out) }
 }
@@ -726,7 +753,8 @@ mod tests {
 
         let tools = convert_responses_tools(&payload).unwrap();
         assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0]["name"], "get_weather");
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["function"]["name"], "get_weather");
     }
 
     #[test]
