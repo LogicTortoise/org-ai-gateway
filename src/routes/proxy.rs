@@ -2425,10 +2425,25 @@ fn build_error_payload(
     );
     let parsed: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
     let err_obj = parsed.get("error");
+    // Anthropic-style error envelopes wrap the actual type one level deeper:
+    //   {"type":"error","error":{"type":"overloaded_error","message":"..."}}
+    // while OpenAI-style keeps it at the top of `error`:
+    //   {"error":{"type":"overloaded_error","code":"...","message":"..."}}
+    // Fall back to the nested pointer so providers that emit a pure Anthropic
+    // style (e.g. trae sidecar, kimi/moonshot Anthropic compat endpoint) get
+    // the precise type surfaced instead of being flattened to `upstream_error`.
     let etype = err_obj
         .and_then(|e| e.get("type"))
         .and_then(|v| v.as_str())
-        .unwrap_or("upstream_error");
+        .filter(|t| *t != "error") // outer Anthropic envelope marker is not a type
+        .map(str::to_owned)
+        .or_else(|| {
+            parsed
+                .pointer("/error/error/type")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "upstream_error".to_owned());
     let ecode = err_obj
         .and_then(|e| e.get("code"))
         .and_then(|v| v.as_str())
@@ -2552,6 +2567,61 @@ mod tests {
         assert!(parse_openai_error_message("<html>500</html>").is_none());
         assert!(parse_openai_error_message("{}").is_none());
         assert!(parse_openai_error_message("").is_none());
+    }
+
+    #[test]
+    fn build_error_payload_openai_style_keeps_precise_type() {
+        // OpenAI 风格错误包络：真实类型在 `error.type` 顶层，要保留。
+        let body = br#"{"error":{"type":"overloaded_error","code":"capacity","message":"..."}}"#;
+        let (status, payload) = build_error_payload(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "minimax",
+            "acct-1",
+            body,
+        );
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(payload["error"]["type"], "overloaded_error");
+        assert_eq!(payload["error"]["code"], "capacity");
+    }
+
+    #[test]
+    fn build_error_payload_anthropic_style_unwraps_nested_type() {
+        // Anthropic 风格：外层 `type` 永远是 "error"，真实类型在 `error.error.type`。
+        // 之前会被错误归类为 `upstream_error`，现在展开到精确类型。
+        let body = b"{\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"cluster overloaded\"}}";
+        let (status, payload) = build_error_payload(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "kimi",
+            "acct-1",
+            body,
+        );
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(payload["error"]["type"], "overloaded_error");
+    }
+
+    #[test]
+    fn build_error_payload_anthropic_style_rate_limit() {
+        // 同样的兜底对 rate_limit_error 也要生效，否则客户端退避逻辑拿不到精确信号。
+        let body = br#"{"type":"error","error":{"type":"rate_limit_error","message":"5h usage exceeded"}}"#;
+        let (_, payload) = build_error_payload(
+            StatusCode::TOO_MANY_REQUESTS,
+            "minimax",
+            "acct-1",
+            body,
+        );
+        assert_eq!(payload["error"]["type"], "rate_limit_error");
+    }
+
+    #[test]
+    fn build_error_payload_unparseable_body_falls_back() {
+        // 非 JSON body：上 type 兜底到 upstream_error，不应崩。
+        let (_, payload) = build_error_payload(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "glm",
+            "acct-1",
+            b"<html>500</html>",
+        );
+        assert_eq!(payload["error"]["type"], "upstream_error");
     }
 
     #[test]
