@@ -274,6 +274,45 @@ Codex / Claude / Cursor 都在响应头里告诉网关自己用了多少，dashb
 
 ---
 
+## 上游 SSE 错误帧：怎么把"半截流"翻成客户端能 retry 的失败
+
+GLM / Kimi / DeepSeek / MiniMax 这四家在 SSE 流里塞错误有两种形态，都必须由网关**翻译成客户端认识的失败事件**而不是让 stream 默默断掉：
+
+### 形态 A — 内嵌 error chunk
+
+有的 provider（典型是 MiniMax）会把 529 容量溢出包成 HTTP 200 + 流中一个 `{"type":"error","error":{"type":"overloaded_error","message":"..."}}` SSE chunk 然后关连接。不处理的话，OpenAI ↔ Responses 翻译器会跟着流读完、最后 `response.completed` 输出空 `output`，Codex 把它当 no-op turn（`last_agent_message: null`），agent 看起来"卡死"。
+
+### 形态 B — 完全空流
+
+更糟的：provider 返回 HTTP 200 + `content-type: text/event-stream` + 0 SSE chunk 就关连接。翻译器同样走到末尾并合成空 success，行为同上。
+
+### 网关的应对
+
+`src/routes/proxy.rs::stream_openai_to_responses_sse` 在流结束分支统一处理：
+
+- 检测到形态 A → 立刻发一个 `event: response.failed` + 完整 Response object（`status: failed`，`response.error.code = 原 chunk 透传，如 `overloaded_error`），然后 `return Err("upstream_stream_error: <msg> (<code>)")`。
+- 检测到形态 B（流结束但 `accumulated_text / final_tool_calls / usage.input_tokens / usage.output_tokens` 全 0）→ 发同样的 `event: response.failed` + `response.error.code = "overloaded_error"` + message 含 `try again in 30s`，然后 `return Err("upstream_empty_stream")`。
+
+外层 spawn task 把 Err 转成 `status = "upstream_stream_error" / "upstream_empty_stream"` 写 audit，并对该账号 `apply_account_failure(ErrorClass::RateLimit / Transient)` 打退避。
+
+### 为什么 code 用 `overloaded_error`（不是 `server_is_overloaded`）
+
+`event: response.failed` 是 OpenAI Responses API 标准的失败 terminal event（不是 `event: error`）。Codex 0.144 的 `codex-api/src/sse/responses.rs::process_responses_event` 收到后按 `response.error.code` 分流：
+
+| `response.error.code` | Codex 内部 `ApiError` | 行为 |
+|---|---|---|
+| `server_is_overloaded` / `slow_down` | `ApiError::ServerOverloaded` | **不自动 retry**，只 surface |
+| `rate_limit_exceeded` | `ApiError::Retryable { message, delay: 解析 }` | 自动 retry（带 delay） |
+| 其他（含 `overloaded_error`） | `ApiError::Retryable { message, delay: None }` | 自动 retry |
+
+所以空流分支用 `code = "overloaded_error"` + message 含 `try again in 30s`，让 Codex 0.144 触发外层 `client.rs` 的 retry loop，自动发新请求 → 网关的 chain `[minimax, codex]` 在 `select_healthy_account` 看到 minimax 在退避期 → 跳过 → 落到 codex 上游账号。Codex 拿到的就是真 codex 的响应，整个降级对用户透明。
+
+### 同样路径的 provider
+
+`minimax / deepseek / glm / kimi` 都走 `send_*_openai_streaming` + 同一个 `stream_openai_to_responses_sse` 翻译器，**这次的修复对四家全部生效**，不需要按 provider 单独改。
+
+---
+
 ## 相关：模型映射运行时覆盖（`data/provider_models.json`）
 
 上面每个 provider 的 `*_DEFAULT_MODEL` / `*_OPUS_MODEL` / `*_SONNET_MODEL` / `*_FABLE_MODEL` / `*_MODELS` 这类 env，都可以在**运行时**被 `data/provider_models.json` 覆盖，不用改 env、不用重启。这是 WebUI「模型映射」面板保存的东西。

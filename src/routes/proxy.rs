@@ -1636,10 +1636,20 @@ async fn translate_openai_sse_to_responses(
     // would mark the Codex turn as a no-op (`last_agent_message: null`) and
     // the user sees a frozen agent. Surface as a `response.failed` terminal
     // event FIRST (so Codex deserialises it through `process_responses_event`
-    // into a typed `ApiError::Stream` / `Retryable` instead of a raw stream
-    // cut that just says "stream closed before response.completed"), THEN
-    // return Err so the spawn task records the audit row and applies the
-    // matching failure class to the account.
+    // into a typed `ApiError` instead of a raw stream cut that just says
+    // "stream closed before response.completed"), THEN return Err so the
+    // spawn task records the audit row and applies the matching failure class
+    // to the account.
+    //
+    // Codex 0.144's `process_responses_event` dispatches `response.error.code`
+    // into `ApiError` variants; only `ApiError::Retryable` (covers `rate_limit
+    // _exceeded` plus everything not in the dispatch table, including our
+    // `overloaded_error`) drives the outer client.rs retry loop. `ApiError::
+    // ServerOverloaded` (`code = server_is_overloaded`) does NOT auto-retry —
+    // it surfaces once and gives up, forcing the user to manually retry the
+    // turn. We use `overloaded_error` here (matches the wire shape minimax
+    // itself emits when it does emit a chunk) AND embed a "try again in"
+    // hint so the outer retry parses a delay instead of bailing.
     if accumulated_text.is_empty()
         && final_tool_calls.is_empty()
         && final_usage.input_tokens == 0
@@ -1660,8 +1670,8 @@ async fn translate_openai_sse_to_responses(
                     "model": raw_model,
                     "output": [],
                     "error": {
-                        "code": "server_is_overloaded",
-                        "message": "upstream returned an empty stream (no SSE chunks before connection close)",
+                        "code": "overloaded_error",
+                        "message": "upstream returned an empty stream (no SSE chunks before connection close); try again in 30s",
                         "type": "upstream_error",
                     },
                     "usage": null,
@@ -2678,13 +2688,19 @@ mod tests {
         // `response.failed` terminal event BEFORE the connection closed.
         // Otherwise Codex sees a raw stream cut and reports "stream
         // disconnected before completion" instead of a typed upstream error.
+        // `code=overloaded_error` (NOT `server_is_overloaded`) because Codex
+        // 0.144 only auto-retries `ApiError::Retryable`, which covers
+        // `rate_limit_exceeded` plus everything not in the dispatch table
+        // — `overloaded_error` falls into the "anything else" bucket and
+        // triggers the outer client.rs retry loop (so Codex bounces to the
+        // next gateway provider via the chain failover).
         let mut got_failure_event = false;
         while let Some(item) = rx.recv().await {
             let Ok(bytes) = item else { break };
             let s = String::from_utf8_lossy(&bytes);
             if s.contains("event: response.failed")
                 && s.contains("\"status\":\"failed\"")
-                && s.contains("\"code\":\"server_is_overloaded\"")
+                && s.contains("\"code\":\"overloaded_error\"")
             {
                 got_failure_event = true;
                 break;

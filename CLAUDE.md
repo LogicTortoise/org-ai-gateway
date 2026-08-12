@@ -24,9 +24,9 @@
 
 ## 代码地图
 
-- `src/routes/proxy.rs` —— 请求代理执行器：按 chain 依次尝试 provider，处理降级 / 重试 / 审计。
+- `src/routes/proxy.rs` —— 请求代理执行器：按 chain 依次尝试 provider，处理降级 / 重试 / 审计。**OpenAI SSE 翻译器**（`stream_openai_to_responses_sse`）把 Chat Completions 流转 Responses 流，并检测内嵌 error chunk / 完全空流，发 `event: response.failed` 让 Codex 客户端能识别 + 自动 retry（详见 `docs/configuration.md` 里"上游 SSE 错误帧"那一节）。
 - `src/provider/chains.rs` —— 调度链模型（`ChainSlot` / `ChainMode` / `ordered_attempts`）与持久化。
-- `src/pool/mod.rs` —— 账号选择、可见性、共享闸门（share cap / 每日额度 / **owner 保护**）。
+- `src/pool/mod.rs` —— 账号选择、可见性、共享闸门（share cap / 每日额度 / **owner 保护**）。`select_healthy_account` 在 minimax 退避期选不到 minimax → chain failover 自动落到下一个 provider（典型是 codex 上游）。
 - `src/provider/{claude,codex,cursor,glm,kimi,minimax,deepseek,ollama}.rs` —— 各上游实现。
 - `src/quota.rs` —— 按用户 token 预算 / RPM 限流。
 - `src/usage/` —— 用量账本、健康探测、容量预测。
