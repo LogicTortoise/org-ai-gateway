@@ -923,6 +923,43 @@ async fn serve_openai_tool_compat(
             break;
         }
 
+        // Detect the same truncation the SSE translator catches in the
+        // streaming branch (see the matching block above): an upstream 200
+        // with no error field, no text content, and no tool call — but the
+        // model did emit tokens (otherwise this branch would already have
+        // been hit by the `text.is_empty() && error.is_some()` case above).
+        // For a Codex / Claude Code agent, returning a Responses payload
+        // with `output: []` is unusable: the agent sees a successful turn
+        // that produced nothing actionable and silently stops waiting for
+        // the next action. Surface as an upstream transient so the chain
+        // failover can move on (or the client retries).
+        //
+        // We deliberately don't gate this on `usage.output_tokens == 0`:
+        // reasoning models (minimax-M3 etc.) bill their reasoning tokens
+        // into `completion_tokens`, so `output_tokens` is reliably > 0 even
+        // when the model produced nothing the client can act on. The
+        // signal that matters is whether the response payload contains
+        // any actionable items, which is just `text` + `tool_calls`.
+        if text.is_empty() && tool_calls.is_empty() {
+            apply_account_failure(state, &account.id, ErrorClass::Transient, None, None, false).await;
+            info!(
+                "{}_empty_response on {} (usage in={} out={} reason={}); retrying on next account",
+                provider,
+                account.account_label,
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.reasoning_tokens,
+            );
+            last_error = Some((StatusCode::BAD_GATEWAY, json!({
+                "error": format!(
+                    "{} upstream returned a response with no content and no tool call (truncated or reasoning-only); try again in 30s",
+                    provider,
+                ),
+                "provider": provider,
+            })));
+            continue;
+        }
+
         // Success: clear backoff, audit with REAL token usage, render the
         // reply back in the Codex Responses shape so tool calls survive.
         reset_backoff(state, &account.id).await;
