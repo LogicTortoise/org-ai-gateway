@@ -1355,28 +1355,27 @@ async fn translate_openai_sse_to_responses(
 
                 // Edge case: stream ended with an explicit `[DONE]` but the
                 // upstream produced no usable output — no content delta, no
-                // tool call, AND no output tokens billed. Don't fall through
-                // to `response.completed` with `output: []`, which Codex /
-                // Claude Code would treat as a successful no-op turn and the
-                // agent would silently stop waiting for the next action. Treat
-                // it as a truncated response: emit `response.failed` so the
-                // client's retry loop kicks in and the spawn task records the
-                // failure class on the account.
+                // tool call — so the response.completed payload Codex would
+                // see has `output: []`. Codex 0.144 treats that as a no-op
+                // turn (`last_agent_message: null`) and the agent silently
+                // stops waiting for the next action. Surface as a
+                // `response.failed` terminal event FIRST (so Codex
+                // deserialises it through `process_responses_event` into a
+                // typed `ApiError` and the outer client.rs retry loop
+                // kicks in), THEN return Err so the spawn task records the
+                // failure class on the account and the next Codex turn
+                // tries the fallback provider (codex upstream).
                 //
-                // We deliberately do NOT also require `input_tokens == 0`:
-                // `prompt_tokens` is reported as soon as the upstream starts
-                // the stream, so by the time `[DONE]` lands it's almost
-                // always > 0 even when the model produced nothing (e.g.
-                // finish_reason=length after the very first token). The
-                // cheaper-and-more-reliable signal is `output_tokens` — when
-                // the model genuinely emitted content (even pure reasoning),
-                // that's > 0. Reasoning models that stream reasoning without
-                // exposing a message item keep this non-zero too, so they
-                // don't get spuriously flagged.
-                if accumulated_text.is_empty()
-                    && final_tool_calls.is_empty()
-                    && final_usage.output_tokens == 0
-                {
+                // We deliberately ignore the `usage` counters here. Reasoning
+                // models (minimax-M3 etc.) bill their reasoning tokens into
+                // `completion_tokens`, so `output_tokens` is reliably > 0
+                // even when the model produced nothing a Codex agent can act
+                // on — looking at usage would let these truncated
+                // reasoning-only streams slip through. The signal that
+                // matters for the client is whether anything landed in the
+                // `output` array of the eventual response, which is just
+                // `accumulated_text` + `final_tool_calls`.
+                if accumulated_text.is_empty() && final_tool_calls.is_empty() {
                     let _ = send_sse_event(
                         &tx,
                         "response.failed",
@@ -1393,7 +1392,7 @@ async fn translate_openai_sse_to_responses(
                                 "output": [],
                                 "error": {
                                     "code": "overloaded_error",
-                                    "message": "upstream returned an empty stream (stream ended with [DONE] but no content, no tool call, no output tokens); try again in 30s",
+                                    "message": "upstream returned a stream with no content and no tool call (reasoning-only or truncated); try again in 30s",
                                     "type": "upstream_error",
                                 },
                                 "usage": null,
@@ -1683,17 +1682,18 @@ async fn translate_openai_sse_to_responses(
 
     // Stream ended without an explicit `[DONE]` (idle timeout, abrupt close).
     // Still emit the terminal events so a Codex client doesn't hang on
-    // `response.completed`. EXCEPT when we got nothing back — no content, no
-    // tool call, no usage — in which case the upstream silently returned an
-    // empty body (e.g. minimax / deepseek capacity issues that didn't even
-    // emit an error chunk). Emitting `response.completed` with `output: []`
-    // would mark the Codex turn as a no-op (`last_agent_message: null`) and
-    // the user sees a frozen agent. Surface as a `response.failed` terminal
-    // event FIRST (so Codex deserialises it through `process_responses_event`
-    // into a typed `ApiError` instead of a raw stream cut that just says
+    // `response.completed`. EXCEPT when nothing landed in the output array
+    // — no content, no tool call — in which case the upstream silently
+    // returned a truncated stream (minimax / deepseek reasoning-only
+    // responses, capacity cuts that didn't even emit an error chunk).
+    // Emitting `response.completed` with `output: []` would mark the Codex
+    // turn as a no-op (`last_agent_message: null`) and the user sees a
+    // frozen agent. Surface as a `response.failed` terminal event FIRST
+    // (so Codex deserialises it through `process_responses_event` into a
+    // typed `ApiError` instead of a raw stream cut that just says
     // "stream closed before response.completed"), THEN return Err so the
-    // spawn task records the audit row and applies the matching failure class
-    // to the account.
+    // spawn task records the audit row and applies the matching failure
+    // class to the account.
     //
     // Codex 0.144's `process_responses_event` dispatches `response.error.code`
     // into `ApiError` variants; only `ApiError::Retryable` (covers `rate_limit
@@ -1704,10 +1704,15 @@ async fn translate_openai_sse_to_responses(
     // turn. We use `overloaded_error` here (matches the wire shape minimax
     // itself emits when it does emit a chunk) AND embed a "try again in"
     // hint so the outer retry parses a delay instead of bailing.
-    if accumulated_text.is_empty()
-        && final_tool_calls.is_empty()
-        && final_usage.output_tokens == 0
-    {
+    //
+    // The signal we check is just `accumulated_text + final_tool_calls`
+    // — NOT the usage counters. Reasoning models (minimax-M3 etc.) bill
+    // their reasoning tokens into `completion_tokens`, so `output_tokens`
+    // is reliably > 0 even when the model produced nothing a Codex agent
+    // can act on. The client cares about whether anything landed in the
+    // `output` array; that's what `accumulated_text` + `final_tool_calls`
+    // measures.
+    if accumulated_text.is_empty() && final_tool_calls.is_empty() {
         let _ = send_sse_event(
             &tx,
             "response.failed",
@@ -2867,32 +2872,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn translate_treats_pure_reasoning_output_as_success() {
-        // Reasoning-only turn (no message item, no tool_call, but the model
-        // actually emitted reasoning tokens). Must NOT be flagged as empty —
-        // output_tokens > 0 is the signal that the model did real work, even
-        // when nothing surfaces into the response.output array. The audit
-        // row stays `success` and the client gets a normal response.completed.
+    async fn translate_treats_pure_reasoning_output_as_failed_not_success() {
+        // Reasoning-only turn (no message item, no tool_call) used to be
+        // marked `success` and surface to Codex / Claude Code as
+        // `response.completed` with `output: []`. Codex 0.144 treats that
+        // as a no-op turn and the agent silently stops. We now flag it
+        // as upstream_empty_stream so the client's retry loop kicks in
+        // (chain failover can move to the next provider) and the spawn
+        // task records the failure class on the account.
+        //
+        // Trade-off: a model that legitimately does pure reasoning with
+        // no surfaceable output will now trigger a retry on every turn.
+        // That's acceptable — for an agent loop there is no useful state
+        // to take from a `response.completed` with `output: []`, so
+        // surfacing an error is the better behaviour. Pure reasoning is
+        // still a real cost (the audit row records the billed output
+        // tokens) so capacity accounting isn't affected.
         let body = "data: {\"id\":\"cmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"x\",\"choices\":[],\"usage\":{\"prompt_tokens\":500,\"completion_tokens\":150,\"completion_tokens_details\":{\"reasoning_tokens\":150}}}\n\ndata: [DONE]\n\n".to_string();
         let url = spawn_one_shot_sse_server(body).await;
         let client = reqwest::Client::new();
         let upstream = client.get(url).send().await.unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(8);
         let result = translate_openai_sse_to_responses(upstream, "test-model", tx).await;
-        let (text, _tool_calls, usage) = result.expect("reasoning-only turn should succeed");
-        assert_eq!(text, "");
-        assert_eq!(usage.output_tokens, 150);
+        let err = result.expect_err("reasoning-only turn should be flagged as truncated");
+        assert_eq!(err, "upstream_empty_stream");
 
-        let mut got_completed = false;
+        let mut got_failure_event = false;
         while let Some(item) = rx.recv().await {
             let Ok(bytes) = item else { break };
             let s = String::from_utf8_lossy(&bytes);
-            if s.contains("event: response.completed") && s.contains("\"status\":\"completed\"") {
-                got_completed = true;
+            if s.contains("event: response.failed") && s.contains("\"code\":\"overloaded_error\"") {
+                got_failure_event = true;
                 break;
             }
         }
-        assert!(got_completed, "expected response.completed for reasoning-only turn");
+        assert!(got_failure_event, "expected response.failed for reasoning-only turn");
     }
 
     /// Spin up a single-shot HTTP server that returns one SSE chunk and
