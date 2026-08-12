@@ -4,6 +4,8 @@ use crate::auth::identify_caller;
 use crate::pool::select_healthy_account;
 use crate::provider::claude::fetch_claude_models;
 use crate::provider::codex::fetch_codex_models;
+use crate::provider::codex::fetch_codex_models_raw;
+use crate::provider::codex::CODEX_MODEL_TEMPLATE_JSON;
 use crate::provider::cursor::fetch_cursor_models;
 use crate::provider::ollama::fetch_ollama_models;
 use crate::provider::deepseek::deepseek_model_catalog;
@@ -410,28 +412,130 @@ pub(crate) async fn proxy_models_openai(
                 .into_response();
         }
     };
-    let models = match fetch_codex_models(&account).await {
+    let mut models = match fetch_codex_models_raw(&account).await {
         Ok(v) => v,
         Err(e) => {
             return (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response();
         }
     };
-    let data: Vec<Value> = models
-        .into_iter()
-        .map(|m| {
-            json!({
-                "id": m.slug,
-                "object": "model",
-                "created": 0,
-                "owned_by": "org-ai-gateway"
-            })
-        })
-        .collect();
-    (
-        StatusCode::OK,
-        Json(json!({ "object": "list", "data": data })),
-    )
-        .into_response()
+    // Merge the live upstream catalog with the gateway's own advertised
+    // aliases (default: the GPT-5.6 Bedrock-style ids — `gpt-5.6-sol` /
+    // `gpt-5.6-terra` / `gpt-5.6-luna` — that Codex recognises but the Codex
+    // backend's catalog doesn't list). Without this, Codex's `list_models`
+    // refresh silently drops any model the user has set in `config.toml`
+    // that isn't a real Codex-backend id, and surfaces an "unknown model"
+    // warning at startup.
+    for slug in advertised_models() {
+        if models.iter().any(|m| {
+            m.get("slug").and_then(|v| v.as_str()) == Some(slug.as_str())
+        }) {
+            continue;
+        }
+        models.push(synthetic_codex_model(&slug));
+    }
+    (StatusCode::OK, Json(json!({ "models": models }))).into_response()
+}
+
+/// Build a Codex-backend-shaped `ModelInfo` (the rich 30+ field version
+/// defined in Codex's `openai_models.rs`, NOT our thin gateway
+/// `crate::models::ModelInfo`) for a slug the gateway wants to advertise
+/// but that doesn't exist in the upstream Codex backend catalog. Field set
+/// mirrors what the Codex backend returns; `base_instructions` and
+/// `model_messages.instructions_template` are copied verbatim from a real
+/// upstream entry (embedded at compile time from
+/// `src/provider/codex_model_template.json`) because Codex 0.147+ requires
+/// these two fields to be present and non-empty — synthetic slugs that
+/// ship empty values get rejected by the `ModelsClient` decoder and break
+/// the `list_models` refresh path.
+fn synthetic_codex_model(slug: &str) -> Value {
+    let template: Value = serde_json::from_str(CODEX_MODEL_TEMPLATE_JSON)
+        .expect("CODEX_MODEL_TEMPLATE_JSON must be valid JSON (build-time file)");
+    let mut obj = json!({
+        "slug": slug,
+        "display_name": slug,
+        "supported_in_api": true,
+        "supported_reasoning_levels": [],
+        "shell_type": "shell_command",
+        "visibility": "list",
+        "priority": 0,
+        "experimental_supported_tools": [],
+        "include_skills_usage_instructions": false,
+        "include_plugin_usage_instructions": false,
+        "include_apps_usage_instructions": true,
+        "supports_reasoning_summary_parameter": true,
+        "default_reasoning_summary": "auto",
+        "support_verbosity": false,
+        "web_search_tool_type": "text",
+        "truncation_policy": { "mode": "bytes", "limit": 10000 },
+        "supports_parallel_tool_calls": true,
+        "supports_image_detail_original": false
+    });
+    if let Some(root) = obj.as_object_mut() {
+        if let Some(base) = template.get("base_instructions").and_then(|v| v.as_str()) {
+            root.insert("base_instructions".to_string(), Value::String(base.to_string()));
+        }
+        if let Some(mm) = template.get("model_messages").cloned() {
+            root.insert("model_messages".to_string(), mm);
+        }
+    }
+    obj
+}
+
+/// Models the gateway advertises in `/v1/models` on top of whatever the live
+/// upstream OpenAI catalog returns. Defaults to the Bedrock-style GPT-5.6
+/// family that Codex's `model_provider_info` module hard-codes
+/// (`openai.gpt-5.6-sol` / `…-terra` / `…-luna`) — these are valid Codex-side
+/// model ids but not in OpenAI's public catalog, so a passthrough `/v1/models`
+/// would silently drop them and Codex would warn about an unknown model.
+///
+/// Override via `OAG_ADVERTISED_MODELS` (comma-separated). Set to empty string
+/// to disable. Whitespace around entries is trimmed; empty entries are
+/// dropped.
+fn advertised_models() -> Vec<String> {
+    const DEFAULT: &[&str] = &["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"];
+    match std::env::var("OAG_ADVERTISED_MODELS") {
+        Ok(v) if v.trim().is_empty() => Vec::new(),
+        Ok(v) => v
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        Err(_) => DEFAULT.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+#[cfg(test)]
+mod advertised_models_tests {
+    use super::advertised_models;
+    use std::sync::Mutex;
+
+    // Tests stomp on the process env, so serialise them.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn defaults_to_bedrock_gpt_5_6_family() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("OAG_ADVERTISED_MODELS");
+        let m = advertised_models();
+        assert_eq!(m, vec!["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]);
+    }
+
+    #[test]
+    fn override_replaces_default() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("OAG_ADVERTISED_MODELS", "custom-a, custom-b ,");
+        let m = advertised_models();
+        assert_eq!(m, vec!["custom-a", "custom-b"]);
+        std::env::remove_var("OAG_ADVERTISED_MODELS");
+    }
+
+    #[test]
+    fn empty_string_disables() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("OAG_ADVERTISED_MODELS", "");
+        assert!(advertised_models().is_empty());
+        std::env::remove_var("OAG_ADVERTISED_MODELS");
+    }
 }
 
 #[derive(Debug, Serialize)]

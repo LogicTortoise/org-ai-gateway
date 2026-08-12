@@ -154,6 +154,71 @@ pub(crate) async fn fetch_codex_models(account: &UpstreamAccount) -> Result<Vec<
     Ok(out)
 }
 
+/// Same upstream call as `fetch_codex_models` but returns the raw JSON
+/// objects verbatim (no field thinning). Used by the `/v1/models` route
+/// because Codex 0.147+'s `ModelsClient` deserialises the body into
+/// `ModelsResponse { models: Vec<ModelInfo> }` where `ModelInfo` has ~30
+/// required fields — if we send the thin `{slug, display_name}` shape,
+/// every entry fails to decode and `list_models` refresh errors out.
+pub(crate) async fn fetch_codex_models_raw(
+    account: &UpstreamAccount,
+) -> Result<Vec<Value>, String> {
+    let client = codex_http_client();
+    let bearer = account.bearer();
+    if bearer.is_empty() {
+        return Err("codex account has empty access token".to_string());
+    }
+
+    let mut req = client
+        .get("https://chatgpt.com/backend-api/codex/models?client_version=0.125.0")
+        .bearer_auth(bearer)
+        .header("Accept", "application/json");
+    if !account.account_id.trim().is_empty() {
+        req = req.header("ChatGPT-Account-ID", account.account_id.trim());
+    }
+
+    let response = req
+        .send()
+        .await
+        .map_err(|e| format!("failed to fetch codex models: {}", e))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|e| format!("failed to read codex models response body: {}", e))?;
+    if !status.is_success() {
+        return Err(format!(
+            "codex models api error {}: {}",
+            status.as_u16(),
+            truncate_text(&body, 400)
+        ));
+    }
+
+    let value: Value =
+        serde_json::from_str(&body).map_err(|e| format!("invalid codex models response: {}", e))?;
+    let arr = value
+        .get("models")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .ok_or_else(|| "codex models response missing `models` field".to_string())?;
+
+    // Drop entries with `supported_in_api=false` (same filter as the thin
+    // version) so the caller doesn't have to redo it; everything else passes
+    // through with all original fields intact.
+    let out: Vec<Value> = arr
+        .into_iter()
+        .filter(|item| {
+            item.get("supported_in_api")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true)
+        })
+        .collect();
+    if out.is_empty() {
+        return Err("no supported codex models found for this account".to_string());
+    }
+    Ok(out)
+}
+
 
 pub(crate) fn ensure_codex_payload_defaults(payload: &mut Value) {
     if let Some(obj) = payload.as_object_mut() {
@@ -403,6 +468,20 @@ pub(crate) fn codex_bootstrap_payload(
 pub(crate) const CODEX_REFRESH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub(crate) const DEFAULT_CODEX_WS_UPSTREAM_URL: &str =
     "wss://chatgpt.com/backend-api/codex/realtime";
+
+/// Embed-time JSON containing the `base_instructions` and `model_messages`
+/// blocks copied verbatim from a real Codex backend catalog entry. Used by
+/// `routes::models_api::synthetic_codex_model` to populate the two
+/// required-by-presence fields that Codex 0.147+'s `ModelsClient` enforces
+/// on every entry, so slugs we advertise (e.g. the Bedrock-style GPT-5.6
+/// family) decode cleanly without the upstream backend needing to list them.
+///
+/// Source: captured live from
+/// `https://chatgpt.com/backend-api/codex/models` for the `gpt-5.5` slug
+/// during 2026-08 debugging. Regenerate by re-fetching and re-saving the
+/// file if a future Codex version adds new required fields.
+pub(crate) const CODEX_MODEL_TEMPLATE_JSON: &str =
+    include_str!("codex_model_template.json");
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct CodexAuthJson {
