@@ -1353,6 +1353,60 @@ async fn translate_openai_sse_to_responses(
                 )
                 .await?;
 
+                // Edge case: stream ended with an explicit `[DONE]` but the
+                // upstream produced no usable output — no content delta, no
+                // tool call, AND no output tokens billed. Don't fall through
+                // to `response.completed` with `output: []`, which Codex /
+                // Claude Code would treat as a successful no-op turn and the
+                // agent would silently stop waiting for the next action. Treat
+                // it as a truncated response: emit `response.failed` so the
+                // client's retry loop kicks in and the spawn task records the
+                // failure class on the account.
+                //
+                // We deliberately do NOT also require `input_tokens == 0`:
+                // `prompt_tokens` is reported as soon as the upstream starts
+                // the stream, so by the time `[DONE]` lands it's almost
+                // always > 0 even when the model produced nothing (e.g.
+                // finish_reason=length after the very first token). The
+                // cheaper-and-more-reliable signal is `output_tokens` — when
+                // the model genuinely emitted content (even pure reasoning),
+                // that's > 0. Reasoning models that stream reasoning without
+                // exposing a message item keep this non-zero too, so they
+                // don't get spuriously flagged.
+                if accumulated_text.is_empty()
+                    && final_tool_calls.is_empty()
+                    && final_usage.output_tokens == 0
+                {
+                    let _ = send_sse_event(
+                        &tx,
+                        "response.failed",
+                        &json!({
+                            "type": "response.failed",
+                            "sequence_number": 0,
+                            "response": {
+                                "id": response_id,
+                                "object": "response",
+                                "created_at": Utc::now().timestamp(),
+                                "status": "failed",
+                                "background": false,
+                                "model": raw_model,
+                                "output": [],
+                                "error": {
+                                    "code": "overloaded_error",
+                                    "message": "upstream returned an empty stream (stream ended with [DONE] but no content, no tool call, no output tokens); try again in 30s",
+                                    "type": "upstream_error",
+                                },
+                                "usage": null,
+                                "user": null,
+                                "metadata": {},
+                                "incomplete_details": null,
+                            },
+                        }),
+                    )
+                    .await;
+                    return Err("upstream_empty_stream".to_string());
+                }
+
                 let response_obj = json!({
                     "id": response_id,
                     "object": "response",
@@ -1652,7 +1706,6 @@ async fn translate_openai_sse_to_responses(
     // hint so the outer retry parses a delay instead of bailing.
     if accumulated_text.is_empty()
         && final_tool_calls.is_empty()
-        && final_usage.input_tokens == 0
         && final_usage.output_tokens == 0
     {
         let _ = send_sse_event(
@@ -2777,6 +2830,69 @@ mod tests {
             }
         }
         assert!(got_failure_event, "translator did not emit response.failed event before closing");
+    }
+
+    #[tokio::test]
+    async fn translate_returns_err_on_done_with_usage_but_no_content() {
+        // The worst truncation: provider sends a `usage` chunk then `[DONE]`
+        // without any `choices[*].delta.content` or `tool_calls` delta.
+        // Before the fix the empty-output check ALSO required
+        // `input_tokens == 0`, which is almost never true (prompt_tokens
+        // arrives with the first chunk). So the translator fell through
+        // to `response.completed` with `output: []`, the audit row said
+        // `success` with `output_length=0`, and Codex/Claude Code treated
+        // the turn as a no-op — the agent looked frozen even though the
+        // upstream did run inference. Now the check is just
+        // `output_tokens == 0`, so this case surfaces as
+        // `upstream_empty_stream` (and a `response.failed` event).
+        let body = "data: {\"id\":\"cmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"x\",\"choices\":[],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":0}}\n\ndata: [DONE]\n\n".to_string();
+        let url = spawn_one_shot_sse_server(body).await;
+        let client = reqwest::Client::new();
+        let upstream = client.get(url).send().await.unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(8);
+        let result = translate_openai_sse_to_responses(upstream, "test-model", tx).await;
+        let err = result.expect_err("expected Err on [DONE] with 0 output_tokens");
+        assert_eq!(err, "upstream_empty_stream");
+
+        let mut got_failure_event = false;
+        while let Some(item) = rx.recv().await {
+            let Ok(bytes) = item else { break };
+            let s = String::from_utf8_lossy(&bytes);
+            if s.contains("event: response.failed") && s.contains("\"code\":\"overloaded_error\"") {
+                got_failure_event = true;
+                break;
+            }
+        }
+        assert!(got_failure_event, "expected response.failed event");
+    }
+
+    #[tokio::test]
+    async fn translate_treats_pure_reasoning_output_as_success() {
+        // Reasoning-only turn (no message item, no tool_call, but the model
+        // actually emitted reasoning tokens). Must NOT be flagged as empty —
+        // output_tokens > 0 is the signal that the model did real work, even
+        // when nothing surfaces into the response.output array. The audit
+        // row stays `success` and the client gets a normal response.completed.
+        let body = "data: {\"id\":\"cmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"x\",\"choices\":[],\"usage\":{\"prompt_tokens\":500,\"completion_tokens\":150,\"completion_tokens_details\":{\"reasoning_tokens\":150}}}\n\ndata: [DONE]\n\n".to_string();
+        let url = spawn_one_shot_sse_server(body).await;
+        let client = reqwest::Client::new();
+        let upstream = client.get(url).send().await.unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(8);
+        let result = translate_openai_sse_to_responses(upstream, "test-model", tx).await;
+        let (text, _tool_calls, usage) = result.expect("reasoning-only turn should succeed");
+        assert_eq!(text, "");
+        assert_eq!(usage.output_tokens, 150);
+
+        let mut got_completed = false;
+        while let Some(item) = rx.recv().await {
+            let Ok(bytes) = item else { break };
+            let s = String::from_utf8_lossy(&bytes);
+            if s.contains("event: response.completed") && s.contains("\"status\":\"completed\"") {
+                got_completed = true;
+                break;
+            }
+        }
+        assert!(got_completed, "expected response.completed for reasoning-only turn");
     }
 
     /// Spin up a single-shot HTTP server that returns one SSE chunk and
