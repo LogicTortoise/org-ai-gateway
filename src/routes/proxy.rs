@@ -110,7 +110,8 @@ async fn serve_with_chain(
                 // Claude-format traffic → GLM's Anthropic-compatible endpoint as
                 // a raw buffered passthrough (high fidelity, tool calls survive),
                 // served by the native loop. Everything else (Codex / OpenAI
-                // format) → GLM's OpenAI-compatible endpoint via the adapter.
+                // format) → GLM's OpenAI-compatible endpoint via the
+                // Responses↔Chat adapter (also tool-call preserving).
                 if matches!(client_format, CursorFormat::Claude) {
                     serve_native_provider(
                         state.clone(),
@@ -123,14 +124,23 @@ async fn serve_with_chain(
                     )
                     .await
                 } else {
-                    serve_glm(state, client_format, user_id, payload, client_wants_stream, shared_only).await
+                    serve_openai_tool_compat(
+                        state,
+                        "glm",
+                        client_format,
+                        user_id,
+                        payload,
+                        client_wants_stream,
+                        shared_only,
+                    )
+                    .await
                 }
             }
             "kimi" => {
                 // Same split as GLM: Claude-format traffic → Kimi's Anthropic-
                 // compatible endpoint as a raw buffered passthrough (this is the
                 // Claude Code fallback path), everything else → Kimi's OpenAI-
-                // compatible endpoint via the adapter.
+                // compatible endpoint via the Responses↔Chat adapter.
                 if matches!(client_format, CursorFormat::Claude) {
                     serve_native_provider(
                         state.clone(),
@@ -143,7 +153,16 @@ async fn serve_with_chain(
                     )
                     .await
                 } else {
-                    serve_kimi(state, client_format, user_id, payload, client_wants_stream, shared_only).await
+                    serve_openai_tool_compat(
+                        state,
+                        "kimi",
+                        client_format,
+                        user_id,
+                        payload,
+                        client_wants_stream,
+                        shared_only,
+                    )
+                    .await
                 }
             }
             "trae" => {
@@ -186,7 +205,7 @@ async fn serve_with_chain(
                     )
                     .await
                 } else {
-                    serve_minimax_deepseek(
+                    serve_openai_tool_compat(
                         state,
                         provider,
                         client_format,
@@ -687,303 +706,18 @@ async fn serve_ollama(
     }
 }
 
-/// Serve a request via GLM's OpenAI-compatible `/chat/completions` through the
-/// shared format adapter. This is the path for Codex/OpenAI-format traffic (the
-/// Claude-format path is the native Anthropic passthrough in
-/// `serve_native_provider`). Token usage is REAL (parsed from GLM's `usage`),
-/// so audited consumption is exact. Account-swap retry mirrors `serve_ollama`,
-/// but GLM IS metered, so the per-user token-budget quota gate applies.
-async fn serve_glm(
-    state: &AppState,
-    format: CursorFormat,
-    user_id: &str,
-    payload: &Value,
-    client_wants_stream: bool,
-    shared_only: bool,
-) -> ProviderOutcome {
-    use crate::provider::cursor::{build_buffered_body, build_sse_body, estimate_request_tokens, extract_request};
-
-    let owned_only = match crate::quota::enforce_user_quota(state, "glm", user_id, !shared_only).await {
-        Ok(v) => v,
-        Err(resp) => return ProviderOutcome::NextProvider(Some(resp)),
-    };
-
-    let req = match extract_request(payload) {
-        Ok(v) => v,
-        Err(e) => {
-            return ProviderOutcome::NextProvider(Some(
-                (StatusCode::BAD_REQUEST, Json(json!({ "error": e, "provider": "glm" }))).into_response(),
-            ));
-        }
-    };
-
-    let raw_model = payload.get("model").and_then(|v| v.as_str()).unwrap_or("glm");
-    // Direct `glm/<name>` / `glm-*` → that model; a paid model name routed here
-    // by the chain → the configured GLM default model.
-    let upstream_model = if glm::is_glm_model(raw_model) {
-        glm::glm_canonical_model(raw_model)
-    } else {
-        glm::glm_canonical_model("glm")
-    };
-    let request_id = Uuid::new_v4().to_string();
-    let request_json_chars = payload.to_string().chars().count();
-    let estimated_input = estimate_request_tokens(&req);
-    let client = glm::glm_http_client();
-
-    let max_attempts = provider_attempt_budget(state, "glm").await;
-    let mut excluded: HashSet<String> = HashSet::new();
-    let mut selected_any = false;
-    let mut last_error: Option<(StatusCode, Value)> = None;
-
-    for _ in 0..max_attempts {
-        let now = Utc::now();
-        let selected = {
-            let accounts = state.accounts.read().await;
-            let rate_limits = state.rate_limits.read().await;
-            let owner_usage = state.owner_usage.read().await;
-            let mut warm = eligible_accounts(&accounts, "glm", user_id, &excluded, now, true);
-            if owned_only {
-                warm.retain(|a| a.owner_user_id == user_id);
-            }
-            if shared_only {
-                warm.retain(|a| a.share_enabled);
-            }
-            // Only accounts that expose the OpenAI-compatible endpoint can serve
-            // this adapter path.
-            warm.retain(glm::supports_openai);
-            select_account_for_request(&warm, user_id, "glm", &rate_limits, &owner_usage)
-        };
-        let Some(account) = selected else { break };
-        selected_any = true;
-        excluded.insert(account.id.clone());
-        note_account_pick(state, &account.id).await;
-
-        let result = match glm::send_glm_openai(client, &account, &upstream_model, &req).await {
-            Ok(r) => r,
-            Err(err) => {
-                apply_account_failure(state, &account.id, ErrorClass::Transient, None, None, false).await;
-                last_error = Some((StatusCode::BAD_GATEWAY, json!({ "error": err, "provider": "glm" })));
-                continue;
-            }
-        };
-
-        if !result.status.is_success() || (result.text.is_empty() && result.error.is_some()) {
-            let detail = result
-                .error
-                .clone()
-                .unwrap_or_else(|| format!("glm upstream returned {}", result.status));
-            let class = ErrorClass::from_status(result.status.as_u16());
-            apply_account_failure(state, &account.id, class, None, None, false).await;
-            info!(
-                "glm_error_{} on {} ({})",
-                result.status.as_u16(),
-                account.account_label,
-                if class.is_retryable() { "retrying on next account" } else { "final" },
-            );
-            let status = if result.status.is_success() { StatusCode::BAD_GATEWAY } else { result.status };
-            last_error = Some((status, json!({ "error": detail, "provider": "glm" })));
-            if class.is_retryable() {
-                continue;
-            }
-            break;
-        }
-
-        // Success: clear backoff, audit with REAL token usage, render the reply.
-        reset_backoff(state, &account.id).await;
-        let input_tokens = if result.usage.input_tokens > 0 {
-            result.usage.input_tokens as u64
-        } else {
-            estimated_input
-        };
-        write_proxy_audit(
-            state, user_id, &account, "glm", &upstream_model, request_json_chars, result.text.len(),
-            "success", result.usage,
-        )
-        .await;
-
-        if client_wants_stream {
-            let sse = build_sse_body(format, &request_id, raw_model, &result.text, input_tokens);
-            let mut response = Response::new(sse.into());
-            *response.status_mut() = StatusCode::OK;
-            response.headers_mut().insert(
-                CONTENT_TYPE,
-                HeaderValue::from_static("text/event-stream; charset=utf-8"),
-            );
-            return ProviderOutcome::Served(response);
-        }
-        let body = build_buffered_body(format, &request_id, raw_model, &result.text, input_tokens);
-        return ProviderOutcome::Served((StatusCode::OK, Json(body)).into_response());
-    }
-
-    match last_error {
-        Some((status, body)) => ProviderOutcome::NextProvider(Some((status, Json(body)).into_response())),
-        None if !selected_any => ProviderOutcome::NextProvider(None),
-        None => ProviderOutcome::NextProvider(Some(
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({ "error": "all glm accounts exhausted", "provider": "glm" })),
-            )
-                .into_response(),
-        )),
-    }
-}
-
-/// Serve a request via Kimi's OpenAI-compatible `/chat/completions` through the
-/// shared format adapter — the Codex/OpenAI-format twin of the Claude-format
-/// Anthropic passthrough in `serve_native_provider`. A near-mirror of `serve_glm`
-/// (Kimi is structurally identical to GLM): real token usage, account-swap
-/// retry, and the metered per-user token-budget quota gate.
-async fn serve_kimi(
-    state: &AppState,
-    format: CursorFormat,
-    user_id: &str,
-    payload: &Value,
-    client_wants_stream: bool,
-    shared_only: bool,
-) -> ProviderOutcome {
-    use crate::provider::cursor::{build_buffered_body, build_sse_body, estimate_request_tokens, extract_request};
-
-    let owned_only = match crate::quota::enforce_user_quota(state, "kimi", user_id, !shared_only).await {
-        Ok(v) => v,
-        Err(resp) => return ProviderOutcome::NextProvider(Some(resp)),
-    };
-
-    let req = match extract_request(payload) {
-        Ok(v) => v,
-        Err(e) => {
-            return ProviderOutcome::NextProvider(Some(
-                (StatusCode::BAD_REQUEST, Json(json!({ "error": e, "provider": "kimi" }))).into_response(),
-            ));
-        }
-    };
-
-    let raw_model = payload.get("model").and_then(|v| v.as_str()).unwrap_or("kimi");
-    // Direct `kimi/<name>` / `kimi-*` / `moonshot-*` → that model; a paid model
-    // name routed here by the chain → the configured Kimi default model.
-    let upstream_model = if kimi::is_kimi_model(raw_model) {
-        kimi::kimi_canonical_model(raw_model)
-    } else {
-        kimi::kimi_canonical_model("kimi")
-    };
-    let request_id = Uuid::new_v4().to_string();
-    let request_json_chars = payload.to_string().chars().count();
-    let estimated_input = estimate_request_tokens(&req);
-    let client = kimi::kimi_http_client();
-
-    let max_attempts = provider_attempt_budget(state, "kimi").await;
-    let mut excluded: HashSet<String> = HashSet::new();
-    let mut selected_any = false;
-    let mut last_error: Option<(StatusCode, Value)> = None;
-
-    for _ in 0..max_attempts {
-        let now = Utc::now();
-        let selected = {
-            let accounts = state.accounts.read().await;
-            let rate_limits = state.rate_limits.read().await;
-            let owner_usage = state.owner_usage.read().await;
-            let mut warm = eligible_accounts(&accounts, "kimi", user_id, &excluded, now, true);
-            if owned_only {
-                warm.retain(|a| a.owner_user_id == user_id);
-            }
-            if shared_only {
-                warm.retain(|a| a.share_enabled);
-            }
-            // Only accounts that expose the OpenAI-compatible endpoint can serve
-            // this adapter path.
-            warm.retain(kimi::supports_openai);
-            select_account_for_request(&warm, user_id, "kimi", &rate_limits, &owner_usage)
-        };
-        let Some(account) = selected else { break };
-        selected_any = true;
-        excluded.insert(account.id.clone());
-        note_account_pick(state, &account.id).await;
-
-        let result = match kimi::send_kimi_openai(client, &account, &upstream_model, &req).await {
-            Ok(r) => r,
-            Err(err) => {
-                apply_account_failure(state, &account.id, ErrorClass::Transient, None, None, false).await;
-                last_error = Some((StatusCode::BAD_GATEWAY, json!({ "error": err, "provider": "kimi" })));
-                continue;
-            }
-        };
-
-        if !result.status.is_success() || (result.text.is_empty() && result.error.is_some()) {
-            let detail = result
-                .error
-                .clone()
-                .unwrap_or_else(|| format!("kimi upstream returned {}", result.status));
-            let class = ErrorClass::from_status(result.status.as_u16());
-            apply_account_failure(state, &account.id, class, None, None, false).await;
-            info!(
-                "kimi_error_{} on {} ({})",
-                result.status.as_u16(),
-                account.account_label,
-                if class.is_retryable() { "retrying on next account" } else { "final" },
-            );
-            let status = if result.status.is_success() { StatusCode::BAD_GATEWAY } else { result.status };
-            last_error = Some((status, json!({ "error": detail, "provider": "kimi" })));
-            if class.is_retryable() {
-                continue;
-            }
-            break;
-        }
-
-        // Success: clear backoff, audit with REAL token usage, render the reply.
-        reset_backoff(state, &account.id).await;
-        let input_tokens = if result.usage.input_tokens > 0 {
-            result.usage.input_tokens as u64
-        } else {
-            estimated_input
-        };
-        write_proxy_audit(
-            state, user_id, &account, "kimi", &upstream_model, request_json_chars, result.text.len(),
-            "success", result.usage,
-        )
-        .await;
-
-        if client_wants_stream {
-            let sse = build_sse_body(format, &request_id, raw_model, &result.text, input_tokens);
-            let mut response = Response::new(sse.into());
-            *response.status_mut() = StatusCode::OK;
-            response.headers_mut().insert(
-                CONTENT_TYPE,
-                HeaderValue::from_static("text/event-stream; charset=utf-8"),
-            );
-            return ProviderOutcome::Served(response);
-        }
-        let body = build_buffered_body(format, &request_id, raw_model, &result.text, input_tokens);
-        return ProviderOutcome::Served((StatusCode::OK, Json(body)).into_response());
-    }
-
-    match last_error {
-        Some((status, body)) => ProviderOutcome::NextProvider(Some((status, Json(body)).into_response())),
-        None if !selected_any => ProviderOutcome::NextProvider(None),
-        None => ProviderOutcome::NextProvider(Some(
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({ "error": "all kimi accounts exhausted", "provider": "kimi" })),
-            )
-                .into_response(),
-        )),
-    }
-}
-
-/// Serve a request via MiniMax's or DeepSeek's OpenAI-compatible endpoint
-/// through a Responses↔Chat Completions adapter. Distinct from the GLM / Kimi
-/// adapter because it preserves `function_call` round-trips: the upstream
-/// Chat Completions response is rewritten back into a Responses
-/// `output` array (one `message` + N `function_call` blocks), so Codex clients
-/// see real tool calls — not just text. Mirrors `serve_glm` / `serve_kimi`'s
-/// account-swap retry + metered per-user quota gate; differs in (a) bypassing
-/// the shared text-only `extract_request` (we use provider-local converters
-/// that understand `tools` / `function_call` blocks), and (b) model rewriting
-/// at THIS layer instead of inside `send_*_openai` — matches the GLM / Kimi
-/// pattern (each provider's `canonical_model` knows its own tier rewrite).
-///
-/// `provider` must be `"minimax"` or `"deepseek"`. The two share this function
-/// because the loop / rendering / quota / retry shape is identical; the
-/// provider-specific bits are dispatched into the right module below.
-async fn serve_minimax_deepseek(
+/// Serve a request via one of the OpenAI-compatible adapters
+/// (`glm` / `kimi` / `minimax` / `deepseek`) — these all share the same
+/// shape: a provider-local Responses↔Chat Completions adapter that preserves
+/// `function_call` / `function_call_output` round-trips, real token usage
+/// parsed from the upstream `usage` block, and per-provider account-swap retry
+/// with the metered per-user token-budget quota gate. Streaming is real
+/// per-token SSE translation via the shared `stream_openai_to_responses_sse`
+/// helper. The four providers differ only in (a) which `send_*_openai` /
+/// `send_*_openai_streaming` module is called and (b) how the model id is
+/// rewritten before the upstream call — handled by the per-provider `match`
+/// ladders inside.
+async fn serve_openai_tool_compat(
     state: &AppState,
     provider: &str,
     format: CursorFormat,
@@ -992,7 +726,7 @@ async fn serve_minimax_deepseek(
     client_wants_stream: bool,
     shared_only: bool,
 ) -> ProviderOutcome {
-    debug_assert!(matches!(provider, "minimax" | "deepseek"));
+    debug_assert!(matches!(provider, "glm" | "kimi" | "minimax" | "deepseek"));
     // Only the Codex / Responses path is wired through the OpenAI surface.
     // Chat Completions format never reaches here (the `/v1/chat/completions`
     // entrypoint rejects non-cursor / non-ollama models with 400); Claude
@@ -1009,10 +743,14 @@ async fn serve_minimax_deepseek(
     };
 
     let raw_model = payload.get("model").and_then(|v| v.as_str()).unwrap_or(provider);
-    // Model rewriting per provider: minimax fixes case + maps claude tiers,
-    // deepseek maps Anthropic tier names. The OpenAI path sends this id
-    // verbatim to the upstream — the converters don't touch `model`.
+    // Model rewriting per provider: each provider's `canonical_model` knows
+    // its own tier rewrite (GLM / Kimi fall back to a single built-in id,
+    // minimax fixes case + maps claude tiers, deepseek maps Anthropic tier
+    // names). The OpenAI path sends this id verbatim to the upstream — the
+    // converters don't touch `model`.
     let upstream_model = match provider {
+        "glm" => glm::glm_canonical_model(raw_model),
+        "kimi" => kimi::kimi_canonical_model(raw_model),
         "minimax" => minimax::minimax_canonical_model(raw_model),
         "deepseek" => deepseek_openai_model_for(raw_model),
         _ => raw_model.to_string(),
@@ -1038,9 +776,11 @@ async fn serve_minimax_deepseek(
                 warm.retain(|a| a.share_enabled);
             }
             // Only accounts that expose the OpenAI-compatible endpoint can
-            // serve this adapter path — same filter the GLM / Kimi adapter
-            // uses for the same reason.
+            // serve this adapter path — same filter every provider's
+            // adapter uses for the same reason.
             match provider {
+                "glm" => warm.retain(glm::supports_openai),
+                "kimi" => warm.retain(kimi::supports_openai),
                 "minimax" => warm.retain(minimax::supports_openai),
                 "deepseek" => warm.retain(deepseek::supports_openai),
                 _ => {}
@@ -1056,6 +796,24 @@ async fn serve_minimax_deepseek(
         // accepts the ORIGINAL payload (no `extract_request` rewriting) and
         // returns parsed text + tool_calls + real usage.
         let send_outcome = match provider {
+            "glm" => glm::send_glm_openai(&account, &upstream_model, payload)
+                .await
+                .map(|r| (
+                    r.status,
+                    r.text,
+                    r.error,
+                    r.usage,
+                    r.tool_calls.into_iter().map(glm_tool_to_common).collect::<Vec<_>>(),
+                )),
+            "kimi" => kimi::send_kimi_openai(&account, &upstream_model, payload)
+                .await
+                .map(|r| (
+                    r.status,
+                    r.text,
+                    r.error,
+                    r.usage,
+                    r.tool_calls.into_iter().map(kimi_tool_to_common).collect::<Vec<_>>(),
+                )),
             "minimax" => minimax::send_minimax_openai(&account, &upstream_model, payload)
                 .await
                 .map(|r| (
@@ -1137,6 +895,12 @@ async fn serve_minimax_deepseek(
             // written by the spawned task once translation completes (or
             // fails); this path bypasses the aggregated JSON body entirely.
             let send_stream_outcome = match provider {
+                "glm" => {
+                    glm::send_glm_openai_streaming(&account, &upstream_model, payload).await
+                }
+                "kimi" => {
+                    kimi::send_kimi_openai_streaming(&account, &upstream_model, payload).await
+                }
                 "minimax" => {
                     minimax::send_minimax_openai_streaming(&account, &upstream_model, payload).await
                 }
@@ -1271,6 +1035,14 @@ fn deepseek_tool_to_common(t: deepseek::DeepseekToolCall) -> CommonToolCall {
     CommonToolCall { id: t.id, name: t.name, arguments: t.arguments }
 }
 
+fn glm_tool_to_common(t: glm::GlmToolCall) -> CommonToolCall {
+    CommonToolCall { id: t.id, name: t.name, arguments: t.arguments }
+}
+
+fn kimi_tool_to_common(t: kimi::KimiToolCall) -> CommonToolCall {
+    CommonToolCall { id: t.id, name: t.name, arguments: t.arguments }
+}
+
 /// Build the `output` array of a Responses-shaped response: one assistant
 /// `message` block carrying any text, then one `function_call` block per
 /// parsed tool call. Empty input gets a synthesized placeholder so the array
@@ -1339,7 +1111,7 @@ async fn stream_openai_to_responses_sse(
 
     // Move everything the spawned task needs (state, account, identity) into
     // the closure — `upstream` is consumed by the translator and can no
-    // longer be borrowed by `serve_minimax_deepseek`'s loop.
+    // longer be borrowed by `serve_openai_tool_compat`'s loop.
     let provider_for_task = provider.clone();
     let raw_model_for_task = raw_model.clone();
     let user_id_for_task = user_id.clone();

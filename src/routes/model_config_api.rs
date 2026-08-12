@@ -389,10 +389,9 @@ async fn dispatch_test_request(
     match provider {
         "glm" => {
             let r = crate::provider::glm::send_glm_openai(
-                crate::provider::glm::glm_http_client(),
                 account,
                 model_id,
-                &req,
+                body,
             )
             .await?;
             Ok(TestUpstream {
@@ -403,10 +402,9 @@ async fn dispatch_test_request(
         }
         "kimi" => {
             let r = crate::provider::kimi::send_kimi_openai(
-                crate::provider::kimi::kimi_http_client(),
                 account,
                 model_id,
-                &req,
+                body,
             )
             .await?;
             Ok(TestUpstream {

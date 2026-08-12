@@ -8,12 +8,15 @@
 //!      returns them verbatim — tool calls survive. No Claude Code fingerprint is
 //!      injected (Kimi is not Anthropic). This is the path used when Kimi serves
 //!      as a fallback for Claude Code.
-//!   2. Codex-format traffic (`/v1/responses`): Kimi has no Responses API, so the
-//!      request is normalized through the shared format adapter
-//!      (`provider::cursor::{extract_request, build_*_body}`) onto Kimi's
-//!      OpenAI-compatible `{base_url}/chat/completions`, then re-rendered in the
-//!      client's format. Buffered text only (no tool round-trips), same tradeoff
-//!      as the ollama path.
+//!   2. Codex-format traffic (`/v1/responses`): Kimi has no Responses API, so
+//!      the request is normalized onto Kimi's OpenAI-compatible
+//!      `{base_url}/chat/completions` via a local Responses↔Chat Completions
+//!      adapter (`convert_responses_to_chat_messages` + `convert_responses_tools`),
+//!      then re-rendered in the client's format. The adapter preserves
+//!      `function_call` / `function_call_output` blocks — tool calls round-trip,
+//!      same as minimax / DeepSeek / GLM. Streaming is real per-token SSE
+//!      translation through the shared `translate_openai_sse_to_responses` in
+//!      `routes::proxy`.
 //!
 //! Unlike GLM (whose base URLs vary by tenant — bigmodel.cn vs z.ai), Kimi's
 //! endpoints are well-known and fixed, so the base URLs DEFAULT to Moonshot's
@@ -28,7 +31,6 @@
 //! Token counts are REAL here (both endpoints return usage objects), so audited
 //! usage is exact — see `usage::tokens::parse_usage("kimi", ...)`.
 use crate::prelude::*;
-use crate::provider::cursor::ExtractedRequest;
 use crate::util::truncate_text;
 
 /// Built-in default Kimi model, used when neither the runtime override nor
@@ -201,31 +203,192 @@ pub(crate) struct KimiResult {
     /// Real token usage parsed from the response (`usage.prompt_tokens` /
     /// `usage.completion_tokens`); zero when the upstream omitted them.
     pub(crate) usage: TokenUsage,
+    /// Parsed `tool_calls` from the upstream `choices[0].message.tool_calls`
+    /// array (each entry's `id` / `function.name` / `function.arguments`).
+    pub(crate) tool_calls: Vec<KimiToolCall>,
 }
 
-/// Build the `messages` array `/chat/completions` expects from the normalized
-/// request: the (joined) system instruction first, then the conversation turns.
-fn build_messages(req: &ExtractedRequest) -> Vec<Value> {
+/// A single Chat-Completions-shaped tool call from Kimi.
+#[derive(Debug, Clone)]
+pub(crate) struct KimiToolCall {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    /// The raw `function.arguments` string from the upstream. It's already
+    /// JSON-shaped, so we pass it through to the client without re-parsing.
+    pub(crate) arguments: String,
+}
+
+/// Build the Chat Completions `messages` array from a Responses API payload.
+///
+/// Walks the `input` array, converting each block:
+///
+///   * `type: "message"`        -> `role: user|assistant|system|developer` with
+///                                 text content (concatenated from all
+///                                 `input_text`/`output_text` parts; non-text
+///                                 parts like `input_image` are skipped — Kimi
+///                                 is text-only on most models).
+///   * `type: "function_call"`  -> `role: assistant` with a synthetic
+///                                 `tool_calls` entry (id / name / arguments).
+///   * `type: "function_call_output"` -> `role: tool` with `tool_call_id` set
+///                                 and `content` carrying the tool output.
+///
+/// `instructions` (top-level) and any `system` / `developer` messages inside
+/// `input` become a leading `role: system` message.
+pub(crate) fn convert_responses_to_chat_messages(payload: &Value) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
-    if !req.instruction.trim().is_empty() {
-        out.push(json!({ "role": "system", "content": req.instruction }));
+
+    // 1. Top-level `instructions` (Responses API) -> system message.
+    let mut sys_buf = String::new();
+    if let Some(s) = payload.get("instructions").and_then(|v| v.as_str()) {
+        if !s.trim().is_empty() {
+            sys_buf.push_str(s);
+        }
     }
-    for turn in &req.turns {
-        // ChatTurn.role: 1 = user, 2 = assistant (the shared extractor's encoding).
-        let role = if turn.role == 2 { "assistant" } else { "user" };
-        out.push(json!({ "role": role, "content": turn.content }));
+
+    // 2. Walk `input`.
+    if let Some(items) = payload.get("input").and_then(|v| v.as_array()) {
+        for item in items {
+            let Some(it) = item.as_object() else { continue };
+            let t = it.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+            match t {
+                "message" => {
+                    let role = it.get("role").and_then(|v| v.as_str()).unwrap_or("user");
+                    let content = match it.get("content") {
+                        Some(Value::String(s)) => s.clone(),
+                        Some(Value::Array(parts)) => collect_text_parts(parts),
+                        _ => String::new(),
+                    };
+                    match role {
+                        "system" | "developer" => {
+                            if !sys_buf.is_empty() {
+                                sys_buf.push('\n');
+                            }
+                            sys_buf.push_str(&content);
+                        }
+                        "assistant" => {
+                            out.push(json!({ "role": "assistant", "content": content }));
+                        }
+                        _ => {
+                            // Default + "user" + unknown: treat as user. Codex
+                            // doesn't emit "tool" messages via `input` — those
+                            // come through as `function_call_output`.
+                            out.push(json!({ "role": "user", "content": content }));
+                        }
+                    }
+                }
+                "function_call" => {
+                    let id = it
+                        .get("call_id")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| it.get("id").and_then(|v| v.as_str()))
+                        .unwrap_or("")
+                        .to_string();
+                    let name = it.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let arguments = match it.get("arguments") {
+                        Some(Value::String(s)) => s.clone(),
+                        Some(other) => other.to_string(),
+                        None => String::new(),
+                    };
+                    out.push(json!({
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{
+                            "id": id,
+                            "type": "function",
+                            "function": { "name": name, "arguments": arguments }
+                        }]
+                    }));
+                }
+                "function_call_output" => {
+                    let call_id = it.get("call_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let output = it.get("output").map(|v| {
+                        if let Value::String(s) = v {
+                            s.clone()
+                        } else {
+                            v.to_string()
+                        }
+                    }).unwrap_or_default();
+                    out.push(json!({
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": output
+                    }));
+                }
+                _ => {
+                    // Unknown / unsupported block types (`reasoning`,
+                    // `web_search_call`, `file_search_call`, `computer_call`,
+                    // ...): skip silently.
+                }
+            }
+        }
+    }
+
+    if !sys_buf.is_empty() {
+        out.insert(0, json!({ "role": "system", "content": sys_buf }));
     }
     out
 }
 
+/// Concatenate text from an OpenAI / Responses content-part array, ignoring
+/// non-text parts (images, etc.).
+fn collect_text_parts(parts: &[Value]) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    for p in parts {
+        let Some(part) = p.as_object() else { continue };
+        if let Some(t) = part.get("type").and_then(|v| v.as_str()) {
+            if !matches!(t, "text" | "input_text" | "output_text") {
+                continue;
+            }
+        }
+        if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+            if !text.is_empty() {
+                out.push(text);
+            }
+        }
+    }
+    out.join("\n")
+}
+
+/// Convert a Responses API `tools` array into Chat Completions `tools`. The two
+/// shapes are identical for the only tool type the gateway forwards
+/// (`type: "function"`), so this is a passthrough.
+pub(crate) fn convert_responses_tools(payload: &Value) -> Option<Vec<Value>> {
+    let tools = payload.get("tools").and_then(|v| v.as_array())?;
+    let mut out = Vec::with_capacity(tools.len());
+    for t in tools {
+        let Some(obj) = t.as_object() else { continue };
+        if obj.get("type").and_then(|v| v.as_str()).unwrap_or("function") == "function" {
+            out.push(t.clone());
+        }
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
+/// Build the OpenAI Chat Completions request body for Kimi from a Responses
+/// API payload. Always `stream: false` — the buffered caller overrides to
+/// `true` itself when streaming.
+fn build_kimi_openai_body(model: &str, payload: &Value) -> Value {
+    let mut body = json!({
+        "model": model,
+        "messages": convert_responses_to_chat_messages(payload),
+        "stream": false,
+    });
+    if let Some(tools) = convert_responses_tools(payload) {
+        body["tools"] = json!(tools);
+        if let Some(tc) = payload.get("tool_choice") {
+            body["tool_choice"] = tc.clone();
+        }
+    }
+    body
+}
+
 /// Send one chat request to Kimi's OpenAI-compatible `/chat/completions` and
-/// return the assistant text plus real token usage. Always non-streaming — the
-/// gateway buffers the whole reply and re-renders it in the client's format.
+/// return the assistant text + parsed tool_calls + real token usage.
 pub(crate) async fn send_kimi_openai(
-    client: &reqwest::Client,
     account: &UpstreamAccount,
     model: &str,
-    req: &ExtractedRequest,
+    payload: &Value,
 ) -> Result<KimiResult, String> {
     let base = kimi_openai_base(account);
     if base.is_empty() {
@@ -235,14 +398,11 @@ pub(crate) async fn send_kimi_openai(
     if api_key.is_empty() {
         return Err("kimi account has empty api key".to_string());
     }
-    let url = format!("{}/chat/completions", base);
-    let body = json!({
-        "model": model,
-        "messages": build_messages(req),
-        "stream": false,
-    });
 
-    let resp = client
+    let url = format!("{}/chat/completions", base);
+    let body = build_kimi_openai_body(model, payload);
+
+    let resp = kimi_http_client()
         .post(&url)
         .bearer_auth(api_key)
         .header(CONTENT_TYPE, "application/json")
@@ -257,36 +417,110 @@ pub(crate) async fn send_kimi_openai(
         .map_err(|e| format!("reading kimi upstream body failed: {}", e))?;
 
     if !status.is_success() {
-        let detail = parse_error_message(&text_body)
+        let detail = parse_kimi_error_message(&text_body)
             .unwrap_or_else(|| format!("kimi upstream returned {}", status));
-        return Ok(KimiResult { text: String::new(), status, error: Some(detail), usage: TokenUsage::default() });
+        return Ok(KimiResult {
+            text: String::new(),
+            status,
+            error: Some(detail),
+            usage: TokenUsage::default(),
+            tool_calls: Vec::new(),
+        });
     }
 
     let value: Value = serde_json::from_str(&text_body)
         .map_err(|e| format!("invalid kimi response JSON: {}", e))?;
-    if let Some(err) = parse_error_message(&text_body) {
+    if let Some(err) = parse_kimi_error_message(&text_body) {
         if value.pointer("/choices/0/message").is_none() {
-            return Ok(KimiResult { text: String::new(), status, error: Some(err), usage: TokenUsage::default() });
+            return Ok(KimiResult {
+                text: String::new(),
+                status,
+                error: Some(err),
+                usage: TokenUsage::default(),
+                tool_calls: Vec::new(),
+            });
         }
     }
 
-    let content = value
-        .pointer("/choices/0/message/content")
+    let message = value.pointer("/choices/0/message");
+    let content = message
+        .and_then(|m| m.get("content"))
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    let tool_calls = parse_kimi_tool_calls(message);
+
     Ok(KimiResult {
         text: content,
         status,
         error: None,
         usage: crate::usage::tokens::parse_usage("kimi", &text_body),
+        tool_calls,
     })
 }
 
-/// Pull a human-readable error out of a Kimi error body. Moonshot follows the
-/// OpenAI shape (`{"error":{"message":"..."}}`) but also tolerates a bare
-/// `{"error":"..."}`.
-fn parse_error_message(body: &str) -> Option<String> {
+/// Streaming sibling of `send_kimi_openai`: forces `stream: true` on the wire
+/// and returns the upstream `reqwest::Response` so the caller can read the
+/// SSE chunks and translate them event-by-event.
+pub(crate) async fn send_kimi_openai_streaming(
+    account: &UpstreamAccount,
+    model: &str,
+    payload: &Value,
+) -> Result<reqwest::Response, String> {
+    let base = kimi_openai_base(account);
+    if base.is_empty() {
+        return Err("kimi account has no OpenAI-compatible base_url".to_string());
+    }
+    let api_key = account.bearer();
+    if api_key.is_empty() {
+        return Err("kimi account has empty api key".to_string());
+    }
+    let url = format!("{}/chat/completions", base);
+    let mut body = build_kimi_openai_body(model, payload);
+    body["stream"] = json!(true);
+    kimi_http_client()
+        .post(&url)
+        .bearer_auth(api_key)
+        .header("Accept", "text/event-stream")
+        .header(CONTENT_TYPE, "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("kimi streaming request failed ({}): {}", url, e))
+}
+
+/// Extract `tool_calls` from a Chat Completions response's `choices[0].message`.
+/// Each upstream entry carries `id` / `function.name` / `function.arguments`
+/// (the arguments are a JSON string, kept verbatim).
+fn parse_kimi_tool_calls(message: Option<&Value>) -> Vec<KimiToolCall> {
+    let Some(arr) = message.and_then(|m| m.get("tool_calls")).and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for tc in arr {
+        let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let name = tc
+            .pointer("/function/name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let arguments = tc
+            .pointer("/function/arguments")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if id.is_empty() && name.is_empty() && arguments.is_empty() {
+            continue;
+        }
+        out.push(KimiToolCall { id, name, arguments });
+    }
+    out
+}
+
+/// Moonshot follows the OpenAI error shape (`{"error":{"message":"..."}}`) but
+/// also tolerates a bare `{"error":"..."}`. `pub(crate)` so the proxy layer
+/// can parse the same shape on the streaming path's non-success reads.
+pub(crate) fn parse_kimi_error_message(body: &str) -> Option<String> {
     let v: Value = serde_json::from_str(body).ok()?;
     let err = v.get("error")?;
     if let Some(s) = err.as_str() {
@@ -434,7 +668,7 @@ pub(crate) async fn probe_kimi(account: &UpstreamAccount) -> Result<(), String> 
         return Err(format!("Kimi 鉴权失败 ({}): {}", status.as_u16(), truncate_text(&body, 200)));
     }
     if !status.is_success() {
-        if let Some(msg) = parse_error_message(&body) {
+        if let Some(msg) = parse_kimi_error_message(&body) {
             // A model/quota error still proves the endpoint+key are valid.
             let lower = msg.to_ascii_lowercase();
             if lower.contains("auth") || lower.contains("api key") || lower.contains("apikey") {
@@ -471,5 +705,98 @@ mod tests {
         let cat = kimi_model_catalog();
         assert_eq!(cat[0].slug, "kimi");
         assert!(cat.iter().any(|m| m.slug == "kimi/kimi-k2-0711-preview"));
+    }
+
+    #[test]
+    fn responses_to_chat_messages_preserves_tool_calls() {
+        let payload = json!({
+            "instructions": "Help with tools.",
+            "input": [
+                { "type": "message", "role": "user", "content": [
+                    { "type": "input_text", "text": "look up foo" }
+                ] },
+                { "type": "function_call", "call_id": "call_2", "name": "lookup",
+                  "arguments": "{\"q\":\"foo\"}" },
+                { "type": "function_call_output", "call_id": "call_2",
+                  "output": "bar" },
+                { "type": "message", "role": "assistant", "content": [
+                    { "type": "output_text", "text": "found: bar" }
+                ] },
+            ],
+            "tools": [
+                { "type": "function", "name": "lookup",
+                  "parameters": { "type": "object" } }
+            ],
+        });
+        let msgs = convert_responses_to_chat_messages(&payload);
+        // 5 entries: system + user + assistant(tool_calls) + tool + assistant(text).
+        // Mirrors the GLM-side test — the trailing `assistant` message is
+        // kept as its own entry rather than merged into the prior
+        // assistant(tool_calls) message.
+        assert_eq!(msgs.len(), 5);
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[1]["role"], "user");
+        assert_eq!(msgs[2]["role"], "assistant");
+        assert_eq!(msgs[2]["tool_calls"][0]["id"], "call_2");
+        assert_eq!(msgs[2]["tool_calls"][0]["function"]["name"], "lookup");
+        assert_eq!(msgs[3]["role"], "tool");
+        assert_eq!(msgs[3]["tool_call_id"], "call_2");
+        assert_eq!(msgs[4]["role"], "assistant");
+        assert!(msgs[4]["content"].as_str().unwrap().contains("found"));
+
+        let tools = convert_responses_tools(&payload).unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "lookup");
+    }
+
+    #[test]
+    fn responses_to_chat_messages_drops_image_and_unknown_blocks() {
+        let payload = json!({
+            "input": [
+                { "type": "message", "role": "user", "content": [
+                    { "type": "input_text", "text": "describe" },
+                    { "type": "input_image", "image_url": "https://..." },
+                ] },
+                { "type": "reasoning", "summary": "thinking" },
+            ],
+        });
+        let msgs = convert_responses_to_chat_messages(&payload);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[0]["content"], "describe");
+    }
+
+    #[test]
+    fn parse_kimi_tool_calls_extracts_function_entries() {
+        let body = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [
+                        { "id": "call_a", "type": "function",
+                          "function": { "name": "f1", "arguments": "{}" } },
+                    ]
+                }
+            }]
+        });
+        let msg = body.pointer("/choices/0/message").unwrap();
+        let tcs = parse_kimi_tool_calls(Some(msg));
+        assert_eq!(tcs.len(), 1);
+        assert_eq!(tcs[0].id, "call_a");
+        assert_eq!(tcs[0].name, "f1");
+    }
+
+    #[test]
+    fn parse_kimi_error_message_nested_and_flat() {
+        assert_eq!(
+            parse_kimi_error_message(r#"{"error":{"message":"insufficient balance"}}"#).as_deref(),
+            Some("insufficient balance")
+        );
+        assert_eq!(
+            parse_kimi_error_message(r#"{"error":"key invalid"}"#).as_deref(),
+            Some("key invalid")
+        );
+        assert!(parse_kimi_error_message("<html>500</html>").is_none());
     }
 }
