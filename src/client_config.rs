@@ -26,7 +26,21 @@ pub(crate) const GATEWAY_PROVIDER_KEY: &str = "org-ai-gateway";
 /// `auth.json` if the env var is unset. `unset OAG_BEARER` therefore reverts
 /// to the original behavior (minus the base_url rewrite — the UI's "恢复"
 /// button is the proper way to fully revert).
-pub(crate) fn merge_gateway_into_config(existing: &str, base_url: &str) -> Result<String, String> {
+///
+/// `experimental_bearer_token` is set in **parallel** so the button is truly
+/// one-click: the caller's `Authorization: Bearer …` (typically their `oag_…`
+/// API key, or a `user:<id>` self-statement for the local owner) gets embedded
+/// straight into `config.toml`. Codex's `bearer_auth_for_provider` checks
+/// `env_key` first, then `experimental_bearer_token`, then `auth.json` — so if
+/// the user later exports `OAG_BEARER=…` with a different token, the env var
+/// wins and the embedded one is silently ignored. The UI's "恢复" button is
+/// the proper revert path; `unset OAG_BEARER` only re-disables the env_key
+/// override.
+pub(crate) fn merge_gateway_into_config(
+    existing: &str,
+    base_url: &str,
+    bearer_token: &str,
+) -> Result<String, String> {
     use toml_edit::{value, DocumentMut, Item, Table};
 
     let mut doc: DocumentMut = existing
@@ -49,6 +63,7 @@ pub(crate) fn merge_gateway_into_config(existing: &str, base_url: &str) -> Resul
     provider["wire_api"] = value("responses");
     provider["requires_openai_auth"] = value(true);
     provider["env_key"] = value("OAG_BEARER");
+    provider["experimental_bearer_token"] = value(bearer_token);
     providers[GATEWAY_PROVIDER_KEY] = Item::Table(provider);
 
     Ok(doc.to_string())

@@ -26,8 +26,11 @@
 //!
 //! An "account" carries:
 //!   * `base_url` — OpenAI-compatible prefix; defaults to `MINIMAX_BASE_URL` env,
-//!     else `https://api.minimaxi.com/v1`. `/v1/text/chatcompletion_v2` is appended.
-//!     Override to `https://api.minimax.io/v1` for the international site.
+//!     else `https://api.minimaxi.com`. `/v1/text/chatcompletion_v2` is appended.
+//!     Override to `https://api.minimax.io` for the international site. The
+//!     base URL must NOT include `/v1` — `MINIMAX_OPENAI_PATH` already carries
+//!     that prefix, so a base ending in `/v1` produces a doubled `/v1/v1/...`
+//!     and a 404.
 //!   * `base_url_alt` — Anthropic-compatible prefix; defaults to
 //!     `MINIMAX_ANTHROPIC_BASE_URL` env, else `https://api.minimaxi.com/anthropic`.
 //!     `/v1/messages` is appended.
@@ -71,9 +74,14 @@ fn spec() -> &'static crate::provider::model_config::ProviderModelSpec {
 
 /// Built-in MiniMax OpenAI-compatible endpoint (mainland site). Used when
 /// neither the account nor `MINIMAX_BASE_URL` supplies one, so connecting only
-/// needs an api key. Override to `https://api.minimax.io/v1` for the
+/// needs an api key. Override to `https://api.minimax.io` for the
 /// international site via `MINIMAX_BASE_URL` (or per-account `base_url`).
-const BUILTIN_OPENAI_BASE: &str = "https://api.minimaxi.com/v1";
+///
+/// The base URL must end at the host (or its namespace prefix like
+/// `/anthropic` for the Anthropic surface) — it must NOT include `/v1`.
+/// `MINIMAX_OPENAI_PATH` carries the `/v1/...` segment, so a base ending in
+/// `/v1` produces a doubled `/v1/v1/text/chatcompletion_v2` and a 404.
+const BUILTIN_OPENAI_BASE: &str = "https://api.minimaxi.com";
 
 /// Built-in MiniMax Anthropic-compatible endpoint (mainland site). Used when
 /// neither the account nor `MINIMAX_ANTHROPIC_BASE_URL` supplies one.
@@ -840,12 +848,12 @@ mod tests {
         };
         assert_eq!(minimax_openai_base(&acc), BUILTIN_OPENAI_BASE);
         // Explicit base wins, trailing slash stripped.
-        acc.base_url = "https://api.minimax.io/v1/".into();
-        assert_eq!(minimax_openai_base(&acc), "https://api.minimax.io/v1");
+        acc.base_url = "https://api.minimax.io/".into();
+        assert_eq!(minimax_openai_base(&acc), "https://api.minimax.io");
         // Env override (no account base) wins over the built-in default.
-        std::env::set_var("MINIMAX_BASE_URL", "https://env.example/v1");
+        std::env::set_var("MINIMAX_BASE_URL", "https://env.example");
         acc.base_url.clear();
-        assert_eq!(minimax_openai_base(&acc), "https://env.example/v1");
+        assert_eq!(minimax_openai_base(&acc), "https://env.example");
         std::env::remove_var("MINIMAX_BASE_URL");
         assert!(supports_openai(&acc));
     }
