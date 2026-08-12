@@ -8,13 +8,24 @@ pub(crate) const GATEWAY_PROVIDER_KEY: &str = "org-ai-gateway";
 /// We deliberately only touch `model_provider` + `[model_providers.<key>]`. We
 /// do NOT set `chatgpt_base_url`, so all other ChatGPT backend-api calls (usage,
 /// account, token refresh) keep hitting the real server and the client stays
-/// healthy. Crucially we never write `auth.json`, so the client keeps its real
-/// identity and Codex's account-mismatch guard never fires.
+/// healthy. We never write `auth.json`, so the client keeps its real identity
+/// and Codex's account-mismatch guard never fires.
 ///
 /// `base_url` is where the local client should send `responses`/`models`
 /// calls — the gateway's own `/v1`, derived from the request that asked for
 /// this config rather than hardcoded, since the bind address/port varies by
 /// deployment.
+///
+/// `env_key = "OAG_BEARER"` is the load-bearing piece: without it, Codex 0.144.x
+/// sees `requires_openai_auth=true` + no env key, falls into
+/// `provider_uses_first_party_auth_path` (ChatGPT OAuth flow), and ignores the
+/// `base_url` rewrite — so requests still go to `https://api.openai.com/v1`
+/// even with `model_provider = "org-ai-gateway"` set. With `env_key` set, the
+/// auth resolver in `bearer_auth_for_provider` reads the bearer token from the
+/// env var first, sends it straight to the gateway, and only falls back to
+/// `auth.json` if the env var is unset. `unset OAG_BEARER` therefore reverts
+/// to the original behavior (minus the base_url rewrite — the UI's "恢复"
+/// button is the proper way to fully revert).
 pub(crate) fn merge_gateway_into_config(existing: &str, base_url: &str) -> Result<String, String> {
     use toml_edit::{value, DocumentMut, Item, Table};
 
@@ -37,6 +48,7 @@ pub(crate) fn merge_gateway_into_config(existing: &str, base_url: &str) -> Resul
     provider["base_url"] = value(base_url);
     provider["wire_api"] = value("responses");
     provider["requires_openai_auth"] = value(true);
+    provider["env_key"] = value("OAG_BEARER");
     providers[GATEWAY_PROVIDER_KEY] = Item::Table(provider);
 
     Ok(doc.to_string())

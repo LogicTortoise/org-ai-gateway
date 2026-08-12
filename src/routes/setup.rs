@@ -112,7 +112,15 @@ pub(crate) async fn codex_apply(headers: HeaderMap) -> impl IntoResponse {
             backup_created,
             config_path: config_path.display().to_string(),
             backup_config_path: backup_config_path.display().to_string(),
-            note: "已把对话请求路由到网关；auth.json 未改动，本地仍是你的真实账号，客户端/终端都生效，无需退出重启。".to_string(),
+            note: "已把对话请求路由到网关；auth.json 未改动，本地仍是你的真实账号，客户端/终端都生效，无需退出重启。
+
+**下一步**：在启动 Codex CLI 的 shell 里 export gateway 认识的 bearer 字符串：
+```bash
+export OAG_BEARER=\"user:koltyu\"   # 自报身份（开发用）
+# 或
+export OAG_BEARER=\"oag_xxxxxxxx\"  # 在网关 WebUI 的 API 密钥页签发
+```
+不设 `OAG_BEARER` 时 Codex 仍会用 `auth.json` 的 ChatGPT OAuth token 发到自定义 base_url——这是无效组合，会被网关拒。设了之后切换 `unset OAG_BEARER` 即可回到原状。完整还原请点击页面上「恢复」。".to_string(),
         }),
     )
         .into_response()
