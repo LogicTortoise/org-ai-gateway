@@ -134,12 +134,21 @@ fn glm_openai_usage_obj(usage: &Value) -> TokenUsage {
         .pointer("/prompt_tokens_details/cached_tokens")
         .and_then(value_as_i64)
         .unwrap_or(0);
+    // DeepSeek R1 / OpenAI Chat Completions reasoning models (and any other
+    // provider that follows the OpenAI shape) attach reasoning tokens under
+    // `completion_tokens_details.reasoning_tokens`. Without this read,
+    // reasoners' reasoning tokens are silently dropped from the billable
+    // count and the audit row.
+    let reasoning = usage
+        .pointer("/completion_tokens_details/reasoning_tokens")
+        .and_then(value_as_i64)
+        .unwrap_or(0);
     TokenUsage {
         input_tokens: geti(usage, "prompt_tokens"),
         cached_input_tokens: cached,
         cache_creation_tokens: 0,
         output_tokens: geti(usage, "completion_tokens"),
-        reasoning_tokens: 0,
+        reasoning_tokens: reasoning,
         billable_tokens: 0,
     }
 }
@@ -409,6 +418,30 @@ mod tests {
         assert!(parse_response_model("{\"error\":\"boom\"}").is_none());
         // And of course garbage bytes.
         assert!(parse_response_model("not json").is_none());
+    }
+
+    #[test]
+    fn glm_openai_usage_picks_up_reasoning_tokens() {
+        // DeepSeek R1 / other OpenAI Chat Completions reasoning models
+        // attach reasoning tokens under `completion_tokens_details`.
+        // Before the fix this was hardcoded to 0 and the token count
+        // silently dropped from the audit row.
+        let body = serde_json::json!({
+            "id": "cmpl-1",
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 50,
+                "prompt_tokens_details": {"cached_tokens": 20},
+                "completion_tokens_details": {"reasoning_tokens": 30},
+            }
+        });
+        let u = parse_glm_json(&body);
+        assert_eq!(u.input_tokens, 100);
+        assert_eq!(u.cached_input_tokens, 20);
+        assert_eq!(u.output_tokens, 50);
+        assert_eq!(u.reasoning_tokens, 30);
+        // billable = input_uncached + output = 100 - 20 + 50 = 130
+        assert_eq!(u.billable_tokens, 130);
     }
 }
 
