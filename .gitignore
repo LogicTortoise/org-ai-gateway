@@ -14,3 +14,7 @@ target/
 .vscode/
 .env
 .env.*
+
+# Local scratch / throwaway — not part of the gateway itself
+.playwright-mcp/
+*.png
