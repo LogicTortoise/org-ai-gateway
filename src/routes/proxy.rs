@@ -1075,7 +1075,7 @@ fn parse_openai_error_message(body: &str) -> Option<String> {
 
 /// Provider-agnostic tool-call record produced by the adapter, so the
 /// rendering code below doesn't care which provider produced it.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct CommonToolCall {
     id: String,
     name: String,
@@ -1202,6 +1202,35 @@ async fn stream_openai_to_responses_sse(
                     "{} streaming translate failed on {}: {}",
                     provider_for_task, account_for_task.account_label, e
                 );
+                // Slice the Err into a short, audit-safe label. The translator
+                // returns either `upstream_stream_error: <msg> (<code>)` (an
+                // SSE error chunk) or `upstream_empty_stream` (silent empty
+                // body). Normalise both so the audit row carries the upstream
+                // signal rather than a generic `stream_translate_error`, and
+                // apply the matching failure class to the account so the next
+                // Codex turn tries the fallback provider (Codex upstream) or
+                // backs off if no fallback exists.
+                let status_label = if let Some(rest) = e.strip_prefix("upstream_stream_error: ") {
+                    // Trim a trailing ` (code)` if present; keep the message.
+                    let msg = rest.rsplit_once(" (").map(|(m, _)| m).unwrap_or(rest);
+                    format!("upstream_stream_error: {}", msg)
+                } else {
+                    e.clone()
+                };
+                let class = if e.starts_with("upstream_stream_error") {
+                    ErrorClass::from_status(529)
+                } else {
+                    ErrorClass::Transient
+                };
+                crate::retry::apply_account_failure(
+                    &state,
+                    &account_for_task.id,
+                    class,
+                    None,
+                    None,
+                    false,
+                )
+                .await;
                 write_proxy_audit(
                     &state,
                     &user_id_for_task,
@@ -1210,7 +1239,7 @@ async fn stream_openai_to_responses_sse(
                     &raw_model_for_task,
                     request_json_chars,
                     0,
-                    "stream_translate_error",
+                    &status_label,
                     TokenUsage::default(),
                 )
                 .await;
@@ -1349,6 +1378,43 @@ async fn translate_openai_sse_to_responses(
                 Ok(v) => v,
                 Err(_) => continue,
             };
+
+            // Detect upstream-reported errors delivered INSIDE an otherwise-2xx
+            // SSE stream. minimax / deepseek (and sometimes glm / kimi) report
+            // transient capacity issues like 529 `overloaded_error` as an SSE
+            // error chunk on a 200 response — without this branch the
+            // translator falls through silently, emits `response.completed`
+            // with empty `output`, and Codex marks the turn as a no-op
+            // (`last_agent_message: null`), so the agent looks frozen. Emit a
+            // Responses-style `error` event so the client retries, and return
+            // Err so the spawned task records the failure in the audit instead
+            // of writing a misleading `success` row.
+            if let Some(err) = v.get("error") {
+                let msg = if let Some(s) = err.as_str() {
+                    s.to_string()
+                } else if let Some(m) = err.get("message").and_then(|m| m.as_str()) {
+                    m.to_string()
+                } else {
+                    err.to_string()
+                };
+                let code = err
+                    .get("type")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("upstream_error")
+                    .to_string();
+                let _ = send_sse_event(
+                    &tx,
+                    "error",
+                    &json!({
+                        "type": "error",
+                        "code": code,
+                        "message": msg,
+                        "param": null,
+                    }),
+                )
+                .await;
+                return Err(format!("upstream_stream_error: {} ({})", msg, code));
+            }
 
             // `usage` is often attached to the last delta (or arrives as a
             // standalone trailing chunk on OpenAI-compatible APIs). Apply it
@@ -1546,7 +1612,22 @@ async fn translate_openai_sse_to_responses(
 
     // Stream ended without an explicit `[DONE]` (idle timeout, abrupt close).
     // Still emit the terminal events so a Codex client doesn't hang on
-    // `response.completed`.
+    // `response.completed`. EXCEPT when we got nothing back — no content, no
+    // tool call, no usage — in which case the upstream silently returned an
+    // empty body (e.g. minimax / deepseek capacity issues that didn't even
+    // emit an error chunk). Emitting `response.completed` with `output: []`
+    // would mark the Codex turn as a no-op (`last_agent_message: null`) and
+    // the user sees a frozen agent. Surface as an upstream error instead —
+    // the spawn task records it in the audit and closes the stream, which
+    // Codex treats as a retryable transport failure.
+    if accumulated_text.is_empty()
+        && final_tool_calls.is_empty()
+        && final_usage.input_tokens == 0
+        && final_usage.output_tokens == 0
+    {
+        return Err("upstream_empty_stream".to_string());
+    }
+
     finalize_output_item(
         &tx,
         &mut current_item_id,
@@ -2478,5 +2559,93 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["type"], "message");
         assert_eq!(items[0]["content"][0]["text"], "");
+    }
+
+    /// Build a minimal Responses-style SSE error chunk like the one minimax /
+    /// deepseek emit on capacity issues (HTTP 200, body contains an error
+    /// frame then the stream closes). Used to feed the translator below.
+    fn error_chunk(code: &str, message: &str) -> String {
+        format!(
+            "data: {{\"type\":\"error\",\"error\":{{\"type\":\"{code}\",\"message\":\"{message}\"}}}}\n\n"
+        )
+    }
+
+    #[tokio::test]
+    async fn translate_emits_error_event_and_returns_err_on_upstream_error_chunk() {
+        // Some providers (minimax / deepseek on 529 cluster-overload) return
+        // HTTP 200 with an error SSE chunk then close. Without the error
+        // branch the translator would silently emit `response.completed` with
+        // empty output, and Codex would mark the turn as a no-op — the user
+        // sees a frozen agent. With the fix, the translator emits a real
+        // Responses error event and returns Err so the audit row records the
+        // upstream signal.
+        let url = spawn_one_shot_sse_server(error_chunk("overloaded_error", "当前服务集群负载较高")).await;
+        let client = reqwest::Client::new();
+        let upstream = client.get(url).send().await.unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(8);
+        let result = translate_openai_sse_to_responses(upstream, "test-model", tx).await;
+        let msg = result.expect_err("expected Err on upstream error chunk, got Ok");
+        assert!(msg.starts_with("upstream_stream_error:"), "got: {}", msg);
+        assert!(msg.contains("当前服务集群负载较高"), "got: {}", msg);
+
+        // Drain what the translator emitted; the error event must reach the
+        // client before the channel closes, otherwise Codex sees the same
+        // empty success it used to.
+        let mut got_error_event = false;
+        while let Ok(Some(item)) = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            rx.recv(),
+        ).await {
+            let Ok(bytes) = item else { break };
+            let text = String::from_utf8_lossy(&bytes);
+            if text.contains("\"type\":\"error\"") {
+                got_error_event = true;
+                assert!(text.contains("\"code\":\"overloaded_error\""));
+                assert!(text.contains("当前服务集群负载较高"));
+            }
+        }
+        assert!(got_error_event, "translator did not emit Responses error event");
+    }
+
+    #[tokio::test]
+    async fn translate_returns_err_on_completely_empty_stream() {
+        // The upstream opened the stream, sent `[DONE]` (or just closed)
+        // without any choices / usage / tool_calls. Before the fix the
+        // translator fell through to the "stream ended without [DONE]" branch
+        // and emitted an empty success — Codex recorded `last_agent_message:
+        // null`. Now it must surface as upstream_empty_stream so the audit
+        // marks the failure.
+        let url = spawn_one_shot_sse_server(String::new()).await;
+        let client = reqwest::Client::new();
+        let upstream = client.get(url).send().await.unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(8);
+        let result = translate_openai_sse_to_responses(upstream, "test-model", tx).await;
+        let err = result.expect_err("expected Err on empty stream");
+        assert_eq!(err, "upstream_empty_stream");
+    }
+
+    /// Spin up a single-shot HTTP server that returns one SSE chunk and
+    /// closes. Listening on `127.0.0.1:0` so the OS picks a free port. Used
+    /// to feed `translate_openai_sse_to_responses` without bringing in a
+    /// mock HTTP dependency in the crate itself.
+    async fn spawn_one_shot_sse_server(body: String) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let mut resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                )
+                .into_bytes();
+                resp.extend_from_slice(body.as_bytes());
+                let _ = sock.write_all(&resp).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        format!("http://{}/", addr)
     }
 }

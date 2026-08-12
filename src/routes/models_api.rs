@@ -425,58 +425,54 @@ pub(crate) async fn proxy_models_openai(
     // refresh silently drops any model the user has set in `config.toml`
     // that isn't a real Codex-backend id, and surfaces an "unknown model"
     // warning at startup.
+    //
+    // Synthesize each alias by deep-copying the FIRST real upstream entry
+    // (so the synthetic shape matches the live schema byte-for-byte — Codex
+    // 0.144+ `ModelsClient` rejects entries missing fields the real catalog
+    // carries, e.g. `supports_reasoning_summaries`, `context_window`,
+    // `default_reasoning_level`, …) and overwriting only `slug` /
+    // `display_name`. When the upstream catalog is empty, fall back to a
+    // schema-only build from `CODEX_MODEL_TEMPLATE_JSON`.
+    let schema_template = models.first().cloned();
     for slug in advertised_models() {
         if models.iter().any(|m| {
             m.get("slug").and_then(|v| v.as_str()) == Some(slug.as_str())
         }) {
             continue;
         }
-        models.push(synthetic_codex_model(&slug));
+        models.push(synthetic_codex_model(&slug, schema_template.as_ref()));
     }
     (StatusCode::OK, Json(json!({ "models": models }))).into_response()
 }
 
-/// Build a Codex-backend-shaped `ModelInfo` (the rich 30+ field version
-/// defined in Codex's `openai_models.rs`, NOT our thin gateway
-/// `crate::models::ModelInfo`) for a slug the gateway wants to advertise
-/// but that doesn't exist in the upstream Codex backend catalog. Field set
-/// mirrors what the Codex backend returns; `base_instructions` and
-/// `model_messages.instructions_template` are copied verbatim from a real
-/// upstream entry (embedded at compile time from
-/// `src/provider/codex_model_template.json`) because Codex 0.147+ requires
-/// these two fields to be present and non-empty — synthetic slugs that
-/// ship empty values get rejected by the `ModelsClient` decoder and break
-/// the `list_models` refresh path.
-fn synthetic_codex_model(slug: &str) -> Value {
+/// Build a Codex-backend-shaped entry for a slug the gateway wants to
+/// advertise but that doesn't exist in the upstream Codex backend catalog.
+///
+/// If a `reference` (typically the first live upstream entry) is supplied,
+/// start by deep-copying it and overwrite only `slug` / `display_name`. This
+/// is the safe path — the synthetic inherits every schema field the live
+/// catalog carries, so Codex 0.144+ decoders accept it.
+///
+/// Falls back to a schema-only build from `CODEX_MODEL_TEMPLATE_JSON` when
+/// the live catalog is empty (e.g. every Codex account just refreshed off).
+fn synthetic_codex_model(slug: &str, reference: Option<&Value>) -> Value {
+    if let Some(tmpl) = reference {
+        let mut obj = tmpl.clone();
+        if let Some(root) = obj.as_object_mut() {
+            root.insert("slug".to_string(), Value::String(slug.to_string()));
+            root.insert("display_name".to_string(), Value::String(slug.to_string()));
+        }
+        return obj;
+    }
+    // Fallback: template only has base_instructions + model_messages. Codex
+    // may reject these for missing fields, but it's better than nothing
+    // when no live account can be reached.
     let template: Value = serde_json::from_str(CODEX_MODEL_TEMPLATE_JSON)
         .expect("CODEX_MODEL_TEMPLATE_JSON must be valid JSON (build-time file)");
-    let mut obj = json!({
-        "slug": slug,
-        "display_name": slug,
-        "supported_in_api": true,
-        "supported_reasoning_levels": [],
-        "shell_type": "shell_command",
-        "visibility": "list",
-        "priority": 0,
-        "experimental_supported_tools": [],
-        "include_skills_usage_instructions": false,
-        "include_plugin_usage_instructions": false,
-        "include_apps_usage_instructions": true,
-        "supports_reasoning_summary_parameter": true,
-        "default_reasoning_summary": "auto",
-        "support_verbosity": false,
-        "web_search_tool_type": "text",
-        "truncation_policy": { "mode": "bytes", "limit": 10000 },
-        "supports_parallel_tool_calls": true,
-        "supports_image_detail_original": false
-    });
+    let mut obj = template;
     if let Some(root) = obj.as_object_mut() {
-        if let Some(base) = template.get("base_instructions").and_then(|v| v.as_str()) {
-            root.insert("base_instructions".to_string(), Value::String(base.to_string()));
-        }
-        if let Some(mm) = template.get("model_messages").cloned() {
-            root.insert("model_messages".to_string(), mm);
-        }
+        root.insert("slug".to_string(), Value::String(slug.to_string()));
+        root.insert("display_name".to_string(), Value::String(slug.to_string()));
     }
     obj
 }
