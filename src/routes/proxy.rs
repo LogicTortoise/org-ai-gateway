@@ -1617,14 +1617,26 @@ async fn translate_openai_sse_to_responses(
     // empty body (e.g. minimax / deepseek capacity issues that didn't even
     // emit an error chunk). Emitting `response.completed` with `output: []`
     // would mark the Codex turn as a no-op (`last_agent_message: null`) and
-    // the user sees a frozen agent. Surface as an upstream error instead —
-    // the spawn task records it in the audit and closes the stream, which
-    // Codex treats as a retryable transport failure.
+    // the user sees a frozen agent. Surface as an upstream error to the
+    // client FIRST (so Codex sees a proper `event: error` frame and not a
+    // raw stream cut), THEN return Err so the spawn task records the audit
+    // row and applies the matching failure class to the account.
     if accumulated_text.is_empty()
         && final_tool_calls.is_empty()
         && final_usage.input_tokens == 0
         && final_usage.output_tokens == 0
     {
+        let _ = send_sse_event(
+            &tx,
+            "error",
+            &json!({
+                "type": "error",
+                "code": "upstream_empty_stream",
+                "message": "upstream returned an empty stream (no SSE chunks before connection close)",
+                "param": null,
+            }),
+        )
+        .await;
         return Err("upstream_empty_stream".to_string());
     }
 
@@ -2618,10 +2630,25 @@ mod tests {
         let url = spawn_one_shot_sse_server(String::new()).await;
         let client = reqwest::Client::new();
         let upstream = client.get(url).send().await.unwrap();
-        let (tx, _rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(8);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(8);
         let result = translate_openai_sse_to_responses(upstream, "test-model", tx).await;
         let err = result.expect_err("expected Err on empty stream");
         assert_eq!(err, "upstream_empty_stream");
+
+        // And — critically — the client must have received an `event: error`
+        // SSE frame BEFORE the connection closed. Otherwise Codex sees a
+        // raw stream cut and reports "stream disconnected before completion"
+        // instead of a typed upstream error.
+        let mut got_error_event = false;
+        while let Some(item) = rx.recv().await {
+            let Ok(bytes) = item else { break };
+            let s = String::from_utf8_lossy(&bytes);
+            if s.contains("event: error") && s.contains("upstream_empty_stream") {
+                got_error_event = true;
+                break;
+            }
+        }
+        assert!(got_error_event, "translator did not emit Responses error event before closing");
     }
 
     /// Spin up a single-shot HTTP server that returns one SSE chunk and
