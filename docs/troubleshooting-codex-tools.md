@@ -5,15 +5,15 @@
 >
 > ### 为什么这条 fix 已过期
 >
-> `565f034` 的修法是在 `convert_responses_tools` 里加 if/else 把 `type:"custom"` / `type:"namespace"` 重新包成 OpenAI Chat Completions 的 `type:"function"`。**这只对 deepseek / glm / kimi 这种"上游只吃 Chat Completions"的 provider 有效**——minimax 路径在 `b87dcb8`（2026-08-13）已经从适配层改成原生 `/v1/responses` 透传了，整个 `convert_responses_tools` 在 minimax 上不再调用。
+> `565f034` 的修法是在 `convert_responses_tools` 里加 if/else 把 `type:"custom"` / `type:"namespace"` 重新包成 OpenAI Chat Completions 的 `type:"function"`。**这条 fix 只对 glm / kimi 这种"上游只吃 Chat Completions"的 provider 有效**——minimax 路径在 `b87dcb8`（2026-08-13）和 deepseek 路径在 `b87dcb8` 后续的 commit 里都已经从适配层改成原生 `/v1/responses` 透传了，整个 `convert_responses_tools` 在 minimax / deepseek 上不再调用。
 >
 > ### 为什么这条 fix 本身很难完备
 >
-> Codex 客户端的 `tools` 数组里的 `type` 是 OpenAI Responses API spec 的扩展集合，spec 允许的类型在持续增加（`function` / `custom` / `namespace` / `web_search` / `tool_search` / `file_search` / 未来的 MCP tool 容器……）。`convert_responses_tools` 现在是"遇到认识的 type 就 rewrap，不认识的就静默丢"——这是**修补**不是根治：每次 Codex 升级加新的 tool type，就有可能再出现"tool 被吞"。任何还在走 Chat Completions 适配层的 provider（deepseek / glm / kimi）都仍然暴露在这条风险下。
+> Codex 客户端的 `tools` 数组里的 `type` 是 OpenAI Responses API spec 的扩展集合，spec 允许的类型在持续增加（`function` / `custom` / `namespace` / `web_search` / `tool_search` / `file_search` / 未来的 MCP tool 容器……）。`convert_responses_tools` 现在是"遇到认识的 type 就 rewrap，不认识的就静默丢"——这是**修补**不是根治：每次 Codex 升级加新的 tool type，就有可能再出现"tool 被吞"。任何还在走 Chat Completions 适配层的 provider（glm / kimi）都仍然暴露在这条风险下。
 >
-> 真正的根治方向是让 Codex slot 走的上游**自己支持 Responses API**（minimax 就是）。如果哪天 deepseek / glm / kimi 哪家官宣 `/v1/responses`，应该同样改成透传，删掉它对应的 `convert_responses_tools`，而不是继续在 if/else 里加分支。
+> 真正的根治方向是让 Codex slot 走的上游**自己支持 Responses API**（minimax 和 deepseek 都是）。如果哪天 glm / kimi 哪家官宣 `/v1/responses`，应该同样改成透传，删掉它对应的 `convert_responses_tools`，而不是继续在 if/else 里加分支。
 >
-> 本 doc 的诊断方法（看 Codex rollout、dump 请求体、加 INFO 日志）做 deepseek / glm / kimi 排查时仍然有用；修法部分对 minimax 不再适用。
+> 本 doc 的诊断方法（看 Codex rollout、dump 请求体、加 INFO 日志）做 glm / kimi 排查时仍然有用；修法部分对 minimax / deepseek 不再适用。
 
 ## 症状
 

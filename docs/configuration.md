@@ -149,14 +149,13 @@ Trae 不是直连的云端 API：Trae IDE 用的是私有的 `api/agent/v3` agen
 
 ### DeepSeek（开放平台，API Key）
 
-直连 DeepSeek 官方的 **Anthropic 兼容端点**（`/anthropic/v1/messages`）和 **OpenAI 兼容端点**（`/v1/chat/completions`），一把 API Key 即可。
+直连 DeepSeek 官方的 **Anthropic 兼容端点**（`/anthropic/v1/messages`）和 **OpenAI 兼容端点**（`/v1/responses`），一把 API Key 即可。
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `DEEPSEEK_BASE_URL` | `https://api.deepseek.com/v1` | **OpenAI 兼容端点**前缀（Codex 路径用）；账号自带的 `base_url` 优先级更高。 |
+| `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | **OpenAI 兼容端点主机**（Codex 路径用，会自动拼 `/v1/responses`）；账号自带的 `base_url` 优先级更高。**base URL 必须只到主机**，不能再带 `/v1` —— 否则会拼成 `/v1/v1/responses` 404。 |
 | `DEEPSEEK_ANTHROPIC_BASE_URL` | `https://api.deepseek.com/anthropic` | **Anthropic 兼容端点**前缀（Claude 路径用）；账号自带的 `base_url_alt` 优先级更高。 |
-| `DEEPSEEK_OPENAI_MODEL` | `deepseek-chat` | Codex / OpenAI 路径统一发送的上游模型 id。DeepSeek 两面发布 **不同**的 model id（Anthropic 面是 `deepseek-v4-pro`，OpenAI 面是 `deepseek-chat`/`deepseek-reasoner`），所以 OpenAI 路径把全部流量路由到这一个可配置 id，不做 tier 改写。要走 reasoner 就设成 `deepseek-reasoner`。 |
-| `DEEPSEEK_DEFAULT_MODEL` | `deepseek-v4-pro` | Anthropic 路径的 **默认档**（裸 `deepseek` slug；独立项，不是 Claude tier） |
+| `DEEPSEEK_DEFAULT_MODEL` | `deepseek-chat` | Codex 路径（Responses）的 **默认档**（裸 `deepseek` slug + Claude 链降级过来的未知名都落到这里）—— 想走 reasoner 就设成 `deepseek-reasoner`。**Anthropic 路径不读这个 env**（Anthropic 面有独立的 4 档，见下）。 |
 | `DEEPSEEK_OPUS_MODEL` | `deepseek-v4-pro` | Anthropic 路径的 **opus 档**（`claude-opus-*`） |
 | `DEEPSEEK_SONNET_MODEL` | `deepseek-v4-pro` | Anthropic 路径的 **sonnet + haiku 档**（`claude-sonnet-*` 和 `claude-haiku-*` 共享一个上游目标） |
 | `DEEPSEEK_FABLE_MODEL` | `deepseek-v4-flash` | Anthropic 路径的 **fable 档**（Claude Code 最便宜的 tier） |
@@ -167,9 +166,11 @@ Trae 不是直连的云端 API：Trae IDE 用的是私有的 `api/agent/v3` agen
 
 **双协议都接：**
 - **Claude 路径**（`/v1/messages`）：原样透传 Anthropic 形状 payload，tool_use 走原生通道完整保留。
-- **Codex 路径**（`/v1/responses`）：通过 Responses↔Chat Completions 适配层转到 `/v1/chat/completions`，`function_call`/`function_call_output` 块双向翻译、tool 调用完整保留。
+- **Codex 路径**（`/v1/responses`）：**网关是透明管道**，不做任何改写。DeepSeek 官方 Codex 接入面就是 `/v1/responses`（见 `api-docs.deepseek.com/.../quick_start/agent_integrations/codex`），Codex CLI 用 `wire_api = "responses"` 直接对得上。整库 gadgets（`function_call` / `function_call_output` / `tools` / `reasoning` 块）都按 Responses 协议透传，不再走之前的 "Responses ↔ Chat Completions" 适配层。
 
-**Anthropic 路径按 Claude Code 的 3 档 tier 改写**：`claude-opus-*` → `DEEPSEEK_OPUS_MODEL`；`claude-sonnet-*` 和 `claude-haiku-*`（`claude-haiku-4-5-*` / `claude-3-5-haiku-*` 两种写法都认）→ `DEEPSEEK_SONNET_MODEL`（**haiku 合并到 sonnet** —— 两个 tier 共享一个上游目标，因为大多数第三方厂商没有独立的 sonnet 变体）；`claude-fable-*` → `DEEPSEEK_FABLE_MODEL`；裸 `deepseek` slug 或其它未知名 → `DEEPSEEK_DEFAULT_MODEL`（独立项，不是 Claude tier）。想要 1M 上下文就把 `DEEPSEEK_OPUS_MODEL` / `DEEPSEEK_SONNET_MODEL` 设成 `deepseek-v4-pro[1m]`。
+**模型路由**：
+- **Codex / Responses 路径**——客户端发的 model id 直接透传（`deepseek-chat` / `deepseek-reasoner` 走 DeepSeek 的 Responses catalog 原样）；从 Claude 链降级过来的 `claude-*` 名字落到 `DEEPSEEK_DEFAULT_MODEL`（独立项，跟 Anthropic 路径的 tier 改写分开）。
+- **Anthropic 路径**按 Claude Code 的 3 档 tier 改写：`claude-opus-*` → `DEEPSEEK_OPUS_MODEL`；`claude-sonnet-*` 和 `claude-haiku-*`（`claude-haiku-4-5-*` / `claude-3-5-haiku-*` 两种写法都认）→ `DEEPSEEK_SONNET_MODEL`（**haiku 合并到 sonnet** —— 两个 tier 共享一个上游目标）；`claude-fable-*` → `DEEPSEEK_FABLE_MODEL`；裸 `deepseek` slug 或其它未知名 → `DEEPSEEK_DEFAULT_MODEL`（独立项）。想要 1M 上下文就把 `DEEPSEEK_OPUS_MODEL` / `DEEPSEEK_SONNET_MODEL` 设成 `deepseek-v4-pro[1m]`。
 
 > `DEEPSEEK_MODELS` 的目录是 Anthropic 路径的 id 目录，是刻意的：DeepSeek 的 `GET /models` 返回的是它 **OpenAI 面** 的 id（`deepseek-chat` / `deepseek-reasoner`），不是 Anthropic 面文档里的 id，拉活列表只会让人选到随后被静默改写的模型名。
 

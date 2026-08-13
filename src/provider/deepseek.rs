@@ -2,8 +2,7 @@
 //!
 //! ## Shape — BOTH client protocols
 //!
-//! Like GLM / Kimi, this provider wires two endpoints and serves two client
-//! protocols:
+//! This provider wires two endpoints and serves two client protocols:
 //!
 //!   1. **Claude-format traffic** (`/v1/messages`): proxied near-natively to
 //!      DeepSeek's Anthropic-compatible endpoint
@@ -12,43 +11,41 @@
 //!      **tool calls survive**. No Claude Code fingerprint is injected (DeepSeek
 //!      is not Anthropic; their endpoint ignores `anthropic-version` anyway).
 //!
-//!   2. **Codex / OpenAI-format traffic** (`/v1/responses`,
-//!      `/v1/chat/completions`): proxied to DeepSeek's OpenAI-compatible
-//!      endpoint (`{base_url_openai}/chat/completions`). The payload is
-//!      rewritten from OpenAI Responses (`input` array of typed blocks +
-//!      top-level `tools` + `instructions`) into OpenAI Chat Completions
-//!      (`messages` + `tools`), and the response is rewritten back. **Function
-//!      calling survives** (this is what distinguishes DeepSeek from the
-//!      GLM/Kimi text-only adapter). Non-streaming only on the OpenAI path;
-//!      streaming tool-call deltas are aggregated into a single
-//!      `response.output_item.done` event, so streaming clients still see the
-//!      tool call, just with first-token delay.
+//!   2. **Codex / OpenAI-format traffic** (`/v1/responses`): proxied as a
+//!      **transparent pipe** to DeepSeek's native Responses API at
+//!      `{base_url_openai}/v1/responses`. DeepSeek officially supports
+//!      `wire_api = "responses"` from Codex CLI
+//!      ([`api-docs.deepseek.com/.../quick_start/agent_integrations/codex`](https://api-docs.deepseek.com/zh-cn/quick_start/agent_integrations/codex));
+//!      the payload matches DeepSeek's wire shape exactly and needs no
+//!      translation. `stream: true` / `stream: false` are both forwarded as
+//!      upstream `stream: true` (forced by `ensure_codex_payload_defaults`),
+//!      with the gateway buffering SSE into a Responses JSON object for
+//!      non-streaming clients (parity with the MiniMax passthrough).
 //!
-//! ### OpenAI vs Anthropic model id mismatch
+//! ### Model id handling
 //!
-//! The two surfaces publish DIFFERENT model ids:
-//!   * Anthropic surface: `deepseek-v4-pro` / `deepseek-v4-pro[1m]` /
-//!     `deepseek-v4-flash` (the ids DeepSeek's Claude Code recipe uses).
-//!   * OpenAI surface:    `deepseek-chat` / `deepseek-reasoner`.
-//!
-//! There is no 1:1 mapping between them — `deepseek-v4-pro` and
-//! `deepseek-v4-flash` are the same backend served with different pricing;
-//! `deepseek-chat` is the same model from a different angle. The OpenAI path
-//! therefore routes ALL traffic to a single configurable id, set via
-//! `DEEPSEEK_OPENAI_MODEL` (default `deepseek-chat`). The Anthropic path keeps
-//! the existing tier rewrite (opus → pro, sonnet/haiku → pro, fable → flash,
-//! default → pro).
+//! The Claude-format (Anthropic) surface keeps its tier rewrite
+//! (opus → pro, sonnet/haiku → pro, fable → flash, default → pro) —
+//! Anthropic-facing ids are what that surface documents. The Codex-format
+//! (Responses) surface receives whatever the client sent: `deepseek-chat` or
+//! `deepseek-reasoner` land on DeepSeek's Responses catalog as-is; a foreign
+//! name from the Claude chain (e.g. `claude-sonnet-4-5`) is rewritten to the
+//! configured default slot, which is what the operator has set as the
+//! "Codex-default" id (the operator picks the reasoner flavor by setting
+//! `DEEPSEEK_DEFAULT_MODEL=deepseek-reasoner`).
 //!
 //! An "account" carries:
 //!   * `base_url` — OpenAI-compatible prefix; defaults to `DEEPSEEK_BASE_URL`
-//!     env, else `https://api.deepseek.com/v1`. `/chat/completions` is appended.
+//!     env, else `https://api.deepseek.com`. `/v1/responses` is appended.
+//!     **base URL must be just the host** — not include `/v1` — or the gateway
+//!     will form `/v1/v1/responses` and 404.
 //!   * `base_url_alt` — Anthropic-compatible prefix; defaults to
 //!     `DEEPSEEK_ANTHROPIC_BASE_URL` env, else `https://api.deepseek.com/anthropic`.
 //!     `/v1/messages` is appended.
 //!   * `api_key` / `access_token` — the DeepSeek API key. `x-api-key` is the
 //!     documented Anthropic header; `Authorization: Bearer` is what their
 //!     Claude Code recipe (`ANTHROPIC_AUTH_TOKEN`) produces. The Anthropic
-//!     path sends both; the OpenAI path sends only the bearer form.
+//!     path sends both; the Responses path sends only the bearer form.
 //!
 //! Token counts are REAL on both paths (both surfaces return usage objects)
 //! — see `usage::tokens::parse_usage("deepseek", ...)`.
@@ -72,7 +69,10 @@ pub(crate) const BUILTIN_FABLE_MODEL: &str = "deepseek-v4-flash";
 
 /// Built-in default upstream model for the bare `deepseek` slug, used when
 /// neither the runtime override nor `DEEPSEEK_DEFAULT_MODEL` supplies one.
-pub(crate) const BUILTIN_DEFAULT_MODEL: &str = "deepseek-v4-pro";
+/// On the Responses surface this is also the fallback for any foreign name
+/// from the Claude chain (e.g. `claude-sonnet-4-5`) — operators who want the
+/// reasoner flavor set `DEEPSEEK_DEFAULT_MODEL=deepseek-reasoner`.
+pub(crate) const BUILTIN_DEFAULT_MODEL: &str = "deepseek-chat";
 
 /// The built-in model catalog. Static by design: DeepSeek's `GET /models` lists
 /// the ids of their *OpenAI* surface (`deepseek-chat`, `deepseek-reasoner`),
@@ -80,9 +80,8 @@ pub(crate) const BUILTIN_DEFAULT_MODEL: &str = "deepseek-v4-pro";
 /// would offer models that then get silently remapped. Any id still works
 /// directly via `deepseek/<id>`.
 pub(crate) const BUILTIN_MODELS: &[&str] = &[
-    "deepseek-v4-pro",
-    "deepseek-v4-pro[1m]",
-    "deepseek-v4-flash",
+    "deepseek-chat",
+    "deepseek-reasoner",
 ];
 
 /// This provider's entry in the runtime model-config table.
@@ -92,14 +91,12 @@ fn spec() -> &'static crate::provider::model_config::ProviderModelSpec {
 
 /// Built-in DeepSeek endpoints. Used when neither the account nor the env
 /// overrides supply a base URL, so connecting only needs an api key.
-const BUILTIN_OPENAI_BASE: &str = "https://api.deepseek.com/v1";
+const BUILTIN_OPENAI_BASE: &str = "https://api.deepseek.com";
 const BUILTIN_ANTHROPIC_BASE: &str = "https://api.deepseek.com/anthropic";
 
-/// Built-in model id for the OpenAI surface. DeepSeek's OpenAI catalog has
-/// just two ids (`deepseek-chat` and `deepseek-reasoner`); the gateway routes
-/// all Codex-slot traffic to this single configurable id. Operators who want
-/// the reasoner flavor set `DEEPSEEK_OPENAI_MODEL=deepseek-reasoner`.
-pub(crate) const BUILTIN_OPENAI_MODEL: &str = "deepseek-chat";
+/// Path appended to the OpenAI-compatible base. DeepSeek's Codex integration
+/// is the native Responses API; the gateway is a transparent pipe here.
+const DEEPSEEK_RESPONSES_PATH: &str = "/v1/responses";
 
 /// Dedicated HTTP client for DeepSeek. Short connect timeout (fail fast on the
 /// fallback path) and a generous total timeout (long generations).
@@ -169,7 +166,7 @@ pub(crate) fn deepseek_canonical_model(model: &str) -> String {
 }
 
 /// The configured default upstream model: runtime override, else
-/// `DEEPSEEK_DEFAULT_MODEL`, else the built-in pro tier.
+/// `DEEPSEEK_DEFAULT_MODEL`, else the built-in chat tier.
 fn deepseek_default_model() -> String {
     spec().resolve(crate::provider::model_config::Slot::Default)
 }
@@ -190,8 +187,8 @@ fn deepseek_fable_model() -> String {
 }
 
 /// The OpenAI-compatible base prefix for a DeepSeek account: its stored
-/// `base_url`, else the `DEEPSEEK_BASE_URL` env (semantically flipped: now
-/// defaults to the OpenAI endpoint), else the built-in OpenAI endpoint.
+/// `base_url`, else the `DEEPSEEK_BASE_URL` env, else the built-in OpenAI
+/// endpoint (just the host — `/v1/responses` is appended at the call site).
 /// Trailing slash trimmed.
 pub(crate) fn deepseek_openai_base(account: &UpstreamAccount) -> String {
     let raw = if !account.base_url.trim().is_empty() {
@@ -229,309 +226,30 @@ pub(crate) fn supports_openai(account: &UpstreamAccount) -> bool {
     !deepseek_openai_base(account).is_empty()
 }
 
-/// Resolve the upstream model id to send on the OpenAI surface. Single
-/// configurable id via `DEEPSEEK_OPENAI_MODEL`, because the Anthropic tier
-/// names (`deepseek-v4-pro` etc.) are NOT valid ids on the OpenAI surface
-/// (`deepseek-chat` / `deepseek-reasoner`). The Anthropic path keeps the
-/// `deepseek_canonical_model` tier rewrite intact; this helper exists
-/// exclusively for the OpenAI path's needs.
-pub(crate) fn deepseek_openai_canonical_model(_model: &str) -> String {
-    std::env::var("DEEPSEEK_OPENAI_MODEL")
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| BUILTIN_OPENAI_MODEL.to_string())
-}
-
 // ---------------------------------------------------------------------------
-// OpenAI-compatible upstream call (Codex slot)
+// OpenAI-compatible upstream call (Codex slot) — transparent pipe
 // ---------------------------------------------------------------------------
 //
 // The Codex slot sends OpenAI Responses payloads (top-level `input` array of
 // typed blocks, `instructions`, `tools`). DeepSeek's OpenAI surface is a
-// standard Chat Completions API at `/chat/completions`, so we rewrite:
-//   * `instructions` + `input` (message / function_call / function_call_output
-//     blocks) -> `messages` array with `system`/`user`/`assistant`/`tool` roles
-//   * `tools` -> Chat Completions `tools` (OpenAI standard, identical shape)
-//   * upstream response (text + `tool_calls`) -> Responses API `output` array
-//     (message + function_call blocks) for the non-streaming aggregation
-// Streaming is supported but the gateway buffers the entire response anyway
-// (account-swap retry needs the full body), so this is always non-streaming on
-// the wire to DeepSeek even when the client asked for `stream: true`.
+// standard Responses API at `/v1/responses`, so we forward the payload
+// verbatim. The upstream is always called with `stream: true`
+// (`ensure_codex_payload_defaults`); the gateway then either pipes the bytes
+// back (streaming client) or buffers + aggregates the SSE into a Responses
+// JSON object (non-streaming client).
 //
-// DeepSeek supports `tools` / `tool_choice` / `tool_calls` per their OpenAI
-// docs.
+// Tool calls survive because the Responses wire shape carries `apply_patch`
+// / `codex_app` / `image_gen` natively — no Chat-Completions rewrap, no
+// `type:"custom"` / `type:"namespace"` translator.
 
-/// Outcome of a DeepSeek OpenAI-compatible call.
-pub(crate) struct DeepseekResult {
-    pub(crate) text: String,
-    pub(crate) status: reqwest::StatusCode,
-    pub(crate) error: Option<String>,
-    /// Real token usage parsed from the response (`usage.prompt_tokens` /
-    /// `usage.completion_tokens`); zero when the upstream omitted them.
-    pub(crate) usage: TokenUsage,
-    /// Parsed `tool_calls` from the upstream `choices[0].message.tool_calls`
-    /// array.
-    pub(crate) tool_calls: Vec<DeepseekToolCall>,
-}
-
-/// A single Chat-Completions-shaped tool call from DeepSeek.
-#[derive(Debug, Clone)]
-pub(crate) struct DeepseekToolCall {
-    pub(crate) id: String,
-    pub(crate) name: String,
-    /// Raw `function.arguments` string from the upstream.
-    pub(crate) arguments: String,
-}
-
-/// Build the Chat Completions `messages` array from a Responses API payload.
-///
-/// Mirrors the shape that used to live in `minimax::convert_responses_to_chat_messages`.
-/// As of 2026-08, the MiniMax Codex path no longer goes through this adapter
-/// at all — it forwards to MiniMax's native `/v1/responses` directly and
-/// returns its Responses shape verbatim. DeepSeek still rides the standard
-/// OpenAI Chat Completions surface, so it keeps its own local copy of the
-/// converter (kept private rather than imported so the adapter surface
-/// stays local to each provider).
-pub(crate) fn convert_responses_to_chat_messages(payload: &Value) -> Vec<Value> {
-    let mut out: Vec<Value> = Vec::new();
-
-    let mut sys_buf = String::new();
-    if let Some(s) = payload.get("instructions").and_then(|v| v.as_str()) {
-        if !s.trim().is_empty() {
-            sys_buf.push_str(s);
-        }
-    }
-
-    if let Some(items) = payload.get("input").and_then(|v| v.as_array()) {
-        for item in items {
-            let Some(it) = item.as_object() else { continue };
-            let t = it.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            match t {
-                "message" => {
-                    let role = it.get("role").and_then(|v| v.as_str()).unwrap_or("user");
-                    let content = match it.get("content") {
-                        Some(Value::String(s)) => s.clone(),
-                        Some(Value::Array(parts)) => collect_text_parts(parts),
-                        _ => String::new(),
-                    };
-                    match role {
-                        "system" | "developer" => {
-                            if !sys_buf.is_empty() {
-                                sys_buf.push('\n');
-                            }
-                            sys_buf.push_str(&content);
-                        }
-                        "assistant" => {
-                            out.push(json!({ "role": "assistant", "content": content }));
-                        }
-                        _ => {
-                            out.push(json!({ "role": "user", "content": content }));
-                        }
-                    }
-                }
-                "function_call" => {
-                    let id = it
-                        .get("call_id")
-                        .and_then(|v| v.as_str())
-                        .or_else(|| it.get("id").and_then(|v| v.as_str()))
-                        .unwrap_or("")
-                        .to_string();
-                    let name = it.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    let arguments = match it.get("arguments") {
-                        Some(Value::String(s)) => s.clone(),
-                        Some(other) => other.to_string(),
-                        None => String::new(),
-                    };
-                    out.push(json!({
-                        "role": "assistant",
-                        "content": "",
-                        "tool_calls": [{
-                            "id": id,
-                            "type": "function",
-                            "function": { "name": name, "arguments": arguments }
-                        }]
-                    }));
-                }
-                "function_call_output" => {
-                    let call_id = it.get("call_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    let output = it.get("output").map(|v| {
-                        if let Value::String(s) = v {
-                            s.clone()
-                        } else {
-                            v.to_string()
-                        }
-                    }).unwrap_or_default();
-                    out.push(json!({
-                        "role": "tool",
-                        "tool_call_id": call_id,
-                        "content": output
-                    }));
-                }
-                _ => {}
-            }
-        }
-    }
-
-    if !sys_buf.is_empty() {
-        out.insert(0, json!({ "role": "system", "content": sys_buf }));
-    }
-    out
-}
-
-fn collect_text_parts(parts: &[Value]) -> String {
-    let mut out: Vec<&str> = Vec::new();
-    for p in parts {
-        let Some(part) = p.as_object() else { continue };
-        if let Some(t) = part.get("type").and_then(|v| v.as_str()) {
-            if !matches!(t, "text" | "input_text" | "output_text") {
-                continue;
-            }
-        }
-        if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
-            if !text.is_empty() {
-                out.push(text);
-            }
-        }
-    }
-    out.join("\n")
-}
-
-/// Pass-through `tools` array with `type: function` entries rewrapped to the
-/// Chat Completions shape. Codex (Responses API) emits function tools flat
-/// (`{type, name, description, parameters, strict}`); Chat Completions
-/// expects them wrapped (`{type: "function", function: {name, description,
-/// parameters, strict}}`). Forwarding the flat shape makes DeepSeek's
-/// `/v1/chat/completions` reject the request as `invalid params, function is
-/// empty`. Already-wrapped tools pass through unchanged.
-pub(crate) fn convert_responses_tools(payload: &Value) -> Option<Vec<Value>> {
-    let tools = payload.get("tools").and_then(|v| v.as_array())?;
-    let mut out = Vec::with_capacity(tools.len());
-    for t in tools {
-        let Some(obj) = t.as_object() else { continue };
-        let ty = obj.get("type").and_then(|v| v.as_str()).unwrap_or("function");
-        if ty != "function" {
-            continue;
-        }
-        if obj.contains_key("function") {
-            out.push(t.clone());
-            continue;
-        }
-        let mut function = serde_json::Map::new();
-        for k in ["name", "description", "parameters", "strict"] {
-            if let Some(v) = obj.get(k) {
-                function.insert(k.to_string(), v.clone());
-            }
-        }
-        if function.get("name").and_then(|v| v.as_str()).map(str::is_empty).unwrap_or(true) {
-            continue;
-        }
-        out.push(json!({
-            "type": "function",
-            "function": Value::Object(function),
-        }));
-    }
-    if out.is_empty() { None } else { Some(out) }
-}
-
-/// Build the OpenAI Chat Completions request body for DeepSeek. Always
-/// `stream: false` — the gateway buffers everything for safe account-swap
-/// retry.
-fn build_deepseek_openai_body(model: &str, payload: &Value) -> Value {
-    let mut body = json!({
-        "model": model,
-        "messages": convert_responses_to_chat_messages(payload),
-        "stream": false,
-    });
-    if let Some(tools) = convert_responses_tools(payload) {
-        body["tools"] = json!(tools);
-        if let Some(tc) = payload.get("tool_choice") {
-            body["tool_choice"] = tc.clone();
-        }
-    }
-    body
-}
-
-/// Send one chat request to DeepSeek's OpenAI-compatible `/chat/completions`
-/// and return the assistant text + parsed tool_calls + real token usage.
-/// Always non-streaming.
-pub(crate) async fn send_deepseek_openai(
-    account: &UpstreamAccount,
-    model: &str,
-    payload: &Value,
-) -> Result<DeepseekResult, String> {
-    let base = deepseek_openai_base(account);
-    if base.is_empty() {
-        return Err("deepseek account has no OpenAI-compatible base_url".to_string());
-    }
-    let api_key = account.bearer();
-    if api_key.is_empty() {
-        return Err("deepseek account has empty api key".to_string());
-    }
-
-    let url = format!("{}/chat/completions", base);
-    let body = build_deepseek_openai_body(model, payload);
-
-    let resp = deepseek_http_client()
-        .post(&url)
-        .bearer_auth(api_key)
-        .header(CONTENT_TYPE, "application/json")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("deepseek upstream request failed ({}): {}", url, e))?;
-    let status = resp.status();
-    let text_body = resp
-        .text()
-        .await
-        .map_err(|e| format!("reading deepseek upstream body failed: {}", e))?;
-
-    if !status.is_success() {
-        let detail = parse_deepseek_error_message(&text_body)
-            .unwrap_or_else(|| format!("deepseek upstream returned {}", status));
-        return Ok(DeepseekResult {
-            text: String::new(),
-            status,
-            error: Some(detail),
-            usage: TokenUsage::default(),
-            tool_calls: Vec::new(),
-        });
-    }
-
-    let value: Value = serde_json::from_str(&text_body)
-        .map_err(|e| format!("invalid deepseek response JSON: {}", e))?;
-    if let Some(err) = parse_deepseek_error_message(&text_body) {
-        if value.pointer("/choices/0/message").is_none() {
-            return Ok(DeepseekResult {
-                text: String::new(),
-                status,
-                error: Some(err),
-                usage: TokenUsage::default(),
-                tool_calls: Vec::new(),
-            });
-        }
-    }
-
-    let message = value.pointer("/choices/0/message");
-    let content = message
-        .and_then(|m| m.get("content"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let tool_calls = parse_deepseek_tool_calls(message);
-
-    Ok(DeepseekResult {
-        text: content,
-        status,
-        error: None,
-        usage: crate::usage::tokens::parse_usage("deepseek", &text_body),
-        tool_calls,
-    })
-}
-
-/// Streaming sibling of `send_deepseek_openai`: forces `stream: true` and
-/// returns the upstream `reqwest::Response` for caller-driven SSE parsing.
-pub(crate) async fn send_deepseek_openai_streaming(
+/// Streaming caller for DeepSeek's `/v1/responses`. The upstream is **always**
+/// called with `stream: true` — `ensure_codex_payload_defaults` forces it on
+/// every Codex payload before dispatch, so even non-streaming clients must
+/// consume an SSE response. The gateway then either pipes the bytes through
+/// (streaming client) or buffers the whole stream and aggregates it back into
+/// a Responses JSON object via `sse::aggregate_codex_sse_to_response_json`
+/// (non-streaming client).
+pub(crate) async fn send_deepseek_responses_streaming(
     account: &UpstreamAccount,
     model: &str,
     payload: &Value,
@@ -544,9 +262,14 @@ pub(crate) async fn send_deepseek_openai_streaming(
     if api_key.is_empty() {
         return Err("deepseek account has empty api key".to_string());
     }
-    let url = format!("{}/chat/completions", base);
-    let mut body = build_deepseek_openai_body(model, payload);
-    body["stream"] = json!(true);
+
+    let url = format!("{}{}", base, DEEPSEEK_RESPONSES_PATH);
+    let mut body = payload.clone();
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("model".to_string(), Value::String(model.to_string()));
+        obj.insert("stream".to_string(), Value::Bool(true));
+    }
+
     deepseek_http_client()
         .post(&url)
         .bearer_auth(api_key)
@@ -556,42 +279,6 @@ pub(crate) async fn send_deepseek_openai_streaming(
         .send()
         .await
         .map_err(|e| format!("deepseek streaming request failed ({}): {}", url, e))
-}
-
-fn parse_deepseek_tool_calls(message: Option<&Value>) -> Vec<DeepseekToolCall> {
-    let Some(arr) = message.and_then(|m| m.get("tool_calls")).and_then(|v| v.as_array()) else {
-        return Vec::new();
-    };
-    let mut out = Vec::with_capacity(arr.len());
-    for tc in arr {
-        let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let name = tc
-            .pointer("/function/name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let arguments = tc
-            .pointer("/function/arguments")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        if id.is_empty() && name.is_empty() && arguments.is_empty() {
-            continue;
-        }
-        out.push(DeepseekToolCall { id, name, arguments });
-    }
-    out
-}
-
-/// DeepSeek follows the OpenAI error shape (`{"error":{"message":"..."}}`)
-/// but also tolerates a bare `{"error":"..."}`.
-fn parse_deepseek_error_message(body: &str) -> Option<String> {
-    let v: Value = serde_json::from_str(body).ok()?;
-    let err = v.get("error")?;
-    if let Some(s) = err.as_str() {
-        return Some(s.to_string());
-    }
-    err.get("message").and_then(|m| m.as_str()).map(|s| s.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -703,20 +390,22 @@ pub(crate) async fn probe_deepseek(account: &UpstreamAccount) -> Result<(), Stri
 }
 
 async fn probe_deepseek_openai(account: &UpstreamAccount, base: &str) -> Result<(), String> {
-    let url = format!("{}/chat/completions", base);
+    let url = format!("{}{}", base, DEEPSEEK_RESPONSES_PATH);
     let resp = deepseek_http_client()
         .post(&url)
         .bearer_auth(account.bearer())
         .header(CONTENT_TYPE, "application/json")
         .json(&json!({
-            "model": deepseek_openai_canonical_model("deepseek"),
-            "messages": [{ "role": "user", "content": "ping" }],
-            "max_tokens": 1,
+            "model": deepseek_default_model(),
+            "input": [{ "role": "user", "content": [
+                { "type": "input_text", "text": "ping" }
+            ]}],
+            "max_output_tokens": 1,
             "stream": false,
         }))
         .send()
         .await
-        .map_err(|e| format!("无法连接 DeepSeek OpenAI ({}): {}", url, e))?;
+        .map_err(|e| format!("无法连接 DeepSeek Responses ({}): {}", url, e))?;
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
@@ -726,10 +415,21 @@ async fn probe_deepseek_openai(account: &UpstreamAccount, base: &str) -> Result<
             truncate_text(&body, 200)
         ));
     }
-    if let Some(msg) = parse_deepseek_error_message(&body) {
-        let lower = msg.to_ascii_lowercase();
-        if lower.contains("auth") || lower.contains("api key") || lower.contains("apikey") {
-            return Err(format!("DeepSeek 鉴权失败: {}", msg));
+    // Both Responses shape `{"error":{"message":"..."}}` and bare `{"error":"..."}`
+    // carry auth/quota info — surface them so a wrong key is diagnosed early.
+    if let Ok(v) = serde_json::from_str::<Value>(&body) {
+        if let Some(err) = v.get("error") {
+            let msg = if let Some(s) = err.as_str() {
+                Some(s.to_string())
+            } else {
+                err.get("message").and_then(|m| m.as_str()).map(|s| s.to_string())
+            };
+            if let Some(m) = msg {
+                let lower = m.to_ascii_lowercase();
+                if lower.contains("auth") || lower.contains("api key") || lower.contains("apikey") {
+                    return Err(format!("DeepSeek 鉴权失败: {}", m));
+                }
+            }
         }
     }
     Ok(())
@@ -785,8 +485,12 @@ mod tests {
         std::env::remove_var("DEEPSEEK_OPUS_MODEL");
         std::env::remove_var("DEEPSEEK_SONNET_MODEL");
         std::env::remove_var("DEEPSEEK_FABLE_MODEL");
+        // Native Anthropic-surface ids pass through.
         assert_eq!(deepseek_canonical_model("deepseek/deepseek-v4-pro[1m]"), "deepseek-v4-pro[1m]");
         assert_eq!(deepseek_canonical_model("deepseek-v4-flash"), "deepseek-v4-flash");
+        // Bare `deepseek` lands on the configured default — for the Responses
+        // surface that's the reasoner flavor once the operator sets
+        // `DEEPSEEK_DEFAULT_MODEL=deepseek-reasoner`.
         assert_eq!(deepseek_canonical_model("deepseek"), BUILTIN_DEFAULT_MODEL);
         // Claude Code's tier names map onto the three upstream slots. haiku
         // folds into sonnet because Claude Code's haiku ids don't contain the
@@ -806,8 +510,8 @@ mod tests {
         std::env::remove_var("DEEPSEEK_MODELS");
         let cat = deepseek_model_catalog();
         assert_eq!(cat[0].slug, "deepseek");
-        assert!(cat.iter().any(|m| m.slug == "deepseek/deepseek-v4-pro"));
-        assert!(cat.iter().any(|m| m.slug == "deepseek/deepseek-v4-flash"));
+        assert!(cat.iter().any(|m| m.slug == "deepseek/deepseek-chat"));
+        assert!(cat.iter().any(|m| m.slug == "deepseek/deepseek-reasoner"));
     }
 
     #[test]
@@ -831,10 +535,13 @@ mod tests {
             created_at: Utc::now(),
             runtime: AccountRuntime::default(),
         };
-        assert_eq!(deepseek_openai_base(&acc), BUILTIN_OPENAI_BASE);
-        // Explicit base wins, trailing slash stripped.
-        acc.base_url = "https://api.deepseek.com/v1/".into();
-        assert_eq!(deepseek_openai_base(&acc), "https://api.deepseek.com/v1");
+        // Built-in default is the bare host — `/v1/responses` is appended at
+        // the call site, never embedded in the base URL.
+        assert_eq!(deepseek_openai_base(&acc), "https://api.deepseek.com");
+        // Explicit base wins, trailing slash stripped. Stripping `/v1` is the
+        // operator's job — the gateway never re-strips it automatically.
+        acc.base_url = "https://api.deepseek.com/".into();
+        assert_eq!(deepseek_openai_base(&acc), "https://api.deepseek.com");
         // Env override (no account base) wins over the built-in default.
         std::env::set_var("DEEPSEEK_BASE_URL", "https://env.example/v1");
         acc.base_url.clear();
@@ -868,54 +575,5 @@ mod tests {
         // Explicit alt wins, trailing slash stripped.
         acc.base_url_alt = "https://api.deepseek.com/anthropic/".into();
         assert_eq!(deepseek_anthropic_base(&acc), "https://api.deepseek.com/anthropic");
-    }
-
-    #[test]
-    fn openai_canonical_model_resolves_via_env_or_builtin() {
-        std::env::remove_var("DEEPSEEK_OPENAI_MODEL");
-        assert_eq!(deepseek_openai_canonical_model("deepseek"), BUILTIN_OPENAI_MODEL);
-        // The input model name is intentionally ignored on the OpenAI path —
-        // both surfaces publish different ids, and forcing one onto the other
-        // would just 400. The single configurable id wins for everything.
-        assert_eq!(deepseek_openai_canonical_model("claude-opus-4-6"), BUILTIN_OPENAI_MODEL);
-        std::env::set_var("DEEPSEEK_OPENAI_MODEL", "deepseek-reasoner");
-        assert_eq!(deepseek_openai_canonical_model("deepseek"), "deepseek-reasoner");
-        std::env::remove_var("DEEPSEEK_OPENAI_MODEL");
-    }
-
-    #[test]
-    fn responses_to_chat_messages_preserves_tool_calls() {
-        let payload = json!({
-            "instructions": "You are a helpful assistant.",
-            "input": [
-                { "type": "message", "role": "user", "content": [
-                    { "type": "input_text", "text": "summarize this" }
-                ]},
-                { "type": "function_call", "call_id": "call_abc",
-                  "name": "summarize", "arguments": "{\"text\":\"hello\"}" },
-                { "type": "function_call_output", "call_id": "call_abc",
-                  "output": "summary!" }
-            ],
-            "tools": [
-                { "type": "function", "name": "summarize",
-                  "description": "summarize",
-                  "parameters": { "type": "object", "properties": { "text": { "type": "string" } } } }
-            ]
-        });
-        let msgs = convert_responses_to_chat_messages(&payload);
-        // system + user + assistant(tool_calls) + tool = 4 entries
-        assert_eq!(msgs.len(), 4);
-        assert_eq!(msgs[0]["role"], "system");
-        assert_eq!(msgs[1]["role"], "user");
-        assert_eq!(msgs[2]["role"], "assistant");
-        let tc = &msgs[2]["tool_calls"][0];
-        assert_eq!(tc["id"], "call_abc");
-        assert_eq!(tc["function"]["name"], "summarize");
-        assert_eq!(msgs[3]["role"], "tool");
-        assert_eq!(msgs[3]["tool_call_id"], "call_abc");
-        let tools = convert_responses_tools(&payload).expect("non-empty tools");
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0]["type"], "function");
-        assert_eq!(tools[0]["function"]["name"], "summarize");
     }
 }
