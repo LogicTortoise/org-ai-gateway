@@ -1,7 +1,8 @@
 # 排查：Codex 0.147 Desktop 发不出 tool_call（`apply_patch` 被吞）
 
 > 状态：✅ 已修（commit `565f034`）  
-> 适用：Codex CLI / Codex Desktop 0.147+ 通过 `/v1/responses` → org-ai-gateway → minimax / deepseek / glm / kimi 这种 Chat Completions 兼容上游的链路
+> 适用（历史）：Codex CLI / Codex Desktop 0.147+ 通过 `/v1/responses` → org-ai-gateway → minimax / deepseek / glm / kimi 这种 Chat Completions 兼容上游的链路  
+> 现状（2026-08 后的新架构）：MiniMax 路径已经从 "Responses↔Chat Completions 适配层" 改成 **原生 Responses 透传**（命中 `/v1/responses`），上面说的 `convert_responses_tools` 整个删掉了，"function 被吞" 这条具体的 bug 不会再出现。deepseek / glm / kimi **仍然**走 Chat Completions 适配层，对应的转换器是 `src/provider/deepseek.rs::convert_responses_tools` / `src/provider/kimi.rs` 里的同名函数；本 doc 里"5 分钟诊断"那套做 deepseek / glm / kimi 排查时依然有用。
 
 ## 症状
 

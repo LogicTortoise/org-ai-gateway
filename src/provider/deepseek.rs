@@ -286,10 +286,13 @@ pub(crate) struct DeepseekToolCall {
 
 /// Build the Chat Completions `messages` array from a Responses API payload.
 ///
-/// Identical conversion to `minimax::convert_responses_to_chat_messages`; the
-/// two providers share the same OpenAI surface shape (standard
-/// `/chat/completions`). Kept as a private helper here rather than imported so
-/// the adapter surface stays local to each provider.
+/// Mirrors the shape that used to live in `minimax::convert_responses_to_chat_messages`.
+/// As of 2026-08, the MiniMax Codex path no longer goes through this adapter
+/// at all — it forwards to MiniMax's native `/v1/responses` directly and
+/// returns its Responses shape verbatim. DeepSeek still rides the standard
+/// OpenAI Chat Completions surface, so it keeps its own local copy of the
+/// converter (kept private rather than imported so the adapter surface
+/// stays local to each provider).
 pub(crate) fn convert_responses_to_chat_messages(payload: &Value) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
 

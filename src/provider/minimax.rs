@@ -12,34 +12,31 @@
 //!      buffers and returns them verbatim — **tool calls survive**. No Claude
 //!      Code fingerprint is injected (MiniMax is not Anthropic).
 //!
-//!   2. **Codex / OpenAI-format traffic** (`/v1/responses`,
-//!      `/v1/chat/completions`): proxied to MiniMax's OpenAI-compatible
-//!      endpoint (`{base_url_openai}/v1/text/chatcompletion_v2`). The payload
-//!      is rewritten from OpenAI Responses (`input` array of typed blocks +
-//!      top-level `tools` + `instructions`) into OpenAI Chat Completions
-//!      (`messages` + `tools`), and the response is rewritten back. **Function
-//!      calling survives** (this is what distinguishes minimax from the GLM/
-//!      Kimi text-only adapter). Non-streaming only on the OpenAI path —
-//!      streaming tool-call deltas are aggregated into a single
-//!      `response.output_item.done` event instead of incremental deltas, so
-//!      streaming clients still see the tool call, just with first-token delay.
+//!   2. **Codex / OpenAI-format traffic** (`/v1/responses`): proxied straight
+//!      through to MiniMax's native Responses API at
+//!      `{base_url_openai}/v1/responses`. The Codex CLI is configured with
+//!      `wire_api = "responses"` per the official MiniMax integration guide
+//!      (`platform.minimaxi.com/docs/token-plan/codex`); the payload matches
+//!      MiniMax's wire shape exactly and needs no translation. Both
+//!      `stream: true` and `stream: false` are forwarded as-is.
 //!
 //! An "account" carries:
 //!   * `base_url` — OpenAI-compatible prefix; defaults to `MINIMAX_BASE_URL` env,
-//!     else `https://api.minimaxi.com`. `/v1/text/chatcompletion_v2` is appended.
-//!     Override to `https://api.minimax.io` for the international site. The
-//!     base URL must NOT include `/v1` — `MINIMAX_OPENAI_PATH` already carries
+//!     else `https://api.minimaxi.com`. `/v1/responses` is appended. The base
+//!     URL must NOT include `/v1` — `MINIMAX_RESPONSES_PATH` already carries
 //!     that prefix, so a base ending in `/v1` produces a doubled `/v1/v1/...`
-//!     and a 404.
+//!     and a 404. Override to `https://api.minimax.io` for the international
+//!     site.
 //!   * `base_url_alt` — Anthropic-compatible prefix; defaults to
 //!     `MINIMAX_ANTHROPIC_BASE_URL` env, else `https://api.minimaxi.com/anthropic`.
 //!     `/v1/messages` is appended.
 //!   * `api_key` / `access_token` — the MiniMax API key. Both endpoints accept
 //!     `Authorization: Bearer`.
 //!
-//! Token counts are REAL on both paths (Anthropic endpoint returns
-//! Anthropic-shaped usage, OpenAI endpoint returns `prompt_tokens`/
-//! `completion_tokens`). See `usage::tokens::parse_usage("minimax", ...)`.
+//! Token counts are REAL on the Anthropic path (miniMax returns
+//! Anthropic-shaped usage). On the Responses path the upstream also returns
+//! real `usage.input_tokens` / `usage.output_tokens` /
+//! `usage.input_tokens_details.cached_tokens`.
 use crate::prelude::*;
 use crate::util::truncate_text;
 
@@ -72,26 +69,27 @@ fn spec() -> &'static crate::provider::model_config::ProviderModelSpec {
     crate::provider::model_config::spec("minimax").expect("minimax model spec")
 }
 
-/// Built-in MiniMax OpenAI-compatible endpoint (mainland site). Used when
-/// neither the account nor `MINIMAX_BASE_URL` supplies one, so connecting only
-/// needs an api key. Override to `https://api.minimax.io` for the
-/// international site via `MINIMAX_BASE_URL` (or per-account `base_url`).
-///
-/// The base URL must end at the host (or its namespace prefix like
-/// `/anthropic` for the Anthropic surface) — it must NOT include `/v1`.
-/// `MINIMAX_OPENAI_PATH` carries the `/v1/...` segment, so a base ending in
-/// `/v1` produces a doubled `/v1/v1/text/chatcompletion_v2` and a 404.
+/// The MiniMax OpenAI-compatible base prefix (mainland site). The base URL
+/// MUST end at the host — it must NOT include `/v1` or any path segment.
+/// The MiniMax Codex endpoint is `{base}/v1/responses`; appending `/v1` again
+/// would produce a doubled `/v1/v1/responses` and a 404.
 const BUILTIN_OPENAI_BASE: &str = "https://api.minimaxi.com";
+
+/// The MiniMax OpenAI-compatible Codex endpoint path. MiniMax serves the
+/// Responses API natively — the Codex client (`wire_api = "responses"` in
+/// its config.toml) sends a vanilla Responses payload (`input[]` /
+/// `instructions` / `tools`) and gets a vanilla Responses payload back. No
+/// conversion is needed; this gateway is a transparent pipe. Hitting
+/// `/v1/chat/completions` or `/v1/text/chatcompletion_v2` instead would
+/// either 404 or return the cryptic
+/// `{"base_resp":{"status_code":2013,"status_msg":"invalid params, chat
+/// content is empty"}}` shape (because the Chat Completions adapter on top of
+/// the Responses endpoint can't parse a Responses-shaped request).
+const MINIMAX_RESPONSES_PATH: &str = "/v1/responses";
 
 /// Built-in MiniMax Anthropic-compatible endpoint (mainland site). Used when
 /// neither the account nor `MINIMAX_ANTHROPIC_BASE_URL` supplies one.
 const BUILTIN_ANTHROPIC_BASE: &str = "https://api.minimaxi.com/anthropic";
-
-/// The MiniMax OpenAI-compatible path. This is the only `/v2` variant in this
-/// codebase: MiniMax's OpenAI surface lives at `/v1/text/chatcompletion_v2`,
-/// NOT the standard `/v1/chat/completions`. Hitting the standard path returns
-/// 404.
-const MINIMAX_OPENAI_PATH: &str = "/v1/text/chatcompletion_v2";
 
 /// Dedicated HTTP client for MiniMax. Short connect timeout (fail fast on the
 /// fallback path) and a generous total timeout (long generations). Shared
@@ -237,385 +235,46 @@ pub(crate) fn supports_openai(account: &UpstreamAccount) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// OpenAI-compatible upstream call (Codex slot)
+// OpenAI-compatible upstream call (Codex slot) — Responses-API passthrough
 // ---------------------------------------------------------------------------
 //
-// The Codex slot sends OpenAI Responses payloads (top-level `input` array of
-// typed blocks, `instructions`, `tools`). MiniMax's OpenAI surface is a
-// Chat-Completions-shaped `/v1/text/chatcompletion_v2`, so we rewrite:
-//   * `instructions` + `input` (message / function_call / function_call_output
-//     blocks) -> `messages` array with `system`/`user`/`assistant`/`tool` roles
-//   * `tools` -> Chat Completions `tools` (OpenAI standard, identical shape)
-//   * upstream response (text + `tool_calls`) -> Responses API `output` array
-//     (message + function_call blocks) for the non-streaming aggregation
-// Streaming is supported but the gateway buffers the entire response anyway
-// (account-swap retry needs the full body), so this is always non-streaming on
-// the wire to MiniMax even when the client asked for `stream: true`.
+// The Codex slot (`wire_api = "responses"` in `config.toml`) sends OpenAI
+// Responses payloads: a top-level `input` array of typed blocks
+// (`message` / `function_call` / `function_call_output` / `reasoning` / …),
+// a top-level `instructions` string, and a top-level `tools` array. Back
+// it gets a Responses-shaped response (`output[]` of typed blocks plus
+// `usage` with `input_tokens_details.cached_tokens` / `output_tokens`).
 //
-// MiniMax supports `tools` / `tool_choice` / `tool_calls` per their v2 docs.
+// MiniMax serves the **Responses API natively** at
+// `{base_url}/v1/responses` — same shape in, same shape out, no conversion.
+// The Codex CLI itself is configured to talk to MiniMax this way per the
+// official integration guide (`platform.minimaxi.com/docs/token-plan/codex`).
+//
+// This is a deliberate departure from the previous design, which rewrote
+// Responses → Chat Completions and posted to `/v1/text/chatcompletion_v2`.
+// That conversion was unnecessary — and worse, MiniMax's
+// `/v1/text/chatcompletion_v2` is a thin Chat Completions adapter layered
+// over the Responses endpoint, so it returned the cryptic
+// `{"base_resp":{"status_code":2013,"status_msg":"invalid params, chat
+// content is empty"}}` shape when handed a Responses-shaped payload it
+// couldn't parse. Forwarding the same payload to `/v1/responses` directly
+// just works (verified live).
+//
+// The gateway is therefore a transparent pipe on this path: it rewrites
+// only `model` (to a MiniMax catalog id) and `stream` (forces `true` on
+// the streaming sibling), and forwards everything else byte-for-byte.
+// Both senders return the raw `reqwest::Response` so the caller can
+// either buffer it (non-streaming) or translate SSE events event-by-event
+// (streaming).
 
-/// Outcome of a MiniMax OpenAI-compatible call. Mirrors `KimiResult` / `GlmResult`
-/// but adds the parsed `tool_calls` so the renderer can rebuild the Responses
-/// `output` array correctly.
-pub(crate) struct MinimaxResult {
-    pub(crate) text: String,
-    pub(crate) status: reqwest::StatusCode,
-    pub(crate) error: Option<String>,
-    /// Real token usage parsed from the response (`usage.prompt_tokens` /
-    /// `usage.completion_tokens`); zero when the upstream omitted them.
-    pub(crate) usage: TokenUsage,
-    /// Parsed `tool_calls` from the upstream `choices[0].message.tool_calls`
-    /// array (each entry's `id` / `function.name` / `function.arguments`).
-    pub(crate) tool_calls: Vec<MinimaxToolCall>,
-}
-
-/// A single Chat-Completions-shaped tool call from MiniMax.
-#[derive(Debug, Clone)]
-pub(crate) struct MinimaxToolCall {
-    pub(crate) id: String,
-    pub(crate) name: String,
-    /// The raw `function.arguments` string from the upstream. It's already
-    /// JSON-shaped, so we pass it through to the client without re-parsing.
-    pub(crate) arguments: String,
-}
-
-/// Build the Chat Completions `messages` array from a Responses API payload.
-///
-/// Walks the `input` array, converting each block:
-///
-///   * `type: "message"`        -> `role: user|assistant|system|developer` with
-///                                 text content (concatenated from all
-///                                 `input_text`/`output_text` parts; non-text
-///                                 parts like `input_image` are skipped — MiniMax
-///                                 is text-only).
-///   * `type: "function_call"`  -> `role: assistant` with a synthetic
-///                                 `tool_calls` entry (id / name / arguments).
-///   * `type: "function_call_output` (or
-///     `type: "function_call_output"`) -> `role: tool` with `tool_call_id` set
-///                                 and `content` carrying the tool output.
-///
-/// `instructions` (top-level) and any `system` / `developer` messages inside
-/// `input` become a leading `role: system` message.
-pub(crate) fn convert_responses_to_chat_messages(payload: &Value) -> Vec<Value> {
-    let mut out: Vec<Value> = Vec::new();
-
-    // 1. Top-level `instructions` (Responses API) -> system message.
-    let mut sys_buf = String::new();
-    if let Some(s) = payload.get("instructions").and_then(|v| v.as_str()) {
-        if !s.trim().is_empty() {
-            sys_buf.push_str(s);
-        }
-    }
-
-    // 2. Walk `input`.
-    if let Some(items) = payload.get("input").and_then(|v| v.as_array()) {
-        for item in items {
-            let Some(it) = item.as_object() else { continue };
-            let t = it.get("type").and_then(|v| v.as_str()).unwrap_or("");
-
-            match t {
-                "message" => {
-                    let role = it.get("role").and_then(|v| v.as_str()).unwrap_or("user");
-                    let content = match it.get("content") {
-                        Some(Value::String(s)) => s.clone(),
-                        Some(Value::Array(parts)) => collect_text_parts(parts),
-                        _ => String::new(),
-                    };
-                    match role {
-                        "system" | "developer" => {
-                            if !sys_buf.is_empty() {
-                                sys_buf.push('\n');
-                            }
-                            sys_buf.push_str(&content);
-                        }
-                        "assistant" => {
-                            out.push(json!({ "role": "assistant", "content": content }));
-                        }
-                        _ => {
-                            // Default + "user" + unknown: treat as user. Codex
-                            // doesn't emit "tool" messages via `input` — those
-                            // come through as `function_call_output`.
-                            out.push(json!({ "role": "user", "content": content }));
-                        }
-                    }
-                }
-                "function_call" => {
-                    // Assistant turn that called a tool. Chat Completions
-                    // represents this as an assistant message with a
-                    // `tool_calls` array (content can be null or empty).
-                    let id = it
-                        .get("call_id")
-                        .and_then(|v| v.as_str())
-                        .or_else(|| it.get("id").and_then(|v| v.as_str()))
-                        .unwrap_or("")
-                        .to_string();
-                    let name = it.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    // Responses API `arguments` is already a JSON STRING
-                    // (matches OpenAI Chat Completions convention).
-                    let arguments = match it.get("arguments") {
-                        Some(Value::String(s)) => s.clone(),
-                        Some(other) => other.to_string(),
-                        None => String::new(),
-                    };
-                    out.push(json!({
-                        "role": "assistant",
-                        "content": "",
-                        "tool_calls": [{
-                            "id": id,
-                            "type": "function",
-                            "function": { "name": name, "arguments": arguments }
-                        }]
-                    }));
-                }
-                "function_call_output" => {
-                    // Tool result echoed back. Chat Completions uses a
-                    // `role: tool` message keyed by `tool_call_id`.
-                    let call_id = it.get("call_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    let output = it.get("output").map(|v| {
-                        if let Value::String(s) = v {
-                            s.clone()
-                        } else {
-                            v.to_string()
-                        }
-                    }).unwrap_or_default();
-                    out.push(json!({
-                        "role": "tool",
-                        "tool_call_id": call_id,
-                        "content": output
-                    }));
-                }
-                _ => {
-                    // Unknown / unsupported block types (`reasoning`,
-                    // `web_search_call`, `file_search_call`, `computer_call`,
-                    // ...): skip silently. MiniMax is text + tools only; passing
-                    // these through would either 400 or be ignored.
-                }
-            }
-        }
-    }
-
-    if !sys_buf.is_empty() {
-        out.insert(0, json!({ "role": "system", "content": sys_buf }));
-    }
-    out
-}
-
-/// Concatenate text from an OpenAI / Responses content-part array, ignoring
-/// non-text parts (images, etc.). Matches `cursor::text_from_parts` but is
-/// private to this provider to keep the adapter surface local.
-fn collect_text_parts(parts: &[Value]) -> String {
-    let mut out: Vec<&str> = Vec::new();
-    for p in parts {
-        let Some(part) = p.as_object() else { continue };
-        if let Some(t) = part.get("type").and_then(|v| v.as_str()) {
-            if !matches!(t, "text" | "input_text" | "output_text") {
-                continue;
-            }
-        }
-        if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
-            if !text.is_empty() {
-                out.push(text);
-            }
-        }
-    }
-    out.join("\n")
-}
-
-/// Convert a Responses API `tools` array into Chat Completions `tools`. The
-/// Codex CLI (Responses API) emits tools in the **flat** shape
-/// (`{type, name, description, parameters, strict}`); MiniMax's Chat
-/// Completions surface expects the **wrapped** shape
-/// (`{type: "function", function: {name, description, parameters, strict}}`).
-/// We have to rewrap or MiniMax answers `status_code: 2013
-/// "invalid params, function is empty"` and returns an empty `choices:null`
-/// body — which the proxy then faithfully pipes back as `text: ""` and
-/// `output_tokens: 0` to the Codex client. Anything already in the wrapped
-/// shape (rare from Codex, but cheap to handle) passes through.
-///
-/// Codex 0.147 (Desktop / vscode) breaks the simple "flat shape" assumption:
-/// its `tools` array mixes several encodings the upstream Responses spec lets
-/// clients invent:
-///
-///   * `{"type":"function", name, ...}` — the normal Responses flat shape.
-///   * `{"type":"custom", name, ...}` — Codex's `apply_patch` and any future
-///     custom tools use this. The OpenAI wire shape is identical to
-///     `type:"function"`, so we just rewrap with the same `{function:{...}}`
-///     form; the tool `name` stays verbatim and Codex dispatches on it.
-///   * `{"type":"namespace", name, tools:[...]}` — Codex groups tools under a
-///     namespace (e.g. `codex_app` with three nested automation functions,
-///     `image_gen` with its gen function). The upstream Responses protocol
-///     asks clients to dispatch by `namespace + tool name`; the spec doesn't
-///     say "send them flat". We have to flatten these so the OpenAI-style
-///     upstream sees ordinary function entries — otherwise **every** tool
-///     Codex ships under a namespace gets silently dropped here, including
-///     the file-edit tool `apply_patch` when it's nested under a namespace,
-///     which is what made backtest-lab sessions look "frozen at a colon" —
-///     the model literally could not have the edit tool to call.
-///   * `{"type":"web_search" / "tool_search" / "file_search", ...}` — Codex's
-///     built-in server tools. MiniMax has no equivalent, so they stay
-///     dropped (better than a 400).
-pub(crate) fn convert_responses_tools(payload: &Value) -> Option<Vec<Value>> {
-    let tools = payload.get("tools").and_then(|v| v.as_array())?;
-    let mut out = Vec::with_capacity(tools.len());
-    for t in tools {
-        convert_one_responses_tool(t, &mut out);
-    }
-    if out.is_empty() { None } else { Some(out) }
-}
-
-/// Recursive helper so `type:"namespace"` entries can flatten their nested
-/// `tools[]` through the same rewrap path as the top-level array. Anything
-/// that isn't a rewrappable function (server tools, missing names, malformed
-/// entries) is dropped silently — the OpenAI wire shape won't accept them
-/// and 400ing here would just break every Codex request.
-fn convert_one_responses_tool(t: &Value, out: &mut Vec<Value>) {
-    let Some(obj) = t.as_object() else { return };
-    let ty = obj.get("type").and_then(|v| v.as_str()).unwrap_or("function");
-
-    match ty {
-        // Normal Responses flat shape, OR Codex's `type:"custom"` variant
-        // (same on-wire shape, different tag) — both rewrap the same way.
-        "function" | "custom" => {
-            if obj.contains_key("function") {
-                // Already wrapped (rare from Codex, but cheap to handle).
-                out.push(t.clone());
-                return;
-            }
-            let mut function = serde_json::Map::new();
-            for k in ["name", "description", "parameters", "strict"] {
-                if let Some(v) = obj.get(k) {
-                    function.insert(k.to_string(), v.clone());
-                }
-            }
-            // `name` is the only field MiniMax's tool dispatcher actually requires;
-            // an empty `name` is exactly the "function is empty" symptom we're
-            // guarding against, so skip instead of forwarding a broken entry.
-            if function.get("name").and_then(|v| v.as_str()).map(str::is_empty).unwrap_or(true) {
-                return;
-            }
-            out.push(json!({
-                "type": "function",
-                "function": Value::Object(function),
-            }));
-        }
-        // Codex groups tools under namespaces. The OpenAI Chat Completions
-        // surface has no concept of namespaces — flatten to plain functions.
-        "namespace" => {
-            if let Some(nested) = obj.get("tools").and_then(|v| v.as_array()) {
-                for nt in nested {
-                    convert_one_responses_tool(nt, out);
-                }
-            }
-        }
-        // Codex built-in server tools (`web_search`, `tool_search`,
-        // `file_search`, `image_gen` standalone, etc.) — no MiniMax equivalent,
-        // drop silently rather than 400.
-        _ => {}
-    }
-}
-
-/// Build the OpenAI Chat Completions request body for MiniMax from a Responses
-/// API payload. Always `stream: false` — the gateway buffers everything for
-/// safe account-swap retry.
-fn build_minimax_openai_body(model: &str, payload: &Value) -> Value {
-    let mut body = json!({
-        "model": model,
-        "messages": convert_responses_to_chat_messages(payload),
-        "stream": false,
-    });
-    if let Some(tools) = convert_responses_tools(payload) {
-        body["tools"] = json!(tools);
-        // Honor the client's `tool_choice` if it set one. Default `auto` would
-        // be set by the upstream on its own.
-        if let Some(tc) = payload.get("tool_choice") {
-            body["tool_choice"] = tc.clone();
-        }
-    }
-    body
-}
-
-/// Send one chat request to MiniMax's OpenAI-compatible
-/// `/v1/text/chatcompletion_v2` and return the assistant text + parsed
-/// tool_calls + real token usage. Always non-streaming.
-pub(crate) async fn send_minimax_openai(
-    account: &UpstreamAccount,
-    model: &str,
-    payload: &Value,
-) -> Result<MinimaxResult, String> {
-    let base = minimax_openai_base(account);
-    if base.is_empty() {
-        return Err("minimax account has no OpenAI-compatible base_url".to_string());
-    }
-    let api_key = account.bearer();
-    if api_key.is_empty() {
-        return Err("minimax account has empty api key".to_string());
-    }
-
-    let url = format!("{}{}", base, MINIMAX_OPENAI_PATH);
-    let body = build_minimax_openai_body(model, payload);
-
-    let resp = minimax_http_client()
-        .post(&url)
-        .bearer_auth(api_key)
-        .header(CONTENT_TYPE, "application/json")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("minimax upstream request failed ({}): {}", url, e))?;
-    let status = resp.status();
-    let text_body = resp
-        .text()
-        .await
-        .map_err(|e| format!("reading minimax upstream body failed: {}", e))?;
-
-    if !status.is_success() {
-        let detail = parse_minimax_error_message(&text_body)
-            .unwrap_or_else(|| format!("minimax upstream returned {}", status));
-        return Ok(MinimaxResult {
-            text: String::new(),
-            status,
-            error: Some(detail),
-            usage: TokenUsage::default(),
-            tool_calls: Vec::new(),
-        });
-    }
-
-    let value: Value = serde_json::from_str(&text_body)
-        .map_err(|e| format!("invalid minimax response JSON: {}", e))?;
-    if let Some(err) = parse_minimax_error_message(&text_body) {
-        if value.pointer("/choices/0/message").is_none() {
-            return Ok(MinimaxResult {
-                text: String::new(),
-                status,
-                error: Some(err),
-                usage: TokenUsage::default(),
-                tool_calls: Vec::new(),
-            });
-        }
-    }
-
-    let message = value.pointer("/choices/0/message");
-    let content = message
-        .and_then(|m| m.get("content"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let tool_calls = parse_minimax_tool_calls(message);
-
-    Ok(MinimaxResult {
-        text: content,
-        status,
-        error: None,
-        usage: crate::usage::tokens::parse_usage("minimax", &text_body),
-        tool_calls,
-    })
-}
-
-/// Streaming sibling of `send_minimax_openai`: forces `stream: true` on the
-/// wire and returns the upstream `reqwest::Response` so the caller can read
-/// the SSE chunks and translate them event-by-event. The caller is
-/// responsible for parsing the chunk stream — this just opens the pipe.
-pub(crate) async fn send_minimax_openai_streaming(
+/// Streaming caller for MiniMax's `/v1/responses`. The upstream is **always**
+/// called with `stream: true` — `ensure_codex_payload_defaults` forces it on
+/// every Codex payload before dispatch, so even non-streaming clients must
+/// consume an SSE response. The gateway then either pipes the bytes through
+/// (streaming client) or buffers the whole stream and aggregates it back into
+/// a Responses JSON object via `sse::aggregate_codex_sse_to_response_json`
+/// (non-streaming client).
+pub(crate) async fn send_minimax_responses_streaming(
     account: &UpstreamAccount,
     model: &str,
     payload: &Value,
@@ -628,9 +287,14 @@ pub(crate) async fn send_minimax_openai_streaming(
     if api_key.is_empty() {
         return Err("minimax account has empty api key".to_string());
     }
-    let url = format!("{}{}", base, MINIMAX_OPENAI_PATH);
-    let mut body = build_minimax_openai_body(model, payload);
-    body["stream"] = json!(true);
+
+    let url = format!("{}{}", base, MINIMAX_RESPONSES_PATH);
+    let mut body = payload.clone();
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("model".to_string(), Value::String(model.to_string()));
+        obj.insert("stream".to_string(), Value::Bool(true));
+    }
+
     minimax_http_client()
         .post(&url)
         .bearer_auth(api_key)
@@ -642,44 +306,44 @@ pub(crate) async fn send_minimax_openai_streaming(
         .map_err(|e| format!("minimax streaming request failed ({}): {}", url, e))
 }
 
-/// Extract `tool_calls` from a Chat Completions response's `choices[0].message`.
-/// Each upstream entry carries `id` / `function.name` / `function.arguments`
-/// (the arguments are a JSON string, kept verbatim).
-fn parse_minimax_tool_calls(message: Option<&Value>) -> Vec<MinimaxToolCall> {
-    let Some(arr) = message.and_then(|m| m.get("tool_calls")).and_then(|v| v.as_array()) else {
-        return Vec::new();
-    };
-    let mut out = Vec::with_capacity(arr.len());
-    for tc in arr {
-        let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let name = tc
-            .pointer("/function/name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let arguments = tc
-            .pointer("/function/arguments")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        if id.is_empty() && name.is_empty() && arguments.is_empty() {
-            continue;
-        }
-        out.push(MinimaxToolCall { id, name, arguments });
-    }
-    out
-}
-
-/// Pull a human-readable error out of a MiniMax error body. MiniMax follows
-/// the OpenAI shape (`{"error":{"message":"..."}}`) but also tolerates a bare
-/// `{"error":"..."}`.
-fn parse_minimax_error_message(body: &str) -> Option<String> {
+/// Pull a human-readable error out of a MiniMax error body. Two shapes
+/// seen in the wild:
+///
+///   * OpenAI-shape: `{"error":{"message":"..."}}` or bare `{"error":"..."}`
+///     — auth / quota / rate-limit failures land here (and now also into
+///     `/v1/responses` auth/quota rejections, which the OpenAI Responses
+///     surface uses).
+///   * MiniMax-shape: `{"base_resp":{"status_code":2013,
+///     "status_msg":"..."}, ...}` — what the upstream returns when the
+///     request itself is rejected by the `/v1/text/chatcompletion_v2`
+///     adapter. We no longer call that surface for Codex, but the probe
+///     still uses this parser to detect auth failures on either surface.
+///
+/// Surfacing the `status_code` lets the operator grep for the specific
+/// failure mode (e.g. `2013` for context-window overflow).
+pub(crate) fn parse_minimax_error_message(body: &str) -> Option<String> {
     let v: Value = serde_json::from_str(body).ok()?;
-    let err = v.get("error")?;
-    if let Some(s) = err.as_str() {
-        return Some(s.to_string());
+    // MiniMax-shape: top-level `base_resp.status_msg` (+ status_code if present).
+    if let Some(base) = v.get("base_resp").and_then(|b| b.as_object()) {
+        let msg = base.get("status_msg").and_then(|m| m.as_str());
+        let code = base.get("status_code").and_then(|c| c.as_i64());
+        if let Some(m) = msg {
+            return Some(match code {
+                Some(c) => format!("minimax error {}: {}", c, m),
+                None => m.to_string(),
+            });
+        }
     }
-    err.get("message").and_then(|m| m.as_str()).map(|s| s.to_string())
+    // OpenAI-shape: `error` as object with `.message`, or a bare string.
+    if let Some(err) = v.get("error") {
+        if let Some(s) = err.as_str() {
+            return Some(s.to_string());
+        }
+        if let Some(m) = err.get("message").and_then(|m| m.as_str()) {
+            return Some(m.to_string());
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -795,21 +459,26 @@ pub(crate) async fn probe_minimax(account: &UpstreamAccount) -> Result<(), Strin
     Err("MiniMax 缺少 base_url".to_string())
 }
 
+/// Probe the OpenAI-compatible `/v1/responses` surface with a minimal
+/// Responses payload. A 200 OK / 4xx (other than 401/403) means the key works
+/// and the endpoint is reachable; 401/403 means wrong key.
 async fn probe_minimax_openai(account: &UpstreamAccount, base: &str) -> Result<(), String> {
-    let url = format!("{}{}", base, MINIMAX_OPENAI_PATH);
+    let url = format!("{}{}", base, MINIMAX_RESPONSES_PATH);
     let resp = minimax_http_client()
         .post(&url)
         .bearer_auth(account.bearer())
         .header(CONTENT_TYPE, "application/json")
         .json(&json!({
             "model": minimax_canonical_model("minimax"),
-            "messages": [{ "role": "user", "content": "ping" }],
-            "max_tokens": 1,
-            "stream": false,
+            "input": [
+                { "type": "message", "role": "user",
+                  "content": [{ "type": "input_text", "text": "ping" }] }
+            ],
+            "max_output_tokens": 1,
         }))
         .send()
         .await
-        .map_err(|e| format!("无法连接 MiniMax OpenAI ({}): {}", url, e))?;
+        .map_err(|e| format!("无法连接 MiniMax Responses ({}): {}", url, e))?;
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
@@ -959,197 +628,47 @@ mod tests {
     }
 
     #[test]
-    fn responses_to_chat_messages_preserves_tool_calls() {
-        // Codex-format payload: instructions + an input array that walks
-        // through user text -> assistant tool call -> tool result. The
-        // conversion has to keep the `tool_calls` entry on the assistant
-        // message and emit a `role: tool` message for the result.
-        let payload = json!({
-            "instructions": "You are a helpful assistant.",
-            "input": [
-                { "type": "message", "role": "user", "content": [
-                    { "type": "input_text", "text": "what's the weather in SF?" }
-                ]},
-                { "type": "function_call", "call_id": "call_abc",
-                  "name": "get_weather", "arguments": "{\"city\":\"SF\"}" },
-                { "type": "function_call_output", "call_id": "call_abc",
-                  "output": "{\"temp\":68}" }
-            ],
-            "tools": [
-                { "type": "function", "name": "get_weather",
-                  "description": "get weather",
-                  "parameters": { "type": "object", "properties": { "city": { "type": "string" } } } }
-            ]
-        });
-        let msgs = convert_responses_to_chat_messages(&payload);
-        // system + user + assistant(tool_calls) + tool = 4 entries
-        assert_eq!(msgs.len(), 4);
-        assert_eq!(msgs[0]["role"], "system");
-        assert!(msgs[0]["content"].as_str().unwrap().contains("helpful assistant"));
-        assert_eq!(msgs[1]["role"], "user");
-        assert!(msgs[1]["content"].as_str().unwrap().contains("weather in SF"));
-        assert_eq!(msgs[2]["role"], "assistant");
-        let tc = &msgs[2]["tool_calls"][0];
-        assert_eq!(tc["id"], "call_abc");
-        assert_eq!(tc["function"]["name"], "get_weather");
-        assert_eq!(tc["function"]["arguments"], "{\"city\":\"SF\"}");
-        assert_eq!(msgs[3]["role"], "tool");
-        assert_eq!(msgs[3]["tool_call_id"], "call_abc");
-        assert!(msgs[3]["content"].as_str().unwrap().contains("temp"));
-        // And the tool definitions get rewrapped to the Chat Completions shape
-        // (Codex emits flat Responses-API tools; MiniMax / Kimi / GLM /
-        // DeepSeek expect `{type:"function", function:{...}}`).
-        let tools = convert_responses_tools(&payload).expect("non-empty tools");
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0]["type"], "function");
-        assert_eq!(tools[0]["function"]["name"], "get_weather");
-        assert_eq!(tools[0]["function"]["description"], "get weather");
-    }
+    fn parse_minimax_error_message_recognizes_base_resp_shape() {
+        // 1. MiniMax-shape: the actual upstream error format on
+        //    context-window overflow — `choices:null, usage:null` and only
+        //    `base_resp.status_msg` carries the message. Without this branch
+        //    the parser returned None and the caller reported
+        //    `minimax_empty_response` (silent failure).
+        let body = r#"{"choices":null,"usage":null,"base_resp":{"status_code":2013,"status_msg":"invalid params, chat content is empty"}}"#;
+        let msg = parse_minimax_error_message(body).expect("base_resp branch must fire");
+        assert!(msg.contains("2013"), "status_code must be surfaced: {}", msg);
+        assert!(msg.contains("invalid params, chat content is empty"));
 
-    #[test]
-    fn responses_tools_rewraps_flat_shape_passes_through_wrapped_shape() {
-        // 1. Flat Responses-API shape (what Codex actually sends) → must be
-        //    rewrapped under `function`.
-        let flat = json!({
-            "tools": [
-                { "type": "function",
-                  "name": "exec_command",
-                  "description": "Runs a shell command",
-                  "parameters": { "type": "object", "properties": { "cmd": { "type": "string" } }, "required": ["cmd"] },
-                  "strict": false }
-            ]
-        });
-        let tools = convert_responses_tools(&flat).unwrap();
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0]["type"], "function");
-        assert!(tools[0].get("function").is_some(), "missing function wrapper");
-        assert_eq!(tools[0]["function"]["name"], "exec_command");
-        assert_eq!(tools[0]["function"]["description"], "Runs a shell command");
-        assert_eq!(tools[0]["function"]["strict"], false);
+        // 2. base_resp without status_msg falls through to None (rather than
+        //    producing a half-baked "minimax error None: ").
+        let no_msg = r#"{"base_resp":{"status_code":2013}}"#;
+        assert!(parse_minimax_error_message(no_msg).is_none());
+
+        // 3. OpenAI-shape still works (auth/quota errors use this form).
+        let oai = r#"{"error":{"message":"insufficient balance","type":"balance"}}"#;
         assert_eq!(
-            tools[0]["function"]["parameters"]["required"][0],
-            "cmd"
+            parse_minimax_error_message(oai).as_deref(),
+            Some("insufficient balance")
         );
 
-        // 2. Already-wrapped Chat Completions shape → passes through.
-        let wrapped = json!({
-            "tools": [{
-                "type": "function",
-                "function": { "name": "f", "parameters": {} }
-            }]
-        });
-        let tools = convert_responses_tools(&wrapped).unwrap();
-        assert_eq!(tools[0]["function"]["name"], "f");
+        // 4. Bare OpenAI-style `error` string still works.
+        let bare = r#"{"error":"rate limited"}"#;
+        assert_eq!(
+            parse_minimax_error_message(bare).as_deref(),
+            Some("rate limited")
+        );
 
-        // 3. Entry missing `name` (the literal "function is empty" symptom
-        //    the upstream complains about) → must be dropped, not forwarded
-        //    as a broken tool.
-        let nameless = json!({
-            "tools": [
-                { "type": "function", "name": "", "description": "x" },
-                { "type": "function", "name": "ok", "description": "y" }
-            ]
-        });
-        let tools = convert_responses_tools(&nameless).unwrap();
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0]["function"]["name"], "ok");
+        // 5. base_resp without status_msg but with a recognizable OpenAI
+        //    error field — OpenAI branch should still fire (base_resp
+        //    doesn't shadow it).
+        let both = r#"{"base_resp":{"status_code":401},"error":{"message":"bad key"}}"#;
+        assert_eq!(
+            parse_minimax_error_message(both).as_deref(),
+            Some("bad key"),
+            "base_resp without status_msg must not shadow the OpenAI branch"
+        );
 
-        // 4. Codex's `type:"custom"` (e.g. `apply_patch`) rewraps the same way
-        //    as `type:"function"` — same on-wire shape, just a different tag
-        //    the OpenAI Responses spec allows. Without this rewrap the only
-        //    file-edit tool Codex Desktop ships was silently dropped, which
-        //    is exactly what made long-running backtest-lab sessions look
-        //    "frozen at a colon" — the model had no edit tool to call.
-        let with_custom = json!({
-            "tools": [
-                { "type": "function", "name": "kept" },
-                { "type": "custom", "name": "apply_patch",
-                  "description": "Apply a patch to a file",
-                  "parameters": { "type": "object", "properties": { "patch": { "type": "string" } } } }
-            ]
-        });
-        let tools = convert_responses_tools(&with_custom).unwrap();
-        assert_eq!(tools.len(), 2);
-        let names: Vec<&str> = tools.iter()
-            .map(|t| t["function"]["name"].as_str().unwrap())
-            .collect();
-        assert!(names.contains(&"kept"));
-        assert!(names.contains(&"apply_patch"),
-            "apply_patch (type:custom) must rewrap, not drop");
-
-        // 5. Codex groups tools under `type:"namespace"` (codex_app,
-        //    image_gen, …). The Chat Completions surface has no namespaces,
-        //    so flatten — every nested function must survive. Without this,
-        //    backtest-lab lost `apply_patch` AND the three Codex-app
-        //    automation tools every turn.
-        let with_namespace = json!({
-            "tools": [
-                { "type": "function", "name": "exec_command" },
-                { "type": "namespace", "name": "codex_app",
-                  "tools": [
-                      { "type": "function", "name": "automation_update",
-                        "description": "manage automations" },
-                      { "type": "function", "name": "list_automations" }
-                  ] },
-                { "type": "namespace", "name": "image_gen",
-                  "tools": [
-                      { "type": "function", "name": "gen_image",
-                        "description": "generate image" }
-                  ] }
-            ]
-        });
-        let tools = convert_responses_tools(&with_namespace).unwrap();
-        assert_eq!(tools.len(), 4,
-            "exec_command + 2 codex_app + 1 image_gen must all survive");
-        let names: std::collections::HashSet<&str> = tools.iter()
-            .map(|t| t["function"]["name"].as_str().unwrap())
-            .collect();
-        assert!(names.contains("exec_command"));
-        assert!(names.contains("automation_update"));
-        assert!(names.contains("list_automations"));
-        assert!(names.contains("gen_image"));
-
-        // 6. Codex built-in server tools (`web_search`, `tool_search`,
-        //    `image_gen` with no nested entry, `file_search`, …) have no
-        //    MiniMax equivalent — drop silently rather than 400.
-        let mixed = json!({
-            "tools": [
-                { "type": "web_search" },
-                { "type": "tool_search" },
-                { "type": "file_search" },
-                { "type": "function", "name": "keep" }
-            ]
-        });
-        let tools = convert_responses_tools(&mixed).unwrap();
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0]["function"]["name"], "keep");
-
-        // 7. Empty tools array → None (no `tools` field gets added).
-        let empty = json!({ "tools": [] });
-        assert!(convert_responses_tools(&empty).is_none());
-
-        // 8. Missing `tools` key entirely → None.
-        let missing = json!({});
-        assert!(convert_responses_tools(&missing).is_none());
-    }
-
-    #[test]
-    fn responses_to_chat_messages_drops_image_and_unknown_blocks() {
-        // Images aren't supported by MiniMax's OpenAI surface; unknown
-        // block types (`reasoning`, etc.) shouldn't blow up the conversion.
-        let payload = json!({
-            "input": [
-                { "type": "message", "role": "user", "content": [
-                    { "type": "input_text", "text": "look" },
-                    { "type": "input_image", "image_url": "https://x/y.png" }
-                ]},
-                { "type": "reasoning", "id": "r_1", "summary": [{"type":"summary_text","text":"thinking"}] }
-            ]
-        });
-        let msgs = convert_responses_to_chat_messages(&payload);
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0]["role"], "user");
-        // image dropped, text kept.
-        assert_eq!(msgs[0]["content"].as_str().unwrap(), "look");
+        // 6. Not JSON at all → None.
+        assert!(parse_minimax_error_message("not json").is_none());
     }
 }

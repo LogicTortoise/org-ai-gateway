@@ -128,7 +128,7 @@ Trae 不是直连的云端 API：Trae IDE 用的是私有的 `api/agent/v3` agen
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `MINIMAX_BASE_URL` | `https://api.minimaxi.com/v1` | **OpenAI 兼容端点**前缀（Codex 路径用）；账号自带的 `base_url` 优先级更高。 |
+| `MINIMAX_BASE_URL` | `https://api.minimaxi.com` | **OpenAI 兼容端点主机**（Codex 路径用，会自动拼 `/v1/responses`）；账号自带的 `base_url` 优先级更高。**base URL 必须只到主机**，不能再带 `/v1` —— 否则会拼成 `/v1/v1/responses` 404。 |
 | `MINIMAX_ANTHROPIC_BASE_URL` | `https://api.minimaxi.com/anthropic` | **Anthropic 兼容端点**前缀（Claude 路径用）；账号自带的 `base_url_alt` 优先级更高。 |
 | `MINIMAX_DEFAULT_MODEL` | `MiniMax-M3` | **默认档**（裸 `minimax` slug；独立项，不是 Claude tier） |
 | `MINIMAX_OPUS_MODEL` | `MiniMax-M3` | **opus 档**（`claude-opus-*`） |
@@ -141,7 +141,7 @@ Trae 不是直连的云端 API：Trae IDE 用的是私有的 `api/agent/v3` agen
 
 **双协议都接：**
 - **Claude 路径**（`/v1/messages`）：原样透传 Anthropic 形状 payload，tool_use 走原生通道完整保留。
-- **Codex 路径**（`/v1/responses`）：通过 Responses↔Chat Completions 适配层转到 `/v1/text/chatcompletion_v2`（**注意不是标准的 `/v1/chat/completions`**，MiniMax 的 OpenAI 端用的是 v2 路径），`function_call`/`function_call_output` 块双向翻译、tool 调用完整保留。
+- **Codex 路径**（`/v1/responses`）：**网关是透明管道**，不做任何改写。MiniMax 官方 Codex 接入面就是 `/v1/responses`（见 `platform.minimaxi.com/docs/token-plan/codex`），Codex CLI 直接用 `wire_api = "responses"` 就跟它对得上。整库 gadgets（`function_call` / `function_call_output` / `tools` / `reasoning` 块）都按 Responses 协议透传，不再走之前的 "Responses ↔ Chat Completions" 适配层。
 
 **模型名大小写会自动修正**：MiniMax 的官方 id 是混合大小写（`MiniMax-M3`），客户端传小写 `minimax-m3` 会被 400；网关按内置目录把已知 id 的大小写还原回去。裸 `minimax` 走默认档，从 Claude 链降级过来的 `claude-*` 名字按 3 档改写到对应 `MINIMAX_*_MODEL`。
 

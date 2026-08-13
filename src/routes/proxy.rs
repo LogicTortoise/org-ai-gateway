@@ -191,8 +191,14 @@ async fn serve_with_chain(
                 // Dual-protocol providers: Claude-format traffic goes to the
                 // Anthropic-compatible surface (raw buffered passthrough — tool
                 // calls survive), Codex/OpenAI-format traffic goes to the
-                // OpenAI-compatible surface via the Responses↔Chat adapter
-                // (also tool-call preserving). The split mirrors GLM / Kimi.
+                // OpenAI-compatible surface. The split mirrors GLM / Kimi.
+                //
+                // MiniMax is special-cased: it serves the Responses API
+                // natively at `/v1/responses`, so its Codex-format slot
+                // skips the Chat-Completions adapter entirely and goes
+                // through `serve_minimax_responses_passthrough` (transparent
+                // pipe). DeepSeek still rides the adapter because we have no
+                // evidence its `/v1/responses` surface (if any) is reliable.
                 if matches!(client_format, CursorFormat::Claude) {
                     serve_native_provider(
                         state.clone(),
@@ -200,6 +206,15 @@ async fn serve_with_chain(
                         client_format,
                         user_id.to_string(),
                         payload.clone(),
+                        client_wants_stream,
+                        shared_only,
+                    )
+                    .await
+                } else if provider == "minimax" {
+                    serve_minimax_responses_passthrough(
+                        state,
+                        user_id,
+                        payload,
                         client_wants_stream,
                         shared_only,
                     )
@@ -761,17 +776,22 @@ async fn serve_ollama(
     }
 }
 
-/// Serve a request via one of the OpenAI-compatible adapters
-/// (`glm` / `kimi` / `minimax` / `deepseek`) — these all share the same
-/// shape: a provider-local Responses↔Chat Completions adapter that preserves
+/// Serve a request via one of the OpenAI-compatible Chat-Completions
+/// adapters (`glm` / `kimi` / `deepseek`) — these all share the same shape:
+/// a provider-local Responses↔Chat Completions adapter that preserves
 /// `function_call` / `function_call_output` round-trips, real token usage
-/// parsed from the upstream `usage` block, and per-provider account-swap retry
-/// with the metered per-user token-budget quota gate. Streaming is real
-/// per-token SSE translation via the shared `stream_openai_to_responses_sse`
-/// helper. The four providers differ only in (a) which `send_*_openai` /
-/// `send_*_openai_streaming` module is called and (b) how the model id is
-/// rewritten before the upstream call — handled by the per-provider `match`
-/// ladders inside.
+/// parsed from the upstream `usage` block, and per-provider account-swap
+/// retry with the metered per-user token-budget quota gate. Streaming is
+/// real per-token SSE translation via the shared
+/// `stream_openai_to_responses_sse` helper. The three providers differ only
+/// in (a) which `send_*_openai` / `send_*_openai_streaming` module is called
+/// and (b) how the model id is rewritten before the upstream call — handled
+/// by the per-provider `match` ladders inside.
+///
+/// MiniMax is intentionally absent: it serves the Responses API natively at
+/// `/v1/responses`, so its Codex slot goes through
+/// `serve_minimax_responses_passthrough` (transparent pipe) instead of this
+/// adapter. The dispatch site special-cases it.
 async fn serve_openai_tool_compat(
     state: &AppState,
     provider: &str,
@@ -781,7 +801,7 @@ async fn serve_openai_tool_compat(
     client_wants_stream: bool,
     shared_only: bool,
 ) -> ProviderOutcome {
-    debug_assert!(matches!(provider, "glm" | "kimi" | "minimax" | "deepseek"));
+    debug_assert!(matches!(provider, "glm" | "kimi" | "deepseek"));
     // Only the Codex / Responses path is wired through the OpenAI surface.
     // Chat Completions format never reaches here (the `/v1/chat/completions`
     // entrypoint rejects non-cursor / non-ollama models with 400); Claude
@@ -800,13 +820,11 @@ async fn serve_openai_tool_compat(
     let raw_model = payload.get("model").and_then(|v| v.as_str()).unwrap_or(provider);
     // Model rewriting per provider: each provider's `canonical_model` knows
     // its own tier rewrite (GLM / Kimi fall back to a single built-in id,
-    // minimax fixes case + maps claude tiers, deepseek maps Anthropic tier
-    // names). The OpenAI path sends this id verbatim to the upstream — the
-    // converters don't touch `model`.
+    // deepseek maps Anthropic tier names). The OpenAI path sends this id
+    // verbatim to the upstream — the converters don't touch `model`.
     let upstream_model = match provider {
         "glm" => glm::glm_canonical_model(raw_model),
         "kimi" => kimi::kimi_canonical_model(raw_model),
-        "minimax" => minimax::minimax_canonical_model(raw_model),
         "deepseek" => deepseek_openai_model_for(raw_model),
         _ => raw_model.to_string(),
     };
@@ -836,7 +854,6 @@ async fn serve_openai_tool_compat(
             match provider {
                 "glm" => warm.retain(glm::supports_openai),
                 "kimi" => warm.retain(kimi::supports_openai),
-                "minimax" => warm.retain(minimax::supports_openai),
                 "deepseek" => warm.retain(deepseek::supports_openai),
                 _ => {}
             }
@@ -869,15 +886,12 @@ async fn serve_openai_tool_compat(
                     r.usage,
                     r.tool_calls.into_iter().map(kimi_tool_to_common).collect::<Vec<_>>(),
                 )),
-            "minimax" => minimax::send_minimax_openai(&account, &upstream_model, payload)
-                .await
-                .map(|r| (
-                    r.status,
-                    r.text,
-                    r.error,
-                    r.usage,
-                    r.tool_calls.into_iter().map(minimax_tool_to_common).collect::<Vec<_>>(),
-                )),
+            "minimax" => unreachable!(
+                "minimax is special-cased at the dispatch site and routes to \
+                 serve_minimax_responses_passthrough directly (the upstream \
+                 serves the Responses API natively at /v1/responses, so there \
+                 is no Chat-Completions adapter to fall through to)"
+            ),
             "deepseek" => deepseek::send_deepseek_openai(&account, &upstream_model, payload)
                 .await
                 .map(|r| (
@@ -993,9 +1007,6 @@ async fn serve_openai_tool_compat(
                 "kimi" => {
                     kimi::send_kimi_openai_streaming(&account, &upstream_model, payload).await
                 }
-                "minimax" => {
-                    minimax::send_minimax_openai_streaming(&account, &upstream_model, payload).await
-                }
                 "deepseek" => {
                     deepseek::send_deepseek_openai_streaming(&account, &upstream_model, payload).await
                 }
@@ -1085,6 +1096,455 @@ async fn serve_openai_tool_compat(
     }
 }
 
+/// Serve a Codex-format request via MiniMax's **native** Responses API
+/// (`/v1/responses`) — a transparent pipe. Distinct from the other three
+/// OpenAI-compatible providers (glm / kimi / deepseek) because:
+///   * MiniMax exposes the Responses API natively, so the gateway doesn't
+///     need to rewrite Responses → Chat Completions. The previous round-trip
+///     rewriting is what triggered the cryptic
+///     `{"base_resp":{"status_code":2013,"status_msg":"invalid params, chat
+///     content is empty"}}` shape on `/v1/text/chatcompletion_v2`. Hitting
+///     `/v1/responses` directly with the same payload the Codex client
+///     already sent eliminates the conversion entirely.
+///   * The upstream response is already Responses-shaped (`output[]` of
+///     typed blocks, `usage.input_tokens` / `output_tokens` /
+///     `input_tokens_details.cached_tokens`), so the non-streaming path
+///     just buffers and returns the body verbatim, and the streaming path
+///     proxies SSE bytes unchanged (with a side-channel parser for the
+///     `response.completed` event so the audit row carries real usage).
+///
+/// Only the Codex slot matters here: the Claude-format client goes through
+/// `serve_native_provider` (using the Anthropic-compatible endpoint), which
+/// is a separate path. The dispatcher routes `format == Responses` traffic
+/// to this function and `format == Claude` traffic to `serve_native_provider`.
+async fn serve_minimax_responses_passthrough(
+    state: &AppState,
+    user_id: &str,
+    payload: &Value,
+    client_wants_stream: bool,
+    shared_only: bool,
+) -> ProviderOutcome {
+    let owned_only = match crate::quota::enforce_user_quota(state, "minimax", user_id, !shared_only).await {
+        Ok(v) => v,
+        Err(resp) => return ProviderOutcome::NextProvider(Some(resp)),
+    };
+
+    let raw_model = payload.get("model").and_then(|v| v.as_str()).unwrap_or("minimax");
+    let upstream_model = minimax::minimax_canonical_model(raw_model);
+
+    let max_attempts = provider_attempt_budget(state, "minimax").await;
+    let mut excluded: HashSet<String> = HashSet::new();
+    let mut selected_any = false;
+    let mut last_error: Option<(StatusCode, Value)> = None;
+    let request_json_chars = payload.to_string().chars().count();
+
+    for _ in 0..max_attempts {
+        let now = Utc::now();
+        let selected = {
+            let accounts = state.accounts.read().await;
+            let rate_limits = state.rate_limits.read().await;
+            let owner_usage = state.owner_usage.read().await;
+            let mut warm = eligible_accounts(&accounts, "minimax", user_id, &excluded, now, true);
+            if owned_only {
+                warm.retain(|a| a.owner_user_id == user_id);
+            }
+            if shared_only {
+                warm.retain(|a| a.share_enabled);
+            }
+            // Only accounts that expose the OpenAI-compatible endpoint can
+            // serve this path — same filter as the Chat-Completions adapter.
+            warm.retain(minimax::supports_openai);
+            select_account_for_request(&warm, user_id, "minimax", &rate_limits, &owner_usage)
+        };
+        let Some(account) = selected else { break };
+        selected_any = true;
+        excluded.insert(account.id.clone());
+        note_account_pick(state, &account.id).await;
+
+        let send_outcome =
+            minimax::send_minimax_responses_streaming(&account, &upstream_model, payload).await;
+
+        let upstream = match send_outcome {
+            Ok(v) => v,
+            Err(err) => {
+                apply_account_failure(state, &account.id, ErrorClass::Transient, None, None, false).await;
+                last_error = Some((StatusCode::BAD_GATEWAY, json!({ "error": err, "provider": "minimax" })));
+                continue;
+            }
+        };
+
+        let upstream_status = upstream.status();
+        let passthrough_headers = collect_passthrough_headers(upstream.headers());
+        let snapshot = parse_rate_limit_headers(upstream.headers());
+        let retry_after = parse_retry_after(upstream.headers());
+        if let Some(s) = snapshot.clone() {
+            crate::capacity::store_rate_limit(state, &account.id, s).await;
+        }
+
+        if !upstream_status.is_success() {
+            // Drain the body so the connection returns to the pool (reqwest
+            // keeps it until consumed), then classify the failure.
+            let body = upstream.text().await.unwrap_or_default();
+            let detail = parse_openai_error_message(&body)
+                .or_else(|| minimax::parse_minimax_error_message(&body))
+                .unwrap_or_else(|| format!("minimax upstream returned {}", upstream_status));
+            let class = ErrorClass::from_status(upstream_status.as_u16());
+            apply_account_failure(state, &account.id, class, None, None, false).await;
+            info!(
+                "minimax_error_{} on {} ({})",
+                upstream_status.as_u16(),
+                account.account_label,
+                if class.is_retryable() { "retrying on next account" } else { "final" },
+            );
+            let resp_status = if upstream_status.is_success() { StatusCode::BAD_GATEWAY } else { upstream_status };
+            last_error = Some((resp_status, json!({ "error": detail, "provider": "minimax" })));
+            if class.is_retryable() {
+                continue;
+            }
+            break;
+        }
+
+        // Non-streaming: the upstream is still stream=true (forced by
+        // `ensure_codex_payload_defaults`), so we buffer the entire SSE body
+        // and aggregate it back into the single Response object a
+        // non-streaming client expects. The Codex wire shape is preserved
+        // verbatim — no re-rendering, no Chat-Completions shim.
+        if !client_wants_stream {
+            let body = match crate::util::read_body_capped(upstream, crate::util::max_response_bytes()).await {
+                Ok(v) => v,
+                Err(e) => {
+                    apply_account_failure(state, &account.id, ErrorClass::Transient, None, None, false).await;
+                    last_error = Some((
+                        StatusCode::BAD_GATEWAY,
+                        json!({ "error": format!("failed reading minimax upstream body: {}", e), "provider": "minimax" }),
+                    ));
+                    break;
+                }
+            };
+            let body_str = String::from_utf8_lossy(&body);
+            let aggregated = crate::sse::aggregate_codex_sse_to_response_json(&body_str);
+            let output_has_content = aggregated
+                .as_ref()
+                .and_then(|v| v.get("output"))
+                .and_then(|v| v.as_array())
+                .map(|arr| !arr.is_empty())
+                .unwrap_or(false);
+            let usage = aggregated
+                .as_ref()
+                .and_then(|v| v.get("usage"))
+                .map(|u| crate::usage::tokens::parse_usage("minimax", &u.to_string()))
+                .unwrap_or_default();
+            tracing::warn!(
+                "[minimax_debug] codex_passthrough_body bytes={} aggregated={} preview={:?}",
+                body.len(),
+                aggregated.is_some(),
+                crate::util::truncate_text(&body_str, 500),
+            );
+
+            if !output_has_content {
+                // Same empty-response failure mode the streaming path catches:
+                // upstream 200 + a `response.completed` whose `output` is empty
+                // (reasoning-only, truncated, or reasoning with no assistant
+                // message). Surface as transient so the chain failover can move
+                // on or the client retries.
+                apply_account_failure(state, &account.id, ErrorClass::Transient, None, None, false).await;
+                info!(
+                    "minimax_empty_response on {} (usage in={} out={} reason={}); retrying on next account",
+                    account.account_label,
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    usage.reasoning_tokens,
+                );
+                last_error = Some((StatusCode::BAD_GATEWAY, json!({
+                    "error": "minimax upstream returned a response with no output items (truncated or reasoning-only); try again in 30s",
+                    "provider": "minimax",
+                })));
+                continue;
+            }
+
+            // Success: clear backoff, audit with REAL token usage, return the
+            // aggregated Response object (already in the Codex Responses wire
+            // shape the client expects).
+            reset_backoff(state, &account.id).await;
+            write_proxy_audit(
+                state, user_id, &account, "minimax", raw_model,
+                request_json_chars, body.len(), "success", usage,
+            )
+            .await;
+
+            let resp_json = aggregated.unwrap_or(Value::Null);
+            let resp_bytes = serde_json::to_vec(&resp_json)
+                .map_err(|e| format!("failed to serialize minimax Response: {}", e))
+                .unwrap_or_default();
+            let mut response = (StatusCode::OK, axum::body::Bytes::from(resp_bytes)).into_response();
+            let headers = response.headers_mut();
+            for (k, v) in passthrough_headers {
+                if let Ok(name) = axum::http::HeaderName::from_bytes(k.as_bytes()) {
+                    headers.insert(name, v);
+                }
+            }
+            headers.insert(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+            return ProviderOutcome::Served(response);
+        }
+
+        // Streaming: open the upstream Responses SSE stream and pipe each
+        // chunk back to the client verbatim. A side-channel parser extracts
+        // the `response.completed` event so the audit row carries real usage;
+        // an empty/error stream produces a `response.failed` terminal event so
+        // the Codex client surfaces the failure and retries (parity with the
+        // Chat-Completions SSE translator).
+        let response = stream_minimax_responses_passthrough(
+            state.clone(),
+            account.clone(),
+            user_id.to_string(),
+            raw_model.to_string(),
+            upstream,
+            request_json_chars,
+            retry_after,
+        )
+        .await;
+        return ProviderOutcome::Served(response);
+    }
+
+    match last_error {
+        Some((status, body)) => ProviderOutcome::NextProvider(Some((status, Json(body)).into_response())),
+        None if !selected_any => ProviderOutcome::NextProvider(None),
+        None => ProviderOutcome::NextProvider(Some(
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": "all minimax accounts exhausted", "provider": "minimax" })),
+            )
+                .into_response(),
+        )),
+    }
+}
+
+/// Pipe a MiniMax `/v1/responses` SSE stream back to the client verbatim
+/// while extracting real usage from the terminal `response.completed` event
+/// for the audit row. Empty or errored streams get a synthesised
+/// `response.failed` terminal event so the Codex client can retry (mirrors
+/// the Chat-Completions SSE translator's behavior).
+async fn stream_minimax_responses_passthrough(
+    state: AppState,
+    account: UpstreamAccount,
+    user_id: String,
+    raw_model: String,
+    upstream: reqwest::Response,
+    request_json_chars: usize,
+    _retry_after: Option<i64>,
+) -> Response {
+    let upstream_status = upstream.status();
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(32);
+
+    let account_for_task = account.clone();
+    let provider_for_task = "minimax".to_string();
+    let raw_model_for_task = raw_model.clone();
+    let user_id_for_task = user_id.clone();
+    let spawn_origin = crate::auth::current_origin().unwrap_or_default();
+    tokio::spawn(crate::auth::with_request_origin(spawn_origin, async move {
+        // The Responses SSE stream is forwarded verbatim. We also parse a
+        // rolling text buffer for the terminal `response.completed` event so
+        // the audit row carries real usage, and for `error` events so a
+        // failed upstream emits a `response.failed` terminal event (Codex
+        // surfaces this as an error and retries, matching the Chat-Completions
+        // translator's behavior).
+        let mut bytes_stream = upstream.bytes_stream();
+        let mut buf = String::new();
+        let mut last_completed_usage: Option<TokenUsage> = None;
+        let mut last_completed_output_empty: bool = false;
+        let mut last_completed_event_id: Option<String> = None;
+        let mut upstream_error: Option<(String, String)> = None;
+        let mut raw_response_bytes: usize = 0;
+
+        loop {
+            let chunk = match bytes_stream.next().await {
+                Some(Ok(c)) => c,
+                Some(Err(e)) => {
+                    let _ = tx.send(Err(std::io::Error::new(std::io::ErrorKind::Other, e))).await;
+                    break;
+                }
+                None => break,
+            };
+            raw_response_bytes += chunk.len();
+            let _ = tx.send(Ok(chunk.clone())).await;
+            // Parse the chunk for audit/error detection. The chunk content
+            // boundaries don't have to coincide with SSE event boundaries —
+            // we accumulate into `buf` and slice at newline boundaries.
+            buf.push_str(&String::from_utf8_lossy(&chunk));
+            while let Some(nl_pos) = buf.find('\n') {
+                let line: String = buf[..nl_pos].to_string();
+                buf = buf[nl_pos + 1..].to_string();
+                let line = line.trim_end_matches('\r').trim_start();
+                let Some(rest) = line.strip_prefix("data:") else { continue };
+                let rest = rest.trim_start();
+                if rest == "[DONE]" || rest.is_empty() {
+                    continue;
+                }
+                let v: Value = match serde_json::from_str(rest) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let event_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                match event_type {
+                    "response.completed" => {
+                        // Capture usage for audit. `response.usage` mirrors the
+                        // shape we emit on the buffered path.
+                        if let Some(usage) = v.pointer("/response/usage").cloned() {
+                            last_completed_usage = Some(TokenUsage {
+                                input_tokens: usage
+                                    .get("input_tokens")
+                                    .and_then(|t| t.as_i64())
+                                    .unwrap_or(0),
+                                cached_input_tokens: usage
+                                    .pointer("/input_tokens_details/cached_tokens")
+                                    .and_then(|t| t.as_i64())
+                                    .unwrap_or(0),
+                                cache_creation_tokens: 0,
+                                output_tokens: usage
+                                    .get("output_tokens")
+                                    .and_then(|t| t.as_i64())
+                                    .unwrap_or(0),
+                                reasoning_tokens: usage
+                                    .pointer("/output_tokens_details/reasoning_tokens")
+                                    .and_then(|t| t.as_i64())
+                                    .unwrap_or(0),
+                                billable_tokens: 0,
+                            });
+                        }
+                        let output = v.pointer("/response/output").and_then(|o| o.as_array());
+                        let has_content = output
+                            .map(|arr| !arr.is_empty())
+                            .unwrap_or(false);
+                        last_completed_output_empty = !has_content;
+                        last_completed_event_id = v
+                            .pointer("/response/id")
+                            .and_then(|i| i.as_str())
+                            .map(|s| s.to_string());
+                    }
+                    "error" => {
+                        let msg = v
+                            .get("message")
+                            .and_then(|m| m.as_str())
+                            .or_else(|| v.pointer("/error/message").and_then(|m| m.as_str()))
+                            .unwrap_or("upstream error")
+                            .to_string();
+                        let code = v
+                            .get("code")
+                            .and_then(|c| c.as_str())
+                            .or_else(|| v.pointer("/error/code").and_then(|c| c.as_str()))
+                            .unwrap_or("upstream_error")
+                            .to_string();
+                        upstream_error = Some((msg, code));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Stream ended. Synthesize a `response.failed` terminal event if the
+        // upstream produced no usable output (mirrors the Chat-Completions
+        // translator's empty-stream handling). Always send [DONE] so the
+        // client exits its SSE loop.
+        if last_completed_output_empty && upstream_error.is_none() {
+            let response_id = last_completed_event_id
+                .unwrap_or_else(|| format!("resp_{}", uuid::Uuid::new_v4()));
+            let _ = send_sse_event(
+                &tx,
+                "response.failed",
+                &json!({
+                    "type": "response.failed",
+                    "sequence_number": 0,
+                    "response": {
+                        "id": response_id,
+                        "object": "response",
+                        "created_at": Utc::now().timestamp(),
+                        "status": "failed",
+                        "background": false,
+                        "model": raw_model_for_task,
+                        "output": [],
+                        "error": {
+                            "code": "overloaded_error",
+                            "message": "upstream returned a stream with no output items (reasoning-only or truncated); try again in 30s",
+                            "type": "upstream_error",
+                        },
+                        "usage": null,
+                        "user": null,
+                        "metadata": {},
+                        "incomplete_details": null,
+                    },
+                }),
+            )
+            .await;
+        }
+        let _ = tx.send(Ok(axum::body::Bytes::from("data: [DONE]\n\n"))).await;
+
+        // Audit decision.
+        let usage = last_completed_usage.unwrap_or_default();
+        if let Some((msg, code)) = upstream_error {
+            let class = ErrorClass::from_status(529);
+            apply_account_failure(&state, &account_for_task.id, class, None, None, false).await;
+            write_proxy_audit(
+                &state,
+                &user_id_for_task,
+                &account_for_task,
+                &provider_for_task,
+                &raw_model_for_task,
+                request_json_chars,
+                raw_response_bytes,
+                &format!("upstream_stream_error: {} ({})", msg, code),
+                usage,
+            )
+            .await;
+        } else if last_completed_output_empty {
+            // Empty stream: synthesize a transient failure so the chain
+            // failover tries the next account on the next Codex turn.
+            let class = ErrorClass::Transient;
+            apply_account_failure(&state, &account_for_task.id, class, None, None, false).await;
+            write_proxy_audit(
+                &state,
+                &user_id_for_task,
+                &account_for_task,
+                &provider_for_task,
+                &raw_model_for_task,
+                request_json_chars,
+                raw_response_bytes,
+                "upstream_empty_stream",
+                usage,
+            )
+            .await;
+        } else {
+            reset_backoff(&state, &account_for_task.id).await;
+            write_proxy_audit(
+                &state,
+                &user_id_for_task,
+                &account_for_task,
+                &provider_for_task,
+                &raw_model_for_task,
+                request_json_chars,
+                raw_response_bytes,
+                "success",
+                usage,
+            )
+            .await;
+        }
+    }));
+
+    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    });
+    let body = axum::body::Body::from_stream(stream);
+    let mut response = Response::new(body);
+    *response.status_mut() = upstream_status;
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("text/event-stream; charset=utf-8"),
+    );
+    response
+}
+
 /// Resolve the upstream model id for the DeepSeek OpenAI path. The two
 /// surfaces publish different ids (`deepseek-v4-pro` ↛ `deepseek-chat`), so
 /// the OpenAI path routes everything to a single configurable id; the input
@@ -1117,10 +1577,6 @@ struct CommonToolCall {
     id: String,
     name: String,
     arguments: String,
-}
-
-fn minimax_tool_to_common(t: minimax::MinimaxToolCall) -> CommonToolCall {
-    CommonToolCall { id: t.id, name: t.name, arguments: t.arguments }
 }
 
 fn deepseek_tool_to_common(t: deepseek::DeepseekToolCall) -> CommonToolCall {
