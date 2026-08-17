@@ -843,15 +843,25 @@ pub(crate) async fn send_cursor_upstream(
         .map_err(|e| format!("reading cursor upstream body failed: {e}"))?;
 
     if !status.is_success() {
-        let detail = String::from_utf8_lossy(&bytes).trim().to_string();
+        let raw_body = String::from_utf8_lossy(&bytes).trim().to_string();
+        // Detail going to the client: redacted + truncated, never raw bytes
+        // (provider pool is shared; raw body may echo upstream credentials).
+        let detail = if raw_body.is_empty() {
+            format!("cursor upstream returned {status}")
+        } else {
+            crate::util::truncate_text(&crate::util::redact_secrets(&raw_body), 500)
+        };
+        let up = crate::util::format_upstream_error("cursor", status, &raw_body, Some(detail.clone()));
+        warn!(
+            "upstream_error_body provider=cursor status={} parser_hit={} body={:?}",
+            status.as_u16(),
+            up.parser_hit,
+            up.body_excerpt,
+        );
         return Ok(CursorResult {
             text: String::new(),
             status,
-            error: Some(if detail.is_empty() {
-                format!("cursor upstream returned {status}")
-            } else {
-                detail
-            }),
+            error: Some(detail),
         });
     }
 

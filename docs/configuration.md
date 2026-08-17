@@ -314,6 +314,52 @@ GLM / Kimi / DeepSeek / MiniMax 这四家在 SSE 流里塞错误有两种形态�
 
 ---
 
+## 上游错误 body：日志里必须看到
+
+**契约**：上游返回非 2xx 时，gateway 必须在 `data/gateway.out.log` 里**永久**留下原始 body 的可读摘要。**不要**只在临时 debug 时打、事后关掉 —— 下次上游再炸，没有 body 就只能凭状态码瞎猜。
+
+### 行为要求
+
+1. 每次 non-2xx upstream response，gateway 输出一行 **`warn!`**，结构：
+
+   ```
+   upstream_error_body provider=<name> status=<code> parser_hit=<true|false> [account=<label>] body=<redacted excerpt>
+   ```
+
+   与既有的 `info!` 简讯（`minimax_error_500 on <account> (retrying on next account)`）**并存**，不替换。`info!` 给运维一眼扫；`warn!` 是事后排查的取证。
+
+2. Body 摘要必须**先脱敏再落盘**（共享池账号安全 —— body 可能 echo 回上游凭据）：
+
+   | 形态 | 命中后 |
+   |---|---|
+   | `sk-…` / `sk-ant-…` / `sk-proj-…`（≥20 字符） | `<redacted:sk>` |
+   | JWT（三段 base64url，前两段 ≥20） | `<redacted:jwt>` |
+   | `Authorization: Bearer <…>` 后面的 token | `<redacted:bearer>` |
+   | JSON 里 key 命中 `api_key`/`apikey`/`access_token`/`refresh_token`/`authorization`/`token`/`secret`（大小写不敏感）的 value | `<redacted>` |
+
+   HTML bounce、CDN 错误页、嵌套 `base_resp`、OpenAI 错误体都会被原文摘进日志（脱敏后），不能再"只看 status code"。
+
+3. **Client-facing 仍然安全**：写回客户端 `last_error` JSON 的 `error` 字段**不**包含原始 body —— 走 parser（如 `parse_openai_error_message` / `minimax::parse_minimax_error_message`）抽出一句话，或 fallback `<provider> upstream returned <status>`。`data/audit.ndjson` 也不出现 raw body。这是共享池账号前提下的硬约束，跟"日志必须留 body"不矛盾 —— 日志脱敏给本机运维看，client 只看到一句话摘要。
+
+### 实现位置
+
+| 角色 | 位置 |
+|---|---|
+| 脱敏 + 摘要 | `src/util.rs::format_upstream_error` / `redact_secrets`（单测在同文件 `tests` 模块） |
+| proxy 层 5 处 | `src/routes/proxy.rs`：minimax / deepseek / openai tool compat streaming / `read_body_capped` 失败 |
+| provider 层 4 处 | `src/provider/glm.rs`、`kimi.rs`、`cursor.rs`、`ollama.rs` 的 non-2xx 分支 |
+
+### 不变 / 不属于本次范围
+
+- 客户端响应 / `audit.ndjson` 仍不含原始 body（共享池账号前提不变）。
+- streaming SSE error 帧（`proxy.rs:1441–1494`）的 `(msg, code)` 解析 / 硬编码 `overloaded_error` 文案是另一个独立 bug，单独修。
+
+### 反例（不应该再发生）
+
+2026-08-17 8:50–8:56 minimax 集群高负载窗口：audit 只有 `minimax_error_500 on minimax (retrying on next account)`，body 完全没记录，只能凭 minimax 中文短语经验判断，没有原始字节证据。下一次同类事件**必须**有 `upstream_error_body … body=…` 行可用。
+
+---
+
 ## 相关：模型映射运行时覆盖（`data/provider_models.json`）
 
 上面每个 provider 的 `*_DEFAULT_MODEL` / `*_OPUS_MODEL` / `*_SONNET_MODEL` / `*_FABLE_MODEL` / `*_MODELS` 这类 env，都可以在**运行时**被 `data/provider_models.json` 覆盖，不用改 env、不用重启。这是 WebUI「模型映射」面板保存的东西。

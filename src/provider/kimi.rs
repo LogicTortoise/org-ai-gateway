@@ -441,12 +441,18 @@ pub(crate) async fn send_kimi_openai(
         .map_err(|e| format!("reading kimi upstream body failed: {}", e))?;
 
     if !status.is_success() {
-        let detail = parse_kimi_error_message(&text_body)
-            .unwrap_or_else(|| format!("kimi upstream returned {}", status));
+        let parsed = parse_kimi_error_message(&text_body);
+        let up = crate::util::format_upstream_error("kimi", status, &text_body, parsed);
+        warn!(
+            "upstream_error_body provider=kimi status={} parser_hit={} body={:?}",
+            status.as_u16(),
+            up.parser_hit,
+            up.body_excerpt,
+        );
         return Ok(KimiResult {
             text: String::new(),
             status,
-            error: Some(detail),
+            error: Some(up.detail),
             usage: TokenUsage::default(),
             tool_calls: Vec::new(),
         });

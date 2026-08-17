@@ -1033,8 +1033,9 @@ async fn serve_openai_tool_compat(
                         // Drain the upstream body so the connection can be
                         // reused (reqwest keeps it in the pool until consumed).
                         let body = upstream_resp.text().await.unwrap_or_default();
-                        let detail = parse_openai_error_message(&body)
-                            .unwrap_or_else(|| format!("{} upstream returned {}", provider, status));
+                        let parsed = parse_openai_error_message(&body);
+                        let up = crate::util::format_upstream_error(provider, status, &body, parsed);
+                        let detail = up.detail;
                         let class = ErrorClass::from_status(status.as_u16());
                         apply_account_failure(state, &account.id, class, None, None, false).await;
                         info!(
@@ -1043,6 +1044,14 @@ async fn serve_openai_tool_compat(
                             status.as_u16(),
                             account.account_label,
                             if class.is_retryable() { "retrying on next account" } else { "final" },
+                        );
+                        warn!(
+                            "upstream_error_body provider={} status={} parser_hit={} account={} body={:?}",
+                            provider,
+                            status.as_u16(),
+                            up.parser_hit,
+                            account.account_label,
+                            up.body_excerpt,
                         );
                         let resp_status = if status.is_success() { StatusCode::BAD_GATEWAY } else { status };
                         last_error = Some((resp_status, json!({ "error": detail, "provider": provider })));
@@ -1199,9 +1208,10 @@ async fn serve_minimax_responses_passthrough(
             // Drain the body so the connection returns to the pool (reqwest
             // keeps it until consumed), then classify the failure.
             let body = upstream.text().await.unwrap_or_default();
-            let detail = parse_openai_error_message(&body)
-                .or_else(|| minimax::parse_minimax_error_message(&body))
-                .unwrap_or_else(|| format!("minimax upstream returned {}", upstream_status));
+            let parsed = parse_openai_error_message(&body)
+                .or_else(|| minimax::parse_minimax_error_message(&body));
+            let up = crate::util::format_upstream_error("minimax", upstream_status, &body, parsed);
+            let detail = up.detail;
             let class = ErrorClass::from_status(upstream_status.as_u16());
             apply_account_failure(state, &account.id, class, None, None, false).await;
             info!(
@@ -1209,6 +1219,13 @@ async fn serve_minimax_responses_passthrough(
                 upstream_status.as_u16(),
                 account.account_label,
                 if class.is_retryable() { "retrying on next account" } else { "final" },
+            );
+            warn!(
+                "upstream_error_body provider=minimax status={} parser_hit={} account={} body={:?}",
+                upstream_status.as_u16(),
+                up.parser_hit,
+                account.account_label,
+                up.body_excerpt,
             );
             let resp_status = if upstream_status.is_success() { StatusCode::BAD_GATEWAY } else { upstream_status };
             last_error = Some((resp_status, json!({ "error": detail, "provider": "minimax" })));
@@ -1228,6 +1245,11 @@ async fn serve_minimax_responses_passthrough(
                 Ok(v) => v,
                 Err(e) => {
                     apply_account_failure(state, &account.id, ErrorClass::Transient, None, None, false).await;
+                    warn!(
+                        "upstream_error_body provider=minimax status=200 parser_hit=false account={} body=<unreadable> read_error={:?}",
+                        account.account_label,
+                        e,
+                    );
                     last_error = Some((
                         StatusCode::BAD_GATEWAY,
                         json!({ "error": format!("failed reading minimax upstream body: {}", e), "provider": "minimax" }),
@@ -1642,8 +1664,9 @@ async fn serve_deepseek_responses_passthrough(
             // Drain the body so the connection returns to the pool (reqwest
             // keeps it until consumed), then classify the failure.
             let body = upstream.text().await.unwrap_or_default();
-            let detail = parse_openai_error_message(&body)
-                .unwrap_or_else(|| format!("deepseek upstream returned {}", upstream_status));
+            let parsed = parse_openai_error_message(&body);
+            let up = crate::util::format_upstream_error("deepseek", upstream_status, &body, parsed);
+            let detail = up.detail;
             let class = ErrorClass::from_status(upstream_status.as_u16());
             apply_account_failure(state, &account.id, class, None, None, false).await;
             info!(
@@ -1651,6 +1674,13 @@ async fn serve_deepseek_responses_passthrough(
                 upstream_status.as_u16(),
                 account.account_label,
                 if class.is_retryable() { "retrying on next account" } else { "final" },
+            );
+            warn!(
+                "upstream_error_body provider=deepseek status={} parser_hit={} account={} body={:?}",
+                upstream_status.as_u16(),
+                up.parser_hit,
+                account.account_label,
+                up.body_excerpt,
             );
             let resp_status = if upstream_status.is_success() { StatusCode::BAD_GATEWAY } else { upstream_status };
             last_error = Some((resp_status, json!({ "error": detail, "provider": "deepseek" })));

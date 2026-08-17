@@ -421,12 +421,18 @@ pub(crate) async fn send_glm_openai(
         .map_err(|e| format!("reading glm upstream body failed: {}", e))?;
 
     if !status.is_success() {
-        let detail = parse_glm_error_message(&text_body)
-            .unwrap_or_else(|| format!("glm upstream returned {}", status));
+        let parsed = parse_glm_error_message(&text_body);
+        let up = crate::util::format_upstream_error("glm", status, &text_body, parsed);
+        warn!(
+            "upstream_error_body provider=glm status={} parser_hit={} body={:?}",
+            status.as_u16(),
+            up.parser_hit,
+            up.body_excerpt,
+        );
         return Ok(GlmResult {
             text: String::new(),
             status,
-            error: Some(detail),
+            error: Some(up.detail),
             usage: TokenUsage::default(),
             tool_calls: Vec::new(),
         });

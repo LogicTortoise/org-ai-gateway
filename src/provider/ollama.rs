@@ -205,12 +205,18 @@ pub(crate) async fn send_ollama_upstream(
         .map_err(|e| format!("reading ollama upstream body failed: {}", e))?;
 
     if !status.is_success() {
-        let detail = parse_error_message(&text_body)
-            .unwrap_or_else(|| format!("ollama upstream returned {}", status));
+        let parsed = parse_error_message(&text_body);
+        let up = crate::util::format_upstream_error("ollama", status, &text_body, parsed);
+        warn!(
+            "upstream_error_body provider=ollama status={} parser_hit={} body={:?}",
+            status.as_u16(),
+            up.parser_hit,
+            up.body_excerpt,
+        );
         return Ok(OllamaResult {
             text: String::new(),
             status,
-            error: Some(detail),
+            error: Some(up.detail),
             usage: TokenUsage::default(),
         });
     }
