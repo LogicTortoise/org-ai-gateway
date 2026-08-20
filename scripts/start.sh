@@ -8,6 +8,9 @@ cd "$(dirname "$0")/.."
 
 # 端口 / 监听地址：当前环境固定 8088
 export GATEWAY_BIND_ADDR="${GATEWAY_BIND_ADDR:-0.0.0.0:8088}"
+# 入站 body 上限：Codex 自动压缩前 / 长上下文场景可能瞬间涨到 64 MiB 以上，
+# 默认给 256 MiB，需要更大再 GATEWAY_MAX_REQUEST_BYTES=… 显式覆盖。
+export GATEWAY_MAX_REQUEST_BYTES="${GATEWAY_MAX_REQUEST_BYTES:-268435456}"
 
 BIN="target/release/org-ai-gateway"
 LOG_DIR="data"

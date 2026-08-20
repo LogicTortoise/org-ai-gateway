@@ -60,7 +60,7 @@ GATEWAY_OWNER_PROTECTION=on GATEWAY_HTTP_TIMEOUT_SECS=900 ./scripts/restart.sh -
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `GATEWAY_MAX_REQUEST_BYTES` | `67108864`（64 MiB） | 入站请求体上限 |
+| `GATEWAY_MAX_REQUEST_BYTES` | `268435456`（256 MiB） | 入站请求体上限 |
 | `GATEWAY_MAX_RESPONSE_BYTES` | `268435456`（256 MiB） | 上游响应体上限（防响应炸弹） |
 | `GATEWAY_AUDIT_ROTATE_BYTES` | `67108864`（64 MiB） | 审计日志轮转阈值；保留一代 `.1` |
 | `GATEWAY_HEALTH_PROBE_SECS` | `120` | 账号健康探测周期（秒）；`0` 关闭 |
