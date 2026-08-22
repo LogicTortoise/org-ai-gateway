@@ -76,6 +76,22 @@ pub(crate) struct ProviderModelCfg {
     /// Wholesale catalog override. Non-empty also pins live-fetched catalogs.
     #[serde(default)]
     pub(crate) models: Vec<String>,
+    /// Default reasoning-effort injected when the client sends none. Empty =
+    /// fall through to env, then the provider's built-in (its strongest tier).
+    #[serde(default)]
+    pub(crate) default_effort: String,
+    /// Upstream reasoning-effort target for the client's `low` tier.
+    #[serde(default)]
+    pub(crate) effort_low: String,
+    /// Upstream reasoning-effort target for the client's `medium` tier.
+    #[serde(default)]
+    pub(crate) effort_medium: String,
+    /// Upstream reasoning-effort target for the client's `high` tier.
+    #[serde(default)]
+    pub(crate) effort_high: String,
+    /// Upstream reasoning-effort target for the client's `xhigh` tier.
+    #[serde(default)]
+    pub(crate) effort_xhigh: String,
 }
 
 impl ProviderModelCfg {
@@ -87,6 +103,11 @@ impl ProviderModelCfg {
             && self.sonnet_model.trim().is_empty()
             && self.fable_model.trim().is_empty()
             && self.models.is_empty()
+            && self.default_effort.trim().is_empty()
+            && self.effort_low.trim().is_empty()
+            && self.effort_medium.trim().is_empty()
+            && self.effort_high.trim().is_empty()
+            && self.effort_xhigh.trim().is_empty()
     }
 
     /// Trim every field and drop blank catalog entries, so a value typed with
@@ -103,6 +124,11 @@ impl ProviderModelCfg {
                 .map(|m| m.trim().to_string())
                 .filter(|m| !m.is_empty())
                 .collect(),
+            default_effort: self.default_effort.trim().to_string(),
+            effort_low: self.effort_low.trim().to_string(),
+            effort_medium: self.effort_medium.trim().to_string(),
+            effort_high: self.effort_high.trim().to_string(),
+            effort_xhigh: self.effort_xhigh.trim().to_string(),
         }
     }
 
@@ -112,6 +138,16 @@ impl ProviderModelCfg {
             Slot::Opus => self.opus_model.trim(),
             Slot::Sonnet => self.sonnet_model.trim(),
             Slot::Fable => self.fable_model.trim(),
+        }
+    }
+
+    pub(crate) fn effort_value(&self, level: EffortLevel) -> &str {
+        match level {
+            EffortLevel::Default => self.default_effort.trim(),
+            EffortLevel::Low => self.effort_low.trim(),
+            EffortLevel::Medium => self.effort_medium.trim(),
+            EffortLevel::High => self.effort_high.trim(),
+            EffortLevel::Xhigh => self.effort_xhigh.trim(),
         }
     }
 }
@@ -202,6 +238,36 @@ impl Slot {
     }
 }
 
+/// The client-side reasoning-effort tier an upstream effort value maps from.
+/// `Default` is not a tier — it is the per-provider fallback injected when the
+/// client sends no effort (or an unrecognised one). The four real tiers mirror
+/// Claude Code's effort vocabulary; Codex's `minimal` folds into `Low`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EffortLevel {
+    /// Injected fallback when no effort is present.
+    Default,
+    /// Client `low` (and Codex `minimal`).
+    Low,
+    /// Client `medium`.
+    Medium,
+    /// Client `high`.
+    High,
+    /// Client `xhigh`.
+    Xhigh,
+}
+
+impl EffortLevel {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            EffortLevel::Default => "default",
+            EffortLevel::Low => "low",
+            EffortLevel::Medium => "medium",
+            EffortLevel::High => "high",
+            EffortLevel::Xhigh => "xhigh",
+        }
+    }
+}
+
 /// Where a resolved value came from, so the UI can show it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -236,6 +302,35 @@ pub(crate) fn resolve_slot_sourced(
     builtin: &str,
 ) -> (String, Source) {
     let stored = with_cfg(provider, |cfg| cfg.slot_value(slot).to_string())
+        .filter(|v| !v.is_empty());
+    if let Some(v) = stored {
+        return (v, Source::Override);
+    }
+    match env_value(env_key) {
+        Some(v) => (v, Source::Env),
+        None => (builtin.to_string(), Source::Builtin),
+    }
+}
+
+/// Resolve one reasoning-effort target, mirroring `resolve_slot_sourced`'s
+/// override > env > builtin chain. Returns only the resolved value.
+pub(crate) fn resolve_effort(
+    provider: &str,
+    level: EffortLevel,
+    env_key: &str,
+    builtin: &str,
+) -> String {
+    resolve_effort_sourced(provider, level, env_key, builtin).0
+}
+
+/// As `resolve_effort`, also reporting which layer supplied the value.
+pub(crate) fn resolve_effort_sourced(
+    provider: &str,
+    level: EffortLevel,
+    env_key: &str,
+    builtin: &str,
+) -> (String, Source) {
+    let stored = with_cfg(provider, |cfg| cfg.effort_value(level).to_string())
         .filter(|v| !v.is_empty());
     if let Some(v) = stored {
         return (v, Source::Override);
@@ -588,6 +683,205 @@ pub(crate) fn spec(provider: &str) -> Option<&'static ProviderModelSpec> {
 }
 
 // ---------------------------------------------------------------------------
+// Reasoning-effort mapping — the same override > env > builtin chain, applied
+// to the `reasoning.effort` tier of the three Responses-API providers.
+// ---------------------------------------------------------------------------
+
+/// One editable reasoning-effort target.
+pub(crate) struct EffortLevelSpec {
+    pub(crate) level: EffortLevel,
+    /// Human label for the UI row.
+    pub(crate) label: &'static str,
+    pub(crate) env: &'static str,
+    pub(crate) builtin: &'static str,
+}
+
+/// Everything the UI and the resolver need to know about one provider's
+/// reasoning-effort mapping. Only Responses-API providers (codex / minimax /
+/// deepseek) have one — the Claude-format path handles `output_config.effort`
+/// natively, and the Chat-Completions adapters carry no reasoning effort.
+pub(crate) struct ProviderEffortSpec {
+    pub(crate) provider: &'static str,
+    pub(crate) label: &'static str,
+    pub(crate) levels: &'static [EffortLevelSpec],
+}
+
+impl ProviderEffortSpec {
+    /// The spec for one effort tier, if this provider declares it.
+    pub(crate) fn level(&self, level: EffortLevel) -> Option<&EffortLevelSpec> {
+        self.levels.iter().find(|l| l.level == level)
+    }
+
+    /// Resolve one of this provider's effort tiers.
+    pub(crate) fn resolve(&self, level: EffortLevel) -> String {
+        let spec = self.level(level).unwrap_or_else(|| {
+            panic!(
+                "provider {} has no {} effort tier",
+                self.provider,
+                level.as_str()
+            )
+        });
+        resolve_effort(self.provider, level, spec.env, spec.builtin)
+    }
+}
+
+/// Providers whose reasoning-effort mapping is editable. Only the three that
+/// serve the Responses API natively (`/v1/responses`) — the effort tier is a
+/// `reasoning.effort` field on that surface. Claude-format providers don't
+/// rewrite effort; the Chat-Completions adapters don't accept it at all.
+pub(crate) const PROVIDER_EFFORT_SPECS: &[ProviderEffortSpec] = &[
+    ProviderEffortSpec {
+        provider: "codex",
+        label: "Codex (OpenAI)",
+        levels: &[
+            EffortLevelSpec {
+                level: EffortLevel::Default,
+                label: "默认档（未传 effort）",
+                env: "CODEX_DEFAULT_EFFORT",
+                builtin: super::codex::CODEX_DEFAULT_EFFORT,
+            },
+            EffortLevelSpec {
+                level: EffortLevel::Low,
+                label: "low 档",
+                env: "CODEX_EFFORT_LOW",
+                builtin: super::codex::CODEX_EFFORT_LOW,
+            },
+            EffortLevelSpec {
+                level: EffortLevel::Medium,
+                label: "medium 档",
+                env: "CODEX_EFFORT_MEDIUM",
+                builtin: super::codex::CODEX_EFFORT_MEDIUM,
+            },
+            EffortLevelSpec {
+                level: EffortLevel::High,
+                label: "high 档",
+                env: "CODEX_EFFORT_HIGH",
+                builtin: super::codex::CODEX_EFFORT_HIGH,
+            },
+            EffortLevelSpec {
+                level: EffortLevel::Xhigh,
+                label: "xhigh 档",
+                env: "CODEX_EFFORT_XHIGH",
+                builtin: super::codex::CODEX_EFFORT_XHIGH,
+            },
+        ],
+    },
+    ProviderEffortSpec {
+        provider: "minimax",
+        label: "MiniMax",
+        levels: &[
+            EffortLevelSpec {
+                level: EffortLevel::Default,
+                label: "默认档（未传 effort）",
+                env: "MINIMAX_DEFAULT_EFFORT",
+                builtin: super::minimax::MINIMAX_DEFAULT_EFFORT,
+            },
+            EffortLevelSpec {
+                level: EffortLevel::Low,
+                label: "low 档",
+                env: "MINIMAX_EFFORT_LOW",
+                builtin: super::minimax::MINIMAX_EFFORT_LOW,
+            },
+            EffortLevelSpec {
+                level: EffortLevel::Medium,
+                label: "medium 档",
+                env: "MINIMAX_EFFORT_MEDIUM",
+                builtin: super::minimax::MINIMAX_EFFORT_MEDIUM,
+            },
+            EffortLevelSpec {
+                level: EffortLevel::High,
+                label: "high 档",
+                env: "MINIMAX_EFFORT_HIGH",
+                builtin: super::minimax::MINIMAX_EFFORT_HIGH,
+            },
+            EffortLevelSpec {
+                level: EffortLevel::Xhigh,
+                label: "xhigh 档",
+                env: "MINIMAX_EFFORT_XHIGH",
+                builtin: super::minimax::MINIMAX_EFFORT_XHIGH,
+            },
+        ],
+    },
+    ProviderEffortSpec {
+        provider: "deepseek",
+        label: "DeepSeek",
+        levels: &[
+            EffortLevelSpec {
+                level: EffortLevel::Default,
+                label: "默认档（未传 effort）",
+                env: "DEEPSEEK_DEFAULT_EFFORT",
+                builtin: super::deepseek::DEEPSEEK_DEFAULT_EFFORT,
+            },
+            EffortLevelSpec {
+                level: EffortLevel::Low,
+                label: "low 档",
+                env: "DEEPSEEK_EFFORT_LOW",
+                builtin: super::deepseek::DEEPSEEK_EFFORT_LOW,
+            },
+            EffortLevelSpec {
+                level: EffortLevel::Medium,
+                label: "medium 档",
+                env: "DEEPSEEK_EFFORT_MEDIUM",
+                builtin: super::deepseek::DEEPSEEK_EFFORT_MEDIUM,
+            },
+            EffortLevelSpec {
+                level: EffortLevel::High,
+                label: "high 档",
+                env: "DEEPSEEK_EFFORT_HIGH",
+                builtin: super::deepseek::DEEPSEEK_EFFORT_HIGH,
+            },
+            EffortLevelSpec {
+                level: EffortLevel::Xhigh,
+                label: "xhigh 档",
+                env: "DEEPSEEK_EFFORT_XHIGH",
+                builtin: super::deepseek::DEEPSEEK_EFFORT_XHIGH,
+            },
+        ],
+    },
+];
+
+/// The effort spec for a provider, or `None` if effort isn't mapped for it.
+pub(crate) fn effort_spec(provider: &str) -> Option<&'static ProviderEffortSpec> {
+    PROVIDER_EFFORT_SPECS.iter().find(|s| s.provider == provider)
+}
+
+/// Normalise the client's `reasoning.effort` (if any) onto this provider's own
+/// tier, and inject the provider default when the client sent none. Only
+/// Responses-API providers are mapped; anything else is a no-op so the
+/// Claude-format `output_config.effort` path stays untouched.
+pub(crate) fn apply_effort_mapping(payload: &mut Value, provider: &str) {
+    let Some(spec) = effort_spec(provider) else {
+        return;
+    };
+    let Some(obj) = payload.as_object_mut() else {
+        return;
+    };
+
+    let input = obj
+        .get("reasoning")
+        .and_then(|r| r.get("effort"))
+        .and_then(|e| e.as_str())
+        .map(|s| s.trim().to_ascii_lowercase());
+
+    let level = match input.as_deref() {
+        Some("minimal") | Some("low") => EffortLevel::Low,
+        Some("medium") => EffortLevel::Medium,
+        Some("high") => EffortLevel::High,
+        Some("xhigh") => EffortLevel::Xhigh,
+        _ => EffortLevel::Default,
+    };
+
+    let target = spec.resolve(level);
+
+    let reasoning = obj
+        .entry("reasoning".to_string())
+        .or_insert_with(|| json!({}));
+    if let Some(robj) = reasoning.as_object_mut() {
+        robj.insert("effort".to_string(), Value::String(target));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Persistence (mirrors `chains.rs`: single JSON doc, atomic replace)
 // ---------------------------------------------------------------------------
 
@@ -645,6 +939,7 @@ mod tests {
             sonnet_model: String::new(),
             fable_model: String::new(),
             models: models.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
         }
     }
 
@@ -745,5 +1040,89 @@ mod tests {
                 assert_eq!(spec.resolve(slot.slot), slot.builtin);
             }
         }
+    }
+
+    #[test]
+    fn effort_precedence_is_override_then_env_then_builtin() {
+        let _g = lock();
+        replace(ModelOverrides::new());
+        std::env::remove_var("TEST_EFFORT_ENV");
+
+        let (v, src) =
+            resolve_effort_sourced("codex", EffortLevel::Default, "TEST_EFFORT_ENV", "xhigh");
+        assert_eq!(v, "xhigh");
+        assert_eq!(src, Source::Builtin);
+
+        std::env::set_var("TEST_EFFORT_ENV", "max");
+        let (v, src) =
+            resolve_effort_sourced("codex", EffortLevel::Default, "TEST_EFFORT_ENV", "xhigh");
+        assert_eq!(v, "max");
+        assert_eq!(src, Source::Env);
+
+        let mut doc = ModelOverrides::new();
+        doc.insert(
+            "codex".to_string(),
+            ProviderModelCfg {
+                default_effort: "high".to_string(),
+                ..Default::default()
+            },
+        );
+        replace(doc);
+        let (v, src) =
+            resolve_effort_sourced("codex", EffortLevel::Default, "TEST_EFFORT_ENV", "xhigh");
+        assert_eq!(v, "high");
+        assert_eq!(src, Source::Override);
+
+        std::env::remove_var("TEST_EFFORT_ENV");
+        replace(ModelOverrides::new());
+    }
+
+    #[test]
+    fn apply_effort_mapping_rewrites_per_provider() {
+        let _g = lock();
+        replace(ModelOverrides::new());
+        // Clear every real env var so the assertions run against the built-ins.
+        for spec in PROVIDER_EFFORT_SPECS {
+            for l in spec.levels {
+                std::env::remove_var(l.env);
+            }
+        }
+
+        // Missing effort -> inject the provider's default tier.
+        let mut p = serde_json::json!({ "model": "x" });
+        apply_effort_mapping(&mut p, "deepseek");
+        assert_eq!(p["reasoning"]["effort"], "max");
+
+        // `xhigh` (client) -> DeepSeek's own top tier.
+        let mut p = serde_json::json!({ "reasoning": { "effort": "xhigh" } });
+        apply_effort_mapping(&mut p, "deepseek");
+        assert_eq!(p["reasoning"]["effort"], "max");
+
+        // `minimal` folds into the `low` tier.
+        let mut p = serde_json::json!({ "reasoning": { "effort": "minimal" } });
+        apply_effort_mapping(&mut p, "deepseek");
+        assert_eq!(p["reasoning"]["effort"], "low");
+
+        // Unrecognised tier -> default (not blindly forwarded).
+        let mut p = serde_json::json!({ "reasoning": { "effort": "banana" } });
+        apply_effort_mapping(&mut p, "deepseek");
+        assert_eq!(p["reasoning"]["effort"], "max");
+
+        // Codex keeps its own vocabulary (xhigh stays xhigh).
+        let mut p = serde_json::json!({ "reasoning": { "effort": "xhigh" } });
+        apply_effort_mapping(&mut p, "codex");
+        assert_eq!(p["reasoning"]["effort"], "xhigh");
+
+        // MiniMax collapses every tier onto `high` (its only real tier).
+        let mut p = serde_json::json!({ "reasoning": { "effort": "xhigh" } });
+        apply_effort_mapping(&mut p, "minimax");
+        assert_eq!(p["reasoning"]["effort"], "high");
+
+        // A provider without an effort spec is a no-op — no `reasoning` injected.
+        let mut p = serde_json::json!({ "model": "x" });
+        apply_effort_mapping(&mut p, "claude");
+        assert!(p.get("reasoning").is_none());
+
+        replace(ModelOverrides::new());
     }
 }

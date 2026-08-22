@@ -512,6 +512,15 @@ pub(crate) fn codex_bootstrap_payload(
 // Codex wire types (auth.json shape, OAuth refresh, bootstrap response).
 // ---------------------------------------------------------------------------
 
+/// Built-in reasoning-effort tiers for the Responses API. Codex/OpenAI exposes
+/// the full `minimal / low / medium / high / xhigh` ladder; these map Claude
+/// Code's tier names onto it, with `xhigh` as the default (strongest).
+pub(crate) const CODEX_DEFAULT_EFFORT: &str = "xhigh";
+pub(crate) const CODEX_EFFORT_LOW: &str = "low";
+pub(crate) const CODEX_EFFORT_MEDIUM: &str = "medium";
+pub(crate) const CODEX_EFFORT_HIGH: &str = "high";
+pub(crate) const CODEX_EFFORT_XHIGH: &str = "xhigh";
+
 pub(crate) const CODEX_REFRESH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub(crate) const DEFAULT_CODEX_WS_UPSTREAM_URL: &str =
     "wss://chatgpt.com/backend-api/codex/realtime";

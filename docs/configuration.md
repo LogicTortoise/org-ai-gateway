@@ -24,6 +24,8 @@ GATEWAY_OWNER_PROTECTION=on GATEWAY_HTTP_TIMEOUT_SECS=900 ./scripts/restart.sh -
 | `GATEWAY_HTTP_TIMEOUT_SECS` | `600` | 上游 HTTP 总超时（秒）；connect timeout 固定 10s |
 | `CODEX_PROXY_URL` | 无 | codex 上游可选出站代理 URL |
 | `CODEX_UPSTREAM_WS_URL` | 内置 Codex WS 端点 | codex WebSocket 上游地址覆盖 |
+| `CODEX_DEFAULT_EFFORT` | `xhigh` | Codex 未传 `reasoning.effort` 时注入的默认档（Responses 档位：`minimal`/`low`/`medium`/`high`/`xhigh`） |
+| `CODEX_EFFORT_LOW` / `CODEX_EFFORT_MEDIUM` / `CODEX_EFFORT_HIGH` / `CODEX_EFFORT_XHIGH` | `low` / `medium` / `high` / `xhigh` | 客户端 effort 档 → Codex 上游档的映射 |
 
 ## 身份 / 权限
 
@@ -134,6 +136,8 @@ Trae 不是直连的云端 API：Trae IDE 用的是私有的 `api/agent/v3` agen
 | `MINIMAX_OPUS_MODEL` | `MiniMax-M3` | **opus 档**（`claude-opus-*`） |
 | `MINIMAX_SONNET_MODEL` | `MiniMax-M3` | **sonnet + haiku 档**（`claude-sonnet-*`、`claude-haiku-*`） |
 | `MINIMAX_FABLE_MODEL` | `MiniMax-M3` | **fable 档**（`claude-fable-*`） |
+| `MINIMAX_DEFAULT_EFFORT` | `high` | Responses 未传 `reasoning.effort` 时注入的默认档（MiniMax 只认 `none`/`high`） |
+| `MINIMAX_EFFORT_LOW` / `MINIMAX_EFFORT_MEDIUM` / `MINIMAX_EFFORT_HIGH` / `MINIMAX_EFFORT_XHIGH` | 均 `high` | 客户端 effort 档 → MiniMax 上游档的映射（MiniMax 只有 `high` 一个真实档，其余全塌到 `high`） |
 | `MINIMAX_MODELS` | 内置目录 | 逗号分隔，覆盖 model 目录（MiniMax 的 Anthropic 面没有 `/models`，所以目录是静态的） |
 | `MINIMAX_TIMEOUT_SECS` | `600` | 超时（秒） |
 | `MINIMAX_PRIMARY_LIMIT_TOKENS` | 不限 | **5h 窗口 token 上限**（网关本地聚合用；不设 = 不参与撞墙预判，仅作 burn rate 观测） |
@@ -159,6 +163,8 @@ Trae 不是直连的云端 API：Trae IDE 用的是私有的 `api/agent/v3` agen
 | `DEEPSEEK_OPUS_MODEL` | `deepseek-v4-pro` | Anthropic 路径的 **opus 档**（`claude-opus-*`） |
 | `DEEPSEEK_SONNET_MODEL` | `deepseek-v4-pro` | Anthropic 路径的 **sonnet + haiku 档**（`claude-sonnet-*` 和 `claude-haiku-*` 共享一个上游目标） |
 | `DEEPSEEK_FABLE_MODEL` | `deepseek-v4-flash` | Anthropic 路径的 **fable 档**（Claude Code 最便宜的 tier） |
+| `DEEPSEEK_DEFAULT_EFFORT` | `max` | Responses 未传 `reasoning.effort` 时注入的默认档（DeepSeek 档位：`low`/`high`/`max`） |
+| `DEEPSEEK_EFFORT_LOW` / `DEEPSEEK_EFFORT_MEDIUM` / `DEEPSEEK_EFFORT_HIGH` / `DEEPSEEK_EFFORT_XHIGH` | `low` / `high` / `high` / `max` | 客户端 effort 档 → DeepSeek 上游档的映射 |
 | `DEEPSEEK_MODELS` | 内置目录 | 逗号分隔，覆盖 model 目录（Anthropic 路径的 id 目录） |
 | `DEEPSEEK_TIMEOUT_SECS` | `600` | 超时（秒） |
 | `DEEPSEEK_PRIMARY_LIMIT_TOKENS` | 不限 | **5h 窗口 token 上限**（网关本地聚合用；不设 = 不参与撞墙预判，仅作 burn rate 观测） |
@@ -362,7 +368,7 @@ GLM / Kimi / DeepSeek / MiniMax 这四家在 SSE 流里塞错误有两种形态�
 
 ## 相关：模型映射运行时覆盖（`data/provider_models.json`）
 
-上面每个 provider 的 `*_DEFAULT_MODEL` / `*_OPUS_MODEL` / `*_SONNET_MODEL` / `*_FABLE_MODEL` / `*_MODELS` 这类 env，都可以在**运行时**被 `data/provider_models.json` 覆盖，不用改 env、不用重启。这是 WebUI「模型映射」面板保存的东西。
+上面每个 provider 的 `*_DEFAULT_MODEL` / `*_OPUS_MODEL` / `*_SONNET_MODEL` / `*_FABLE_MODEL` / `*_MODELS` 这类 env，以及 Codex / MiniMax / DeepSeek 的 `*_DEFAULT_EFFORT` / `*_EFFORT_LOW` / `*_EFFORT_MEDIUM` / `*_EFFORT_HIGH` / `*_EFFORT_XHIGH`，都可以在**运行时**被 `data/provider_models.json` 覆盖，不用改 env、不用重启。这是 WebUI「模型映射」面板保存的东西。
 
 **优先级（从高到低）**：
 
@@ -379,9 +385,14 @@ data/provider_models.json（手改）  >  环境变量  >  代码内置常量
     "opus_model": "deepseek-v4-pro",
     "sonnet_model": "deepseek-v4-pro",
     "fable_model": "deepseek-v4-flash",
-    "models": ["deepseek-v4-pro", "deepseek-v4-flash"]
+    "models": ["deepseek-v4-pro", "deepseek-v4-flash"],
+    "default_effort": "max",
+    "effort_low": "low",
+    "effort_medium": "high",
+    "effort_high": "high",
+    "effort_xhigh": "max"
   },
-  "minimax": { "default_model": "minimax-m3" }
+  "minimax": { "default_model": "minimax-m3", "default_effort": "high" }
 }
 ```
 
@@ -390,13 +401,15 @@ data/provider_models.json（手改）  >  环境变量  >  代码内置常量
 - `sonnet_model` —— Sonnet + Haiku 档（两个 tier 共享一个上游目标，因为大多数第三方厂商没有独立的 sonnet 变体）。**所有 provider 都声明这一档**。`haiku_model` 和旧名 `sonnet_haiku_model` 写入时仍被接受（serde alias 兼容老配置），新配置请用 `sonnet_model`。
 - `fable_model` —— Fable 档（`claude-fable-*`，Claude Code 最便宜的 tier）。**所有 provider 都声明这一档**。
 - `models` —— 整份模型清单覆盖。**非空即"钉死"**：GLM / Kimi / Trae / Ollama 平时会去上游 `GET /models` 拉清单，一旦这里填了内容（或对应 `*_MODELS` env 有值），就不再拉，直接用这份——否则刚填的清单会立刻被上游拉回的覆盖掉。
+- `default_effort` —— Responses 面未传 `reasoning.effort` 时注入的默认档（**独立项**，不是 client 档）。
+- `effort_low` / `effort_medium` / `effort_high` / `effort_xhigh` —— 客户端 effort 档 → 上游档的映射。只有 **Codex / MiniMax / DeepSeek** 三家声明（它们都走 `/v1/responses` 原生透传）；其余 provider 无此字段。
 - 空字符串 / 空数组 = 未覆盖，回落到 env；某 provider 全部字段都空则整条记录不落盘，文件不积垃圾。
 
 **读写方式**：
 
 | 端点 | 权限 | 作用 |
 |---|---|---|
-| `GET /v1/provider/model-map` | 任意已识别调用方 | 每档的 `matches` / env 名 / 内置值 / 当前覆盖 / **实际生效值 + 来源标记**（`override` / `env` / `builtin` / `live`）。每个 provider 都返回 4 行（`default` / `opus` / `sonnet` / `fable`）。 |
+| `GET /v1/provider/model-map` | 任意已识别调用方 | 每档的 `matches` / env 名 / 内置值 / 当前覆盖 / **实际生效值 + 来源标记**（`override` / `env` / `builtin` / `live`）。每个 provider 都返回 4 行（`default` / `opus` / `sonnet` / `fable`）；Codex / MiniMax / DeepSeek 额外返回 `effort` 数组（5 档：`default` / `low` / `medium` / `high` / `xhigh`），其中 Codex 无 model 改写，只回 effort 档。 |
 | `PUT /v1/provider/model-map` | 仅 owner-trusted | 覆盖任意子集；未提及的 provider 保持原样；保存失败会回滚内存态 |
 | `POST /v1/provider/model-map/test` | 仅 owner-trusted | 按**当前已保存**的映射真发一次 `max_tokens: 1` 的最小请求，回报 HTTP 状态、耗时、发出的模型、**上游实际应答的模型**（`parse_response_model`）、token 用量。`slot` 字段可传 `default` / `opus` / `sonnet`（亦接受简写 `haiku`，已合并到 sonnet 档） / `fable`。 |
 

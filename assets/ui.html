@@ -693,6 +693,7 @@
                 modelMapTestOk: '通了', modelMapTestFailed: '失败',
                 modelMapSent: '发出', modelMapServed: '上游应答', modelMapTokens: 'token', modelMapLatency: '耗时',
                 modelMapAccount: '账号',
+                modelMapEffort: '推理 effort 档位', modelMapEffortHint: '映射 client 的 reasoning.effort 到该上游档位；default 档在未传 effort 时注入。留空 = 用内置默认。',
                 searchPlaceholder: '搜索账号 / 所有者...',
                 allPlatforms: '所有平台', allStatuses: '所有状态',
                 statusActive: '活跃 (有请求)', statusShared: '已共享', statusPrivate: '私有',
@@ -871,6 +872,7 @@
                 modelMapTestOk: 'OK', modelMapTestFailed: 'Failed',
                 modelMapSent: 'sent', modelMapServed: 'served', modelMapTokens: 'tokens', modelMapLatency: 'latency',
                 modelMapAccount: 'account',
+                modelMapEffort: 'Reasoning effort', modelMapEffortHint: 'Maps the client\'s reasoning.effort to this upstream tier; the default tier is injected when none is sent. Leave empty = built-in default.',
                 searchPlaceholder: 'Search account / owner...',
                 allPlatforms: 'All platforms', allStatuses: 'All statuses',
                 statusActive: 'Active (has requests)', statusShared: 'Shared', statusPrivate: 'Private',
@@ -2764,8 +2766,11 @@
                 for (const p of window.__modelMap) {
                     const slots = {};
                     for (const s of p.slots) slots[s.slot] = s.override_value || '';
+                    const efforts = {};
+                    for (const e of (p.effort || [])) efforts[e.level] = e.override_value || '';
                     window.__modelMapEdits[p.provider] = {
                         slots,
+                        efforts,
                         models: (p.catalog_override || []).join(', '),
                     };
                 }
@@ -2810,6 +2815,28 @@
                         class="flex-1 min-w-0 bg-white border ${inputBorderClass} rounded-md px-2.5 py-1.5 text-sm focus:border-indigo-500 focus:ring-2 focus:ring-indigo-200 outline-none">
                     <code class="text-sm text-gray-800 w-40 truncate text-right" title="${escapeAttr(slot.value)}">${escapeHtml(slot.value)}</code>
                     ${modelMapSrcBadge(slot.source)}
+                </div>`;
+        }
+
+        function renderModelMapEffort(provider, level) {
+            const edit = window.__modelMapEdits[provider] || { efforts: {} };
+            const typed = edit.efforts[level.level] ?? '';
+            const isDefaultLevel = level.level === 'default';
+            const labelClass = isDefaultLevel
+                ? 'text-xs font-medium text-gray-400 w-20 shrink-0 uppercase tracking-wider'
+                : 'text-sm font-medium text-gray-700 w-20 shrink-0';
+            const inputBorderClass = isDefaultLevel
+                ? 'border-dashed border-gray-300'
+                : 'border-gray-300';
+            return `
+                <div class="flex items-center gap-3 py-1.5" data-effort-row="${escapeAttr(level.level)}">
+                    <span class="${labelClass}">${escapeHtml(level.label)}</span>
+                    <input type="text" value="${escapeAttr(typed)}" placeholder="${escapeAttr(level.builtin)}"
+                        oninput="modelMapEditEffort('${provider}','${level.level}',this.value)"
+                        data-modelmap-effort-input="${escapeAttr(provider)}:${escapeAttr(level.level)}"
+                        class="flex-1 min-w-0 bg-white border ${inputBorderClass} rounded-md px-2.5 py-1.5 text-sm focus:border-indigo-500 focus:ring-2 focus:ring-indigo-200 outline-none">
+                    <code class="text-sm text-gray-800 w-40 truncate text-right" title="${escapeAttr(level.value)}">${escapeHtml(level.value)}</code>
+                    ${modelMapSrcBadge(level.source)}
                 </div>`;
         }
 
@@ -2911,6 +2938,14 @@ function cssEscape(s) {
         function renderModelMapProvider(p) {
             const edit = window.__modelMapEdits[p.provider] || { slots: {}, models: '' };
             const slotRows = p.slots.map(s => renderModelMapSlot(p.provider, s)).join('');
+            const effortRows = (p.effort || []).map(e => renderModelMapEffort(p.provider, e)).join('');
+            const effortSection = (p.effort && p.effort.length) ? `
+                    <div class="px-5 py-3 border-t border-gray-100">
+                        <div class="flex items-center gap-2 mb-2">
+                            <span class="text-xs font-medium text-gray-700" title="${t('modelMapEffortHint')}">${t('modelMapEffort')}</span>
+                        </div>
+                        <div class="space-y-1">${effortRows}</div>
+                    </div>` : '';
             const catalogIds = p.catalog_value || [];
             const catalogPinned = p.catalog_source === 'override' || p.catalog_source === 'env';
             const slotTable = p.slots.map(s => `
@@ -2920,6 +2955,19 @@ function cssEscape(s) {
                     <td class="py-1.5 pr-2 text-gray-500 break-all">${escapeHtml(s.env)}</td>
                     <td class="py-1.5 text-gray-500 break-all">${escapeHtml(s.builtin)}</td>
                 </tr>`).join('');
+            const hasModelSlots = p.slots.length > 0;
+            const slotDetailsBlock = hasModelSlots ? `
+                <table class="w-full table-fixed">
+                    <colgroup><col style="width:4rem"><col><col style="width:8rem"><col style="width:7rem"></colgroup>
+                    <thead class="text-[10px] uppercase tracking-wide text-gray-400">
+                        <tr><th class="text-left py-1 pr-2 font-medium">档</th><th class="text-left py-1 pr-2 font-medium">匹配</th><th class="text-left py-1 pr-2 font-medium">env</th><th class="text-left py-1 font-medium">内置</th></tr>
+                    </thead>
+                    <tbody>${slotTable}</tbody>
+                </table>
+                <div class="pt-2 border-t border-gray-100">
+                    <span class="text-[10px] uppercase tracking-wide text-gray-400">${t('modelMapCatalog')}</span>
+                    <div class="mt-1 text-gray-600">${escapeHtml(p.catalog_env)}</div>
+                </div>` : '';
             return `
                 <div class="bg-white border border-gray-200 rounded-xl shadow-sm overflow-hidden">
                     <div class="px-5 py-3 flex items-center gap-3">
@@ -2933,27 +2981,18 @@ function cssEscape(s) {
                             </summary>
                             <div class="absolute right-0 top-full mt-1 z-10 w-[34rem] max-w-[90vw] bg-white border border-gray-200 rounded-lg shadow-lg p-4 text-xs text-gray-700 space-y-3">
                                 <p class="text-gray-600 leading-relaxed">${escapeHtml(p.rule)}</p>
-                                <table class="w-full table-fixed">
-                                    <colgroup><col style="width:4rem"><col><col style="width:8rem"><col style="width:7rem"></colgroup>
-                                    <thead class="text-[10px] uppercase tracking-wide text-gray-400">
-                                        <tr><th class="text-left py-1 pr-2 font-medium">档</th><th class="text-left py-1 pr-2 font-medium">匹配</th><th class="text-left py-1 pr-2 font-medium">env</th><th class="text-left py-1 font-medium">内置</th></tr>
-                                    </thead>
-                                    <tbody>${slotTable}</tbody>
-                                </table>
-                                <div class="pt-2 border-t border-gray-100">
-                                    <span class="text-[10px] uppercase tracking-wide text-gray-400">${t('modelMapCatalog')}</span>
-                                    <div class="mt-1 text-gray-600">${escapeHtml(p.catalog_env)}</div>
-                                </div>
+                                ${slotDetailsBlock}
                             </div>
                         </details>
-                        <button onclick="modelMapTest('${p.provider}')"
+                        ${hasModelSlots ? `<button onclick="modelMapTest('${p.provider}')"
                             class="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md border border-gray-300 text-gray-700 hover:bg-gray-50 hover:border-gray-400 transition">
                             <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
                             ${t('modelMapTest')}
-                        </button>
+                        </button>` : ''}
                     </div>
                     <div class="px-5 pb-4 space-y-1">${slotRows}</div>
-                    <div class="px-5 py-3 border-t border-gray-100 bg-gray-50/40">
+                    ${effortSection}
+                    ${hasModelSlots ? `<div class="px-5 py-3 border-t border-gray-100 bg-gray-50/40">
                         <div class="flex items-center gap-2 mb-2">
                             <span class="text-xs font-medium text-gray-700">${t('modelMapCatalog')}</span>
                             ${modelMapSrcBadge(p.catalog_source)}
@@ -2964,7 +3003,7 @@ function cssEscape(s) {
                             oninput="modelMapEditCatalog('${p.provider}',this.value)"
                             class="w-full bg-white border border-gray-300 rounded-md px-2.5 py-1.5 text-sm focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 outline-none">${escapeHtml(edit.models || '')}</textarea>
                         <div class="mt-2 flex flex-wrap gap-1.5">${renderModelMapChips(p.provider, catalogIds)}</div>
-                    </div>
+                    </div>` : ''}
                     <div class="px-5 py-3 border-t border-gray-100">
                         ${renderModelMapTest(p.provider)}
                     </div>
@@ -2991,8 +3030,12 @@ function cssEscape(s) {
             e.slots[slot] = value;
         }
         function modelMapEditCatalog(provider, value) {
-            const e = window.__modelMapEdits[provider] || (window.__modelMapEdits[provider] = { slots: {}, models: '' });
+            const e = window.__modelMapEdits[provider] || (window.__modelMapEdits[provider] = { slots: {}, efforts: {}, models: '' });
             e.models = value;
+        }
+        function modelMapEditEffort(provider, level, value) {
+            const e = window.__modelMapEdits[provider] || (window.__modelMapEdits[provider] = { slots: {}, efforts: {}, models: '' });
+            e.efforts[level] = value;
         }
 
         async function saveModelMap() {
@@ -3004,6 +3047,11 @@ function cssEscape(s) {
                     sonnet_model: (e.slots.sonnet || '').trim(),
                     fable_model: (e.slots.fable || '').trim(),
                     models: (e.models || '').split(',').map(s => s.trim()).filter(Boolean),
+                    default_effort: ((e.efforts || {}).default || '').trim(),
+                    effort_low: ((e.efforts || {}).low || '').trim(),
+                    effort_medium: ((e.efforts || {}).medium || '').trim(),
+                    effort_high: ((e.efforts || {}).high || '').trim(),
+                    effort_xhigh: ((e.efforts || {}).xhigh || '').trim(),
                 };
             }
             try {

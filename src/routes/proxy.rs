@@ -1167,6 +1167,7 @@ async fn serve_minimax_responses_passthrough(
     // error it can't retry its way out of. `payload_owned` is the working copy;
     // `stripped_sensitive` guarantees the strip happens at most once.
     let mut payload_owned = payload.clone();
+    crate::provider::model_config::apply_effort_mapping(&mut payload_owned, "minimax");
     let mut stripped_sensitive = false;
 
     for _ in 0..max_attempts {
@@ -1626,6 +1627,11 @@ async fn serve_deepseek_responses_passthrough(
     };
 
     let raw_model = payload.get("model").and_then(|v| v.as_str()).unwrap_or("deepseek");
+    // Map the client's reasoning effort (or inject the default) once, before the
+    // retry loop — every attempt sends the same already-mapped payload.
+    let mut payload_mapped = payload.clone();
+    crate::provider::model_config::apply_effort_mapping(&mut payload_mapped, "deepseek");
+    let payload = &payload_mapped;
     // On the Responses surface, the upstream model id follows DeepSeek's own
     // catalog (`deepseek-chat` / `deepseek-reasoner`) and the operator picks
     // the reasoner flavor by setting `DEEPSEEK_DEFAULT_MODEL=deepseek-reasoner`.
@@ -2952,6 +2958,11 @@ async fn serve_native_provider(
     // claude": Codex speaks the Responses format, whose ordinary function tools
     // legitimately carry `type: "function"` and must not be stripped.
     let mut payload = payload;
+    // Codex speaks the Responses format; map the client's reasoning effort (or
+    // inject the default) before the payload reaches the upstream.
+    if provider == "codex" {
+        crate::provider::model_config::apply_effort_mapping(&mut payload, provider);
+    }
     if crate::provider::is_third_party_anthropic(provider) {
         let removed = crate::provider::strip_anthropic_server_tools(&mut payload);
         if removed > 0 {

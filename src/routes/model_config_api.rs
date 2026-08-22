@@ -6,8 +6,8 @@
 use crate::auth::identify_caller;
 use crate::prelude::*;
 use crate::provider::model_config::{
-    self, persist_model_config, ModelOverrides, ProviderModelCfg, ProviderModelSpec, Slot, Source,
-    PROVIDER_MODEL_SPECS,
+    self, effort_spec, persist_model_config, EffortLevelSpec, ModelOverrides, ProviderModelCfg,
+    ProviderModelSpec, Slot, Source, PROVIDER_EFFORT_SPECS, PROVIDER_MODEL_SPECS,
 };
 
 /// One slot in the UI's "resolved value" column, with the source badge attached
@@ -23,6 +23,18 @@ pub(crate) struct ResolvedSlotView {
     /// just one slot doesn't have to mention the others.
     pub(crate) override_value: Option<String>,
     /// The value the gateway will actually use.
+    pub(crate) value: String,
+    pub(crate) source: Source,
+}
+
+/// One reasoning-effort tier in the UI's effort section.
+#[derive(Debug, Serialize)]
+pub(crate) struct ResolvedEffortView {
+    pub(crate) level: &'static str,
+    pub(crate) label: &'static str,
+    pub(crate) env: &'static str,
+    pub(crate) builtin: &'static str,
+    pub(crate) override_value: Option<String>,
     pub(crate) value: String,
     pub(crate) source: Source,
 }
@@ -43,6 +55,9 @@ pub(crate) struct ProviderModelView {
     pub(crate) catalog_env: &'static str,
     /// Built-in catalog ids, so the UI can show what it'd fall back to.
     pub(crate) catalog_builtin: &'static [&'static str],
+    /// Reasoning-effort tiers for Responses-API providers; `None` when this
+    /// provider has no editable effort mapping.
+    pub(crate) effort: Option<Vec<ResolvedEffortView>>,
 }
 
 fn slot_view(
@@ -67,6 +82,33 @@ fn slot_view(
         matches: slot.matches,
         env: slot.env,
         builtin: slot.builtin,
+        override_value,
+        value,
+        source,
+    }
+}
+
+fn effort_view(
+    provider: &'static str,
+    level: &EffortLevelSpec,
+) -> ResolvedEffortView {
+    let (value, source) = crate::provider::model_config::resolve_effort_sourced(
+        provider,
+        level.level,
+        level.env,
+        level.builtin,
+    );
+    let override_value = crate::provider::model_config::snapshot()
+        .get(provider)
+        .and_then(|cfg| {
+            let v = cfg.effort_value(level.level);
+            if v.is_empty() { None } else { Some(v.to_string()) }
+        });
+    ResolvedEffortView {
+        level: level.level.as_str(),
+        label: level.label,
+        env: level.env,
+        builtin: level.builtin,
         override_value,
         value,
         source,
@@ -105,6 +147,13 @@ pub(crate) async fn get_model_map(
             .get(spec.provider)
             .map(|c| c.models.clone())
             .filter(|v| !v.is_empty());
+        let effort = effort_spec(spec.provider).map(|espec| {
+            espec
+                .levels
+                .iter()
+                .map(|l| effort_view(spec.provider, l))
+                .collect::<Vec<_>>()
+        });
         providers.push(ProviderModelView {
             provider: spec.provider,
             label: spec.label,
@@ -116,6 +165,33 @@ pub(crate) async fn get_model_map(
             catalog_live: spec.catalog_live,
             catalog_env: spec.catalog_env,
             catalog_builtin: spec.catalog_builtin,
+            effort,
+        });
+    }
+    // Codex has no model rewrite (its model id passes through untouched), so it
+    // isn't in PROVIDER_MODEL_SPECS — but it *does* map reasoning effort. Emit a
+    // synthetic row with no slots/catalog so the UI still renders its 5 tiers.
+    for espec in PROVIDER_EFFORT_SPECS {
+        if PROVIDER_MODEL_SPECS.iter().any(|s| s.provider == espec.provider) {
+            continue;
+        }
+        let effort: Vec<ResolvedEffortView> = espec
+            .levels
+            .iter()
+            .map(|l| effort_view(espec.provider, l))
+            .collect();
+        providers.push(ProviderModelView {
+            provider: espec.provider,
+            label: espec.label,
+            rule: "model 直通上游（无改写），仅映射 reasoning effort 档位。",
+            slots: Vec::new(),
+            catalog_override: None,
+            catalog_value: Vec::new(),
+            catalog_source: Source::Builtin,
+            catalog_live: false,
+            catalog_env: "",
+            catalog_builtin: &[],
+            effort: Some(effort),
         });
     }
     let _ = state;
@@ -149,8 +225,11 @@ pub(crate) async fn update_model_map(
 
     // Validate the keys up-front so an unknown provider name returns a clean
     // 400 instead of silently being kept in the file.
-    let known: std::collections::BTreeSet<&'static str> =
-        PROVIDER_MODEL_SPECS.iter().map(|s| s.provider).collect();
+    let known: std::collections::BTreeSet<&'static str> = PROVIDER_MODEL_SPECS
+        .iter()
+        .map(|s| s.provider)
+        .chain(PROVIDER_EFFORT_SPECS.iter().map(|s| s.provider))
+        .collect();
     for k in payload.providers.keys() {
         let k_norm = k.trim().to_ascii_lowercase();
         if !known.contains(k_norm.as_str()) {

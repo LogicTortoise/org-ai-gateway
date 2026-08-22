@@ -49,6 +49,16 @@ pub(crate) const BUILTIN_OPUS_MODEL: &str = "MiniMax-M3";
 pub(crate) const BUILTIN_SONNET_MODEL: &str = "MiniMax-M3";
 pub(crate) const BUILTIN_FABLE_MODEL: &str = "MiniMax-M3";
 
+/// Built-in reasoning-effort tiers for MiniMax's `/v1/responses`. MiniMax only
+/// distinguishes `none` (think-off) and `high` (Deep thinking), so every tier
+/// maps to `high` — the operator can point a tier at `none` if they want to
+/// switch lightweight requests to think-off.
+pub(crate) const MINIMAX_DEFAULT_EFFORT: &str = "high";
+pub(crate) const MINIMAX_EFFORT_LOW: &str = "high";
+pub(crate) const MINIMAX_EFFORT_MEDIUM: &str = "high";
+pub(crate) const MINIMAX_EFFORT_HIGH: &str = "high";
+pub(crate) const MINIMAX_EFFORT_XHIGH: &str = "high";
+
 /// The built-in model catalog, in MiniMax's own documented casing. There is no
 /// live `/models` endpoint on the Anthropic surface, so this list is static and
 /// can lag behind MiniMax's actual catalog — any id also works directly via

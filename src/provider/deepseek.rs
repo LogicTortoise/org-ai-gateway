@@ -74,6 +74,15 @@ pub(crate) const BUILTIN_FABLE_MODEL: &str = "deepseek-v4-flash";
 /// reasoner flavor set `DEEPSEEK_DEFAULT_MODEL=deepseek-reasoner`.
 pub(crate) const BUILTIN_DEFAULT_MODEL: &str = "deepseek-chat";
 
+/// Built-in reasoning-effort tiers for DeepSeek's `/v1/responses`. DeepSeek
+/// exposes `low / high / max`; `medium` folds up to `high` and `xhigh` reaches
+/// `max` (the strongest tier).
+pub(crate) const DEEPSEEK_DEFAULT_EFFORT: &str = "max";
+pub(crate) const DEEPSEEK_EFFORT_LOW: &str = "low";
+pub(crate) const DEEPSEEK_EFFORT_MEDIUM: &str = "high";
+pub(crate) const DEEPSEEK_EFFORT_HIGH: &str = "high";
+pub(crate) const DEEPSEEK_EFFORT_XHIGH: &str = "max";
+
 /// The built-in model catalog. Static by design: DeepSeek's `GET /models` lists
 /// the ids of their *OpenAI* surface (`deepseek-chat`, `deepseek-reasoner`),
 /// which are not the ids this Anthropic surface documents — pulling it live
