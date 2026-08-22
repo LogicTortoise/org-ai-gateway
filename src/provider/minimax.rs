@@ -346,6 +346,56 @@ pub(crate) fn parse_minimax_error_message(body: &str) -> Option<String> {
     None
 }
 
+/// Whether an upstream error message is MiniMax's "input image flagged as
+/// sensitive" rejection. These land as an HTTP 4xx *before* any model work:
+/// `input new_sensitive, messages[N]'s content[K] image is sensitive, please
+/// check your input (1026)`. The account is fine — only the payload trips the
+/// content filter — so the gateway strips the offending image and retries
+/// instead of surfacing a fatal input error the Codex client can't recover from.
+pub(crate) fn is_sensitive_image_error(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("image is sensitive") || lower.contains("new_sensitive")
+}
+
+/// Rewrite a Responses payload so every `input_image` content block inside an
+/// `input` array's `message` items is replaced by an `input_text` placeholder.
+/// MiniMax's content filter rejects the whole request when any image is
+/// sensitive, so dropping the image and telling the model it was omitted lets
+/// the turn complete (the model can proceed without it) rather than wedging the
+/// Codex message queue. Returns a new value; the input is not mutated.
+pub(crate) fn strip_sensitive_images(payload: &Value) -> Value {
+    let mut out = payload.clone();
+    let Some(obj) = out.as_object_mut() else {
+        return out;
+    };
+    let Some(input) = obj.get_mut("input").and_then(|v| v.as_array_mut()) else {
+        return out;
+    };
+    for item in input.iter_mut() {
+        let Some(item_obj) = item.as_object_mut() else {
+            continue;
+        };
+        if item_obj.get("type").and_then(|t| t.as_str()) != Some("message") {
+            continue;
+        }
+        let Some(content) = item_obj.get_mut("content").and_then(|c| c.as_array_mut()) else {
+            continue;
+        };
+        for block in content.iter_mut() {
+            let Some(block_obj) = block.as_object_mut() else {
+                continue;
+            };
+            if block_obj.get("type").and_then(|t| t.as_str()) == Some("input_image") {
+                *block = json!({
+                    "type": "input_text",
+                    "text": "[image omitted: upstream content filter flagged it as sensitive; proceed without it]",
+                });
+            }
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Anthropic-compatible upstream call (passthrough, used for Claude-format traffic)
 // ---------------------------------------------------------------------------
@@ -670,5 +720,65 @@ mod tests {
 
         // 6. Not JSON at all → None.
         assert!(parse_minimax_error_message("not json").is_none());
+    }
+
+    #[test]
+    fn sensitive_image_error_detection() {
+        assert!(is_sensitive_image_error(
+            "input new_sensitive, messages[112]'s content[0] image is sensitive, please check your input (1026)"
+        ));
+        assert!(is_sensitive_image_error("image is sensitive"));
+        assert!(is_sensitive_image_error("something new_sensitive happened"));
+        // Unrelated errors must not trip the strip-and-retry path.
+        assert!(!is_sensitive_image_error("insufficient balance"));
+        assert!(!is_sensitive_image_error("rate limited"));
+        assert!(!is_sensitive_image_error("invalid params, chat content is empty"));
+    }
+
+    #[test]
+    fn strip_sensitive_images_replaces_input_image_blocks() {
+        let payload = json!({
+            "model": "MiniMax-M3",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "describe this"},
+                        {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+                    ],
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "unrelated",
+                },
+            ],
+        });
+        let stripped = strip_sensitive_images(&payload);
+        let content = stripped
+            .pointer("/input/0/content")
+            .and_then(|c| c.as_array())
+            .unwrap();
+        assert_eq!(content.len(), 2, "input_image must become input_text, not be dropped");
+        assert_eq!(content[0]["type"], "input_text", "text block untouched");
+        assert_eq!(content[1]["type"], "input_text", "image block rewritten");
+        assert!(content[1]["text"].as_str().unwrap().contains("omitted"));
+        // Non-message items are untouched.
+        assert_eq!(stripped.pointer("/input/1/type").unwrap(), "function_call_output");
+        // Original payload is not mutated.
+        assert_eq!(payload.pointer("/input/0/content/1/type").unwrap(), "input_image");
+    }
+
+    #[test]
+    fn strip_sensitive_images_ignores_missing_input_or_non_message() {
+        let no_input = json!({"model": "MiniMax-M3"});
+        assert_eq!(strip_sensitive_images(&no_input), no_input);
+
+        // A message with string content (not an array) is left alone.
+        let string_content = json!({
+            "input": [{"type": "message", "role": "user", "content": "plain text"}],
+        });
+        assert_eq!(strip_sensitive_images(&string_content), string_content);
     }
 }

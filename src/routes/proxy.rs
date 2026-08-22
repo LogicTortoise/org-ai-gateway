@@ -1160,6 +1160,14 @@ async fn serve_minimax_responses_passthrough(
     let mut selected_any = false;
     let mut last_error: Option<(StatusCode, Value)> = None;
     let request_json_chars = payload.to_string().chars().count();
+    // MiniMax may 4xx a whole request because an `input_image` block trips its
+    // content filter. In that case we strip the offending image and retry on the
+    // SAME account (the account is healthy — only the payload is at fault), so
+    // the Codex client gets a normally-completed turn instead of a fatal input
+    // error it can't retry its way out of. `payload_owned` is the working copy;
+    // `stripped_sensitive` guarantees the strip happens at most once.
+    let mut payload_owned = payload.clone();
+    let mut stripped_sensitive = false;
 
     for _ in 0..max_attempts {
         let now = Utc::now();
@@ -1185,7 +1193,7 @@ async fn serve_minimax_responses_passthrough(
         note_account_pick(state, &account.id).await;
 
         let send_outcome =
-            minimax::send_minimax_responses_streaming(&account, &upstream_model, payload).await;
+            minimax::send_minimax_responses_streaming(&account, &upstream_model, &payload_owned).await;
 
         let upstream = match send_outcome {
             Ok(v) => v,
@@ -1212,6 +1220,21 @@ async fn serve_minimax_responses_passthrough(
                 .or_else(|| minimax::parse_minimax_error_message(&body));
             let up = crate::util::format_upstream_error("minimax", upstream_status, &body, parsed);
             let detail = up.detail;
+            // Sensitive-image rejection: strip the offending `input_image` and
+            // retry on the SAME account rather than surfacing a fatal 4xx to the
+            // Codex client. The account is healthy, so it is NOT marked failed
+            // and we deliberately drop `excluded` so the same account is
+            // eligible for reselection next iteration.
+            if !stripped_sensitive && minimax::is_sensitive_image_error(&detail) {
+                stripped_sensitive = true;
+                payload_owned = minimax::strip_sensitive_images(&payload_owned);
+                excluded.remove(&account.id);
+                info!(
+                    "minimax_sensitive_image on {}; stripped input_image and retrying",
+                    account.account_label,
+                );
+                continue;
+            }
             let class = ErrorClass::from_status(upstream_status.as_u16());
             apply_account_failure(state, &account.id, class, None, None, false).await;
             info!(
