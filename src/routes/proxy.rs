@@ -1169,6 +1169,7 @@ async fn serve_minimax_responses_passthrough(
     let mut payload_owned = payload.clone();
     crate::provider::model_config::apply_effort_mapping(&mut payload_owned, "minimax");
     let mut stripped_sensitive = false;
+    let mut stripped_image_count = 0usize;
 
     for _ in 0..max_attempts {
         let now = Utc::now();
@@ -1228,11 +1229,14 @@ async fn serve_minimax_responses_passthrough(
             // eligible for reselection next iteration.
             if !stripped_sensitive && minimax::is_sensitive_image_error(&detail) {
                 stripped_sensitive = true;
-                payload_owned = minimax::strip_sensitive_images(&payload_owned);
+                let (stripped, n) = minimax::strip_sensitive_images(&payload_owned);
+                payload_owned = stripped;
+                stripped_image_count = n;
                 excluded.remove(&account.id);
                 info!(
-                    "minimax_sensitive_image on {}; stripped input_image and retrying",
+                    "minimax_sensitive_image on {}; stripped {} input_image block(s) and retrying",
                     account.account_label,
+                    stripped_image_count,
                 );
                 continue;
             }
@@ -1332,7 +1336,23 @@ async fn serve_minimax_responses_passthrough(
             )
             .await;
 
-            let resp_json = aggregated.unwrap_or(Value::Null);
+            // Non-streaming equivalent of the streaming-path tool-call
+            // prefix: register the (function_call, function_call_output)
+            // pair at the head of the aggregated `output` array so the client
+            // sees an explicit result for every stripped image.
+            let mut resp_json = aggregated.unwrap_or(Value::Null);
+            if stripped_image_count > 0 {
+                let items = minimax::image_filter_output_items(stripped_image_count);
+                if let Some(output) = resp_json
+                    .as_object_mut()
+                    .and_then(|o| o.get_mut("output"))
+                    .and_then(|v| v.as_array_mut())
+                {
+                    for (i, item) in items.into_iter().enumerate() {
+                        output.insert(i, item);
+                    }
+                }
+            }
             let resp_bytes = serde_json::to_vec(&resp_json)
                 .map_err(|e| format!("failed to serialize minimax Response: {}", e))
                 .unwrap_or_default();
@@ -1364,6 +1384,7 @@ async fn serve_minimax_responses_passthrough(
             upstream,
             request_json_chars,
             retry_after,
+            stripped_image_count,
         )
         .await;
         return ProviderOutcome::Served(response);
@@ -1387,6 +1408,12 @@ async fn serve_minimax_responses_passthrough(
 /// for the audit row. Empty or errored streams get a synthesised
 /// `response.failed` terminal event so the Codex client can retry (mirrors
 /// the Chat-Completions SSE translator's behavior).
+///
+/// `stripped_image_count > 0` means this request already went through a
+/// sensitive-image strip + retry: the stream gets a synthetic
+/// (function_call, function_call_output) prefix so the Codex client registers
+/// an explicit tool-call result for the omitted images instead of wedging its
+/// message queue over an input that was silently rewritten.
 async fn stream_minimax_responses_passthrough(
     state: AppState,
     account: UpstreamAccount,
@@ -1395,6 +1422,7 @@ async fn stream_minimax_responses_passthrough(
     upstream: reqwest::Response,
     request_json_chars: usize,
     _retry_after: Option<i64>,
+    stripped_image_count: usize,
 ) -> Response {
     let upstream_status = upstream.status();
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(32);
@@ -1411,6 +1439,15 @@ async fn stream_minimax_responses_passthrough(
         // failed upstream emits a `response.failed` terminal event (Codex
         // surfaces this as an error and retries, matching the Chat-Completions
         // translator's behavior).
+        // Stripped sensitive images: prefix the stream with a synthetic
+        // (function_call, function_call_output) pair so Codex can register it
+        // in its message queue. Without this the queue wedges — the input had
+        // images but the stream never acknowledged them. Sent before any
+        // upstream bytes; the audit parser below ignores these event types.
+        if stripped_image_count > 0 {
+            let prefix = minimax::synthesize_image_filter_events(stripped_image_count);
+            let _ = tx.send(Ok(axum::body::Bytes::from(prefix))).await;
+        }
         let mut bytes_stream = upstream.bytes_stream();
         let mut buf = String::new();
         let mut last_completed_usage: Option<TokenUsage> = None;
