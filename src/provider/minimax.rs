@@ -372,17 +372,14 @@ pub(crate) fn is_sensitive_image_error(msg: &str) -> bool {
 /// MiniMax's content filter rejects the whole request when any image is
 /// sensitive, so dropping the image and telling the model it was omitted lets
 /// the turn complete (the model can proceed without it) rather than wedging the
-/// Codex message queue. Returns `(rewritten_payload, stripped_count)`; the
-/// input is not mutated. The count feeds `synthesize_image_filter_events`, so
-/// the client sees an explicit tool-call result for every dropped image.
-pub(crate) fn strip_sensitive_images(payload: &Value) -> (Value, usize) {
+/// Codex message queue. Returns a new value; the input is not mutated.
+pub(crate) fn strip_sensitive_images(payload: &Value) -> Value {
     let mut out = payload.clone();
-    let mut count = 0usize;
     let Some(obj) = out.as_object_mut() else {
-        return (out, count);
+        return out;
     };
     let Some(input) = obj.get_mut("input").and_then(|v| v.as_array_mut()) else {
-        return (out, count);
+        return out;
     };
     for item in input.iter_mut() {
         let Some(item_obj) = item.as_object_mut() else {
@@ -403,70 +400,10 @@ pub(crate) fn strip_sensitive_images(payload: &Value) -> (Value, usize) {
                     "type": "input_text",
                     "text": "[image omitted: upstream content filter flagged it as sensitive; proceed without it]",
                 });
-                count += 1;
             }
         }
     }
-    (out, count)
-}
-
-/// Build the synthetic output items announcing "image(s) flagged as sensitive
-/// by the upstream content filter and omitted": a complete
-/// (`function_call`, `function_call_output`) pair. Injected into the response
-/// the Codex client sees — at the head of an aggregated `output` array, or as
-/// a leading SSE event sequence via [`synthesize_image_filter_events`] — so it
-/// registers a full tool-call/result pair in its message queue. Without it, an
-/// input that carried images but a stream that never acknowledges them wedges
-/// the queue.
-///
-/// Shape follows the existing Responses function_call construction in proxy.rs
-/// (`build_common_output_items`): `arguments` / `output` are JSON-encoded
-/// STRINGS and ids use the `fc_` prefix.
-pub(crate) fn image_filter_output_items(stripped_count: usize) -> Vec<Value> {
-    let call_id = format!("call_imgfilter_{}", uuid::Uuid::new_v4());
-    let fc_id = format!("fc_imgfilter_{}", uuid::Uuid::new_v4());
-    let arguments = json!({ "images_filtered": stripped_count }).to_string();
-    let output = json!({
-        "status": "filtered",
-        "images_filtered": stripped_count,
-        "reason": "image is sensitive (1026)",
-        "action": "image has been omitted; proceed without it",
-    })
-    .to_string();
-
-    vec![
-        json!({
-            "type": "function_call",
-            "id": fc_id,
-            "call_id": call_id,
-            "name": "image_content_filter_check",
-            "arguments": arguments,
-            "status": "completed",
-        }),
-        json!({
-            "type": "function_call_output",
-            "call_id": call_id,
-            "output": output,
-        }),
-    ]
-}
-
-/// Wrap [`image_filter_output_items`] into raw SSE bytes (an
-/// `response.output_item.added` + `response.output_item.done` pair per item)
-/// for injection at the START of a streaming upstream response.
-pub(crate) fn synthesize_image_filter_events(stripped_count: usize) -> Vec<u8> {
-    let mut sse = String::new();
-    for (output_index, item) in image_filter_output_items(stripped_count).into_iter().enumerate() {
-        for event_type in ["response.output_item.added", "response.output_item.done"] {
-            let payload = json!({
-                "type": event_type,
-                "output_index": output_index,
-                "item": &item,
-            });
-            sse.push_str(&format!("event: {}\ndata: {}\n\n", event_type, payload));
-        }
-    }
-    sse.into_bytes()
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -828,8 +765,7 @@ mod tests {
                 },
             ],
         });
-        let (stripped, count) = strip_sensitive_images(&payload);
-        assert_eq!(count, 1, "exactly one input_image was stripped");
+        let stripped = strip_sensitive_images(&payload);
         let content = stripped
             .pointer("/input/0/content")
             .and_then(|c| c.as_array())
@@ -845,94 +781,14 @@ mod tests {
     }
 
     #[test]
-    fn strip_sensitive_images_counts_multiple_images() {
-        let payload = json!({
-            "input": [
-                {
-                    "type": "message",
-                    "role": "user",
-                    "content": [
-                        {"type": "input_image", "image_url": "data:image/png;base64,A"},
-                        {"type": "input_text", "text": "and this"},
-                        {"type": "input_image", "image_url": "data:image/png;base64,B"},
-                    ],
-                },
-                {
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [{"type": "output_text", "text": "kept"}],
-                },
-            ],
-        });
-        let (stripped, count) = strip_sensitive_images(&payload);
-        assert_eq!(count, 2, "both input_image blocks counted");
-        let content = stripped.pointer("/input/0/content").unwrap().as_array().unwrap();
-        assert_eq!(content[0]["type"], "input_text");
-        assert_eq!(content[1]["type"], "input_text");
-        assert_eq!(content[2]["type"], "input_text");
-    }
-
-    #[test]
     fn strip_sensitive_images_ignores_missing_input_or_non_message() {
         let no_input = json!({"model": "MiniMax-M3"});
-        let (stripped, count) = strip_sensitive_images(&no_input);
-        assert_eq!(stripped, no_input);
-        assert_eq!(count, 0);
+        assert_eq!(strip_sensitive_images(&no_input), no_input);
 
         // A message with string content (not an array) is left alone.
         let string_content = json!({
             "input": [{"type": "message", "role": "user", "content": "plain text"}],
         });
-        let (stripped, count) = strip_sensitive_images(&string_content);
-        assert_eq!(stripped, string_content);
-        assert_eq!(count, 0);
-    }
-
-    #[test]
-    fn synthesize_image_filter_events_well_formed_sse_pair() {
-        let bytes = synthesize_image_filter_events(3);
-        let text = String::from_utf8(bytes).unwrap();
-
-        // Split into SSE events on the blank-line separator and parse the
-        // data: payloads.
-        let events: Vec<Value> = text
-            .split("\n\n")
-            .filter(|chunk| !chunk.trim().is_empty())
-            .map(|chunk| {
-                let data_line = chunk
-                    .lines()
-                    .find(|l| l.starts_with("data: "))
-                    .expect("each event carries a data line");
-                serde_json::from_str::<Value>(&data_line["data: ".len()..]).unwrap()
-            })
-            .collect();
-
-        assert_eq!(events.len(), 4, "added/done x function_call/function_call_output");
-        assert_eq!(events[0]["type"], "response.output_item.added");
-        assert_eq!(events[1]["type"], "response.output_item.done");
-        assert_eq!(events[2]["type"], "response.output_item.added");
-        assert_eq!(events[3]["type"], "response.output_item.done");
-
-        let fc = &events[0]["item"];
-        assert_eq!(fc["type"], "function_call");
-        assert_eq!(fc["name"], "image_content_filter_check");
-        assert!(fc["id"].as_str().unwrap().starts_with("fc_"));
-        assert!(fc["call_id"].as_str().unwrap().starts_with("call_imgfilter_"));
-        // `arguments` is a JSON-encoded STRING carrying the stripped count.
-        let args: Value = serde_json::from_str(fc["arguments"].as_str().unwrap()).unwrap();
-        assert_eq!(args["images_filtered"], 3);
-
-        // The output item shares the call_id and reports filtered status.
-        let out = &events[2]["item"];
-        assert_eq!(out["type"], "function_call_output");
-        assert_eq!(out["call_id"], fc["call_id"]);
-        let parsed_out: Value = serde_json::from_str(out["output"].as_str().unwrap()).unwrap();
-        assert_eq!(parsed_out["status"], "filtered");
-        assert_eq!(parsed_out["images_filtered"], 3);
-        assert!(parsed_out["reason"].as_str().unwrap().contains("1026"));
-
-        for ev in &events {
-            assert!(ev.get("output_index").is_some(), "every event has output_index");
-        }
+        assert_eq!(strip_sensitive_images(&string_content), string_content);
     }
 }
