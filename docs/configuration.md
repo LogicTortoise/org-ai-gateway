@@ -16,6 +16,54 @@ GATEWAY_OWNER_PROTECTION=on GATEWAY_HTTP_TIMEOUT_SECS=900 ./scripts/restart.sh -
 
 ---
 
+## Gateway 角色：客户端的反向代理，不是上游的替身
+
+**核心定位**：OrgAI Gateway 是 **Codex CLI / Claude Code / Cursor 等客户端的 base_url 替身 / 反向代理**，**不是任何上游（minimax / codex / claude / cursor / glm / kimi / deepseek）的协议实现**。客户端从来不直连上游；Gateway 才是客户端眼里那个"API 服务端"。
+
+```
+Codex CLI  / Claude Code / Cursor / IDE 插件
+   │   base_url = http://<gateway>:8088  （或反向代理后的公网地址）
+   ▼
+┌──────────────────────────────┐
+│        OrgAI Gateway         │   ← 客户端写到这里
+│     反向代理 / 路由器          │
+│                              │
+│  按 data/provider_chains.json│
+│  把请求路由到不同上游          │
+└──────────────────────────────┘
+   │           │           │
+   ▼           ▼           ▼
+ codex     minimax    claude / cursor
+ 上游      上游       / glm / kimi / deepseek 上游
+```
+
+每个上游**自己实现**跟客户端匹配的 wire format，Gateway 不替任何上游实现协议：
+
+- **Codex slot**（Codex CLI 走 OpenAI Responses 形状请求）
+  - codex 上游：原生 OpenAI Responses API
+  - minimax 上游：minimax 自家实现的 OpenAI Responses 兼容端点 `/v1/responses`
+  - glm / kimi / deepseek 上游：自家 OpenAI Responses 兼容端点
+- **Claude slot**（Claude Code 走 Anthropic Messages 形状请求）
+  - claude 上游：原生 Anthropic Messages API
+  - minimax 上游：minimax 自家实现的 Anthropic 兼容端点（`/anthropic/v1/messages`）
+  - glm / kimi / deepseek 上游：自家 Anthropic 兼容端点
+- **Cursor slot**：cursor 上游自有协议
+
+Gateway 在每条转发链上的角色是**透明管道**：客户端按 OpenAI Responses / Anthropic Messages 协议发请求，Gateway 按 chain 选目标上游、上游按自家实现的兼容端点接请求、返回的 wire format 原样回给客户端。Gateway 在流上做的 side-channel 解析（解析 `response.completed` 拿真实 usage、检测内嵌 error chunk / 空流合成 `response.failed`）都是**纯附加**，不改写任何 wire 字节。
+
+### ⚠ minimax 官网接法 ≠ Gateway 接入方式
+
+`platform.minimaxi.com/docs/token-plan/codex` 是 **Codex CLI 直连 minimax** 的接法说明（base_url、model、本地 catalog JSON 路径、`reasoning` / `default_reasoning_level` / `truncation_policy` 等 catalog 字段、`shell_type` / `experimental_supported_tools` 等工具声明）。在 Gateway 模式下这份文档**不适用**：
+
+- Codex CLI 不会直连 minimax，所有请求先到 Gateway；Gateway 才是客户端眼里的服务端。
+- Gateway **不需要**也不应该**模拟 minimax 的 catalog 字段**——`/v1/models` / `/backend-api/codex/models` 响应继续走 codex 上游 catalog（这是 Codex CLI 客户端应该看到的 catalog，不该被 minimax catalog 替换）。客户端想要 minimax 专属 catalog 字段就在本地 `~/.codex/model-catalogs/custom-catalog.json` 自己配，那是 Codex CLI 自己的本地 catalog 文件，不是从 `base_url` 拉的。
+- minimax 上游自己负责"按 OpenAI Responses 兼容端点协议响应"——这是 minimax 的责任；Gateway 不替它承担。
+- 任何想"按 minimax 官网接法去注入 catalog 字段"或"在 Gateway 里模拟 minimax 协议"的思路都是错的，Gateway 不是 minimax。
+
+透明管道的好处：上游协议演进时（如 minimax 改自家 Responses 端点的事件格式）Gateway 不用同步改写，最多加 side-channel 解析处理新事件，不会破坏客户端兼容性。
+
+---
+
 ## 服务 / 网络
 
 | 变量 | 默认 | 说明 |
