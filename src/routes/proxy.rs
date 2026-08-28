@@ -1455,18 +1455,87 @@ async fn stream_minimax_responses_passthrough(
         let mut last_completed_event_id: Option<String> = None;
         let mut upstream_error: Option<(String, String)> = None;
         let mut raw_response_bytes: usize = 0;
+        // [minimax_stream_probe] per-request timing for debugging "session
+        // disconnects mid-stream". Tracks first-byte latency, per-chunk gaps,
+        // and the moment the Codex CLI client disconnects while the upstream
+        // is still producing — leaves a clear trail in the log so the next
+        // 502 burst can be pinpointed without re-running traffic. Safe to
+        // remove once the stream-cut root cause is fixed.
+        let stream_started = std::time::Instant::now();
+        let mut chunk_idx: usize = 0;
+        let mut first_byte_at: Option<std::time::Instant> = None;
+        let mut prev_chunk_at: Option<std::time::Instant> = None;
+        let user_for_probe = user_id_for_task.clone();
+        let raw_model_for_probe = raw_model_for_task.clone();
+        info!(
+            "[minimax_stream_probe] BEGIN user={} raw_model={} account={} chain=codex",
+            user_for_probe, raw_model_for_probe, account_for_task.account_label,
+        );
 
         loop {
             let chunk = match bytes_stream.next().await {
                 Some(Ok(c)) => c,
                 Some(Err(e)) => {
+                    info!(
+                        "[minimax_stream_probe] UPSTREAM_READ_ERR user={} chunks={} raw_bytes={} elapsed={:?} err={}",
+                        user_for_probe, chunk_idx, raw_response_bytes,
+                        stream_started.elapsed(), e,
+                    );
                     let _ = tx.send(Err(std::io::Error::new(std::io::ErrorKind::Other, e))).await;
                     break;
                 }
-                None => break,
+                None => {
+                    info!(
+                        "[minimax_stream_probe] UPSTREAM_END user={} chunks={} raw_bytes={} elapsed={:?}",
+                        user_for_probe, chunk_idx, raw_response_bytes,
+                        stream_started.elapsed(),
+                    );
+                    break;
+                }
             };
-            raw_response_bytes += chunk.len();
-            let _ = tx.send(Ok(chunk.clone())).await;
+            let now = std::time::Instant::now();
+            let first_byte_ms = first_byte_at.map(|t| now.duration_since(t));
+            let gap_since_prev = prev_chunk_at.map(|t| now.duration_since(t));
+            if first_byte_at.is_none() {
+                first_byte_at = Some(now);
+            }
+            prev_chunk_at = Some(now);
+            let chunk_size = chunk.len();
+            raw_response_bytes += chunk_size;
+            chunk_idx += 1;
+            // Dump the SSE event content so we can verify the wire format
+            // the upstream is emitting — minimax's `/v1/responses` is
+            // supposed to be Responses-shaped but the client renders
+            // nothing, so we need to see whether `sequence_number`,
+            // `output_item.added`, `output_text.delta`, etc. are present.
+            let chunk_str = String::from_utf8_lossy(&chunk);
+            let preview: String = chunk_str
+                .chars()
+                .take(160)
+                .collect::<String>()
+                .replace('\n', "\\n");
+            info!(
+                "[minimax_stream_probe] CHUNK user={} idx={} size={} elapsed={:?} first_byte+={:?} gap={:?} raw_total={} preview={:?}",
+                user_for_probe, chunk_idx, chunk_size,
+                stream_started.elapsed(),
+                first_byte_ms.map(|d| d.as_millis()),
+                gap_since_prev.map(|d| d.as_millis()),
+                raw_response_bytes,
+                preview,
+            );
+            // If the Codex CLI closed the connection, surface it loudly and
+            // bail — otherwise we'd keep reading minimax chunks after the
+            // client is gone, with no signal in the log of which side quit.
+            if tx.send(Ok(chunk.clone())).await.is_err() {
+                info!(
+                    "[minimax_stream_probe] CLIENT_DROPPED user={} chunks={} raw_bytes={} elapsed={:?} first_byte_took={:?}",
+                    user_for_probe, chunk_idx, raw_response_bytes,
+                    stream_started.elapsed(),
+                    first_byte_at.map(|t| t.duration_since(stream_started)),
+                );
+                buf.push_str(&String::from_utf8_lossy(&chunk));
+                break;
+            }
             // Parse the chunk for audit/error detection. The chunk content
             // boundaries don't have to coincide with SSE event boundaries —
             // we accumulate into `buf` and slice at newline boundaries.
