@@ -121,6 +121,7 @@ Gateway 在每条转发链上的角色是**透明管道**：客户端按 OpenAI 
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | 读取本机 Claude Code 登录态的目录（捐号时用） |
+| `CODEX_CLIENT_VERSION` | `0.153.4` | Codex 模型目录请求未携带 `client_version` 时使用的兜底版本。客户端显式传入的版本优先并原样转发，避免新模型因旧版本目录被隐藏。 |
 | `CURSOR_TIMEOUT_SECS` | `120` | Cursor 上游超时（秒） |
 | `OAG_ADVERTISED_MODELS` | `gpt-5.6-sol,gpt-5.6-terra,gpt-5.6-luna` | 逗号分隔，附加到 `GET /v1/models` 的 catalog 末尾。这些是 Codex 认识但 OpenAI 公网 catalog 没有的别名（Bedrock 命名空间），让 Codex `list_models` refresh 不再丢。设为空字符串关闭追加。 |
 

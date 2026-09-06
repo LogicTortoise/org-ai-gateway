@@ -17,7 +17,16 @@ use crate::provider::minimax::minimax_model_catalog;
 use crate::provider::trae::fetch_trae_models;
 use crate::provider::trae::trae_model_catalog;
 
-pub(crate) async fn get_codex_models(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct CodexModelsQuery {
+    client_version: Option<String>,
+}
+
+pub(crate) async fn get_codex_models(
+    State(state): State<AppState>,
+    Query(query): Query<CodexModelsQuery>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
     let user_id = match extract_user_id(&headers) {
         Ok(uid) => uid,
         Err(err) => {
@@ -44,7 +53,8 @@ pub(crate) async fn get_codex_models(State(state): State<AppState>, headers: Hea
         }
     };
 
-    let models = match fetch_codex_models(&selected_account).await {
+    let models =
+        match fetch_codex_models(&selected_account, query.client_version.as_deref()).await {
         Ok(m) => m,
         Err(e) => {
             return (
@@ -368,6 +378,7 @@ async fn provider_static_models(
 
 pub(crate) async fn proxy_models_codex(
     State(state): State<AppState>,
+    Query(query): Query<CodexModelsQuery>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let caller = identify_caller(&headers);
@@ -384,7 +395,7 @@ pub(crate) async fn proxy_models_codex(
                 .into_response();
         }
     };
-    let models = match fetch_codex_models(&account).await {
+    let models = match fetch_codex_models(&account, query.client_version.as_deref()).await {
         Ok(v) => v,
         Err(e) => {
             return (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response();
@@ -396,6 +407,7 @@ pub(crate) async fn proxy_models_codex(
 
 pub(crate) async fn proxy_models_openai(
     State(state): State<AppState>,
+    Query(query): Query<CodexModelsQuery>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let caller = identify_caller(&headers);
@@ -412,7 +424,7 @@ pub(crate) async fn proxy_models_openai(
                 .into_response();
         }
     };
-    let mut models = match fetch_codex_models_raw(&account).await {
+    let mut models = match fetch_codex_models_raw(&account, query.client_version.as_deref()).await {
         Ok(v) => v,
         Err(e) => {
             return (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response();

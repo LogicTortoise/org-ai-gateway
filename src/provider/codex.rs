@@ -10,6 +10,23 @@ use crate::usage::synthesize_rate_limit_from_error;
 use crate::util::codex_http_client;
 use crate::util::truncate_text;
 
+const DEFAULT_CODEX_CLIENT_VERSION: &str = "0.153.4";
+const CODEX_MODELS_URL: &str = "https://chatgpt.com/backend-api/codex/models";
+
+fn codex_models_client_version(requested: Option<&str>) -> String {
+    requested
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            std::env::var("CODEX_CLIENT_VERSION")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or_else(|| DEFAULT_CODEX_CLIENT_VERSION.to_string())
+}
+
 pub(crate) async fn call_codex_responses_api(
     state: &AppState,
     account: &UpstreamAccount,
@@ -84,15 +101,20 @@ pub(crate) async fn call_codex_responses_api(
 }
 
 
-pub(crate) async fn fetch_codex_models(account: &UpstreamAccount) -> Result<Vec<ModelInfo>, String> {
+pub(crate) async fn fetch_codex_models(
+    account: &UpstreamAccount,
+    client_version: Option<&str>,
+) -> Result<Vec<ModelInfo>, String> {
     let client = codex_http_client();
     let bearer = account.bearer();
     if bearer.is_empty() {
         return Err("codex account has empty access token".to_string());
     }
 
+    let client_version = codex_models_client_version(client_version);
     let mut req = client
-        .get("https://chatgpt.com/backend-api/codex/models?client_version=0.125.0")
+        .get(CODEX_MODELS_URL)
+        .query(&[("client_version", client_version)])
         .bearer_auth(bearer)
         .header("Accept", "application/json");
     if !account.account_id.trim().is_empty() {
@@ -162,6 +184,7 @@ pub(crate) async fn fetch_codex_models(account: &UpstreamAccount) -> Result<Vec<
 /// every entry fails to decode and `list_models` refresh errors out.
 pub(crate) async fn fetch_codex_models_raw(
     account: &UpstreamAccount,
+    client_version: Option<&str>,
 ) -> Result<Vec<Value>, String> {
     let client = codex_http_client();
     let bearer = account.bearer();
@@ -169,8 +192,10 @@ pub(crate) async fn fetch_codex_models_raw(
         return Err("codex account has empty access token".to_string());
     }
 
+    let client_version = codex_models_client_version(client_version);
     let mut req = client
-        .get("https://chatgpt.com/backend-api/codex/models?client_version=0.125.0")
+        .get(CODEX_MODELS_URL)
+        .query(&[("client_version", client_version)])
         .bearer_auth(bearer)
         .header("Accept", "application/json");
     if !account.account_id.trim().is_empty() {
@@ -217,6 +242,40 @@ pub(crate) async fn fetch_codex_models_raw(
         return Err("no supported codex models found for this account".to_string());
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod model_catalog_tests {
+    use super::codex_models_client_version;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn requested_client_version_has_priority() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("CODEX_CLIENT_VERSION", "0.140.0");
+        assert_eq!(
+            codex_models_client_version(Some(" 0.153.4 ")),
+            "0.153.4"
+        );
+        std::env::remove_var("CODEX_CLIENT_VERSION");
+    }
+
+    #[test]
+    fn env_client_version_is_the_fallback() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("CODEX_CLIENT_VERSION", " 0.152.0 ");
+        assert_eq!(codex_models_client_version(None), "0.152.0");
+        std::env::remove_var("CODEX_CLIENT_VERSION");
+    }
+
+    #[test]
+    fn built_in_client_version_is_current_enough_for_latest_catalog() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("CODEX_CLIENT_VERSION");
+        assert_eq!(codex_models_client_version(None), "0.153.4");
+    }
 }
 
 
