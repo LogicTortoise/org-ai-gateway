@@ -9,6 +9,7 @@ pub(crate) mod glm;
 pub(crate) mod kimi;
 pub(crate) mod minimax;
 pub(crate) mod model_config;
+pub(crate) mod model_routing;
 pub(crate) mod ollama;
 pub(crate) mod trae;
 pub(crate) mod usage_window;

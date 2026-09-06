@@ -13,8 +13,10 @@ use crate::provider::claude::sanitize_claude_messages_payload;
 use crate::provider::claude::send_claude_upstream_with_refresh;
 use crate::provider::codex::ensure_codex_payload_defaults;
 use crate::provider::codex::send_codex_upstream_with_refresh;
-use crate::provider::chains::ordered_attempts;
 use crate::provider::chains::ChainSlot;
+use crate::provider::model_routing::next_round_robin_offset;
+use crate::provider::model_routing::provider_order;
+use crate::provider::model_routing::RouteDecision;
 use crate::provider::cursor::CursorFormat;
 use crate::provider::deepseek;
 use crate::provider::glm;
@@ -64,6 +66,28 @@ impl ProviderOutcome {
     }
 }
 
+/// Return the literal upstream model selected by a model route. A missing
+/// decision leaves each Provider path's existing model behavior unchanged.
+fn resolved_route_model(decision: Option<&RouteDecision>) -> Option<&str> {
+    decision.map(|route| route.upstream_model.as_str())
+}
+
+fn cursor_upstream_model(raw_model: &str, resolved_model: Option<&str>) -> String {
+    resolved_model
+        .map(str::to_string)
+        .unwrap_or_else(|| crate::provider::cursor::cursor_canonical_model(raw_model))
+}
+
+fn ollama_upstream_model(raw_model: &str, resolved_model: Option<&str>) -> String {
+    match resolved_model {
+        Some(model) => model.to_string(),
+        None if crate::provider::ollama::is_ollama_model(raw_model) => {
+            ollama_canonical_model(raw_model)
+        }
+        None => ollama_canonical_model("ollama"),
+    }
+}
+
 /// Serve a request through the configured priority chain for `slot`, degrading
 /// to the next provider on exhaustion / failure (failover), optionally rotating
 /// the starting provider each request (round-robin). Returns the first
@@ -77,22 +101,54 @@ async fn serve_with_chain(
     payload: &Value,
     client_wants_stream: bool,
     shared_only: bool,
+    decision: Option<RouteDecision>,
 ) -> Response {
     let cfg = state.chains.read().await.for_slot(slot).clone();
-    // Round-robin rotates the starting offset once per request; failover ignores it.
-    let rr_offset = if matches!(cfg.mode, crate::provider::chains::ChainMode::RoundRobin) {
+    let requested_model = decision
+        .as_ref()
+        .map(|d| d.requested_model.as_str())
+        .or_else(|| payload.get("model").and_then(|v| v.as_str()))
+        .unwrap_or("");
+    let routing_rule = decision.as_ref().map(|d| d.rule_id.as_str());
+    match decision.as_ref() {
+        Some(d) => info!(
+            "model_route slot={} source=rule rule={} requested_model={}",
+            slot.as_str(),
+            d.rule_id,
+            requested_model,
+        ),
+        None => tracing::debug!(
+            "model_route slot={} source=global_chain requested_model={}",
+            slot.as_str(),
+            requested_model,
+        ),
+    }
+    // A model route bypasses the chain, so it must not consume the chain's
+    // round-robin counter.
+    let rr_offset = if decision.is_none()
+        && matches!(
+            cfg.mode,
+            crate::provider::chains::ChainMode::RoundRobin
+        )
+    {
         let mut rr = state.chain_rr.lock().await;
         let counter = rr.entry(slot.as_str().to_string()).or_insert(0);
-        let v = *counter;
-        *counter = counter.wrapping_add(1);
-        v
+        let (next, used) = next_round_robin_offset(&cfg, *counter, decision.as_ref());
+        *counter = next;
+        used
     } else {
         0
     };
-    let order = ordered_attempts(&cfg, rr_offset);
+    let order = provider_order(&cfg, decision.as_ref(), rr_offset);
+    let resolved_model = resolved_route_model(decision.as_ref());
 
     let mut last_error: Option<Response> = None;
     for provider in &order {
+        // Each Provider gets a fresh logical payload. Wire-only model rewriting
+        // happens inside the Provider path so response rendering and audit
+        // fallback still see the client-requested model.
+        let attempt_payload = payload.clone();
+        let payload = &attempt_payload;
         let outcome = match provider.as_str() {
             "codex" | "claude" => {
                 serve_native_provider(
@@ -103,6 +159,8 @@ async fn serve_with_chain(
                     payload.clone(),
                     client_wants_stream,
                     shared_only,
+                    resolved_model,
+                    routing_rule,
                 )
                 .await
             }
@@ -121,6 +179,8 @@ async fn serve_with_chain(
                         payload.clone(),
                         client_wants_stream,
                         shared_only,
+                        resolved_model,
+                        routing_rule,
                     )
                     .await
                 } else {
@@ -132,6 +192,8 @@ async fn serve_with_chain(
                         payload,
                         client_wants_stream,
                         shared_only,
+                        resolved_model,
+                        routing_rule,
                     )
                     .await
                 }
@@ -150,6 +212,8 @@ async fn serve_with_chain(
                         payload.clone(),
                         client_wants_stream,
                         shared_only,
+                        resolved_model,
+                        routing_rule,
                     )
                     .await
                 } else {
@@ -161,6 +225,8 @@ async fn serve_with_chain(
                         payload,
                         client_wants_stream,
                         shared_only,
+                        resolved_model,
+                        routing_rule,
                     )
                     .await
                 }
@@ -181,6 +247,8 @@ async fn serve_with_chain(
                         payload.clone(),
                         client_wants_stream,
                         shared_only,
+                        resolved_model,
+                        routing_rule,
                     )
                     .await
                 } else {
@@ -208,6 +276,8 @@ async fn serve_with_chain(
                         payload.clone(),
                         client_wants_stream,
                         shared_only,
+                        resolved_model,
+                        routing_rule,
                     )
                     .await
                 } else if provider == "minimax" {
@@ -217,6 +287,8 @@ async fn serve_with_chain(
                         payload,
                         client_wants_stream,
                         shared_only,
+                        resolved_model,
+                        routing_rule,
                     )
                     .await
                 } else if provider == "deepseek" {
@@ -226,6 +298,8 @@ async fn serve_with_chain(
                         payload,
                         client_wants_stream,
                         shared_only,
+                        resolved_model,
+                        routing_rule,
                     )
                     .await
                 } else {
@@ -237,15 +311,36 @@ async fn serve_with_chain(
                         payload,
                         client_wants_stream,
                         shared_only,
+                        resolved_model,
+                        routing_rule,
                     )
                     .await
                 }
             }
             "ollama" => {
-                serve_ollama(state, client_format, user_id, payload, client_wants_stream, shared_only).await
+                serve_ollama(
+                    state,
+                    client_format,
+                    user_id,
+                    payload,
+                    client_wants_stream,
+                    shared_only,
+                    resolved_model,
+                    routing_rule,
+                )
+                .await
             }
             "cursor" => {
-                serve_cursor(state, client_format, user_id, payload, shared_only).await
+                serve_cursor(
+                    state,
+                    client_format,
+                    user_id,
+                    payload,
+                    shared_only,
+                    resolved_model,
+                    routing_rule,
+                )
+                .await
             }
             _ => ProviderOutcome::NextProvider(None),
         };
@@ -277,7 +372,7 @@ async fn serve_with_chain(
                 "hint": "请连接对应 provider 的账号，或在 UI「优先级链路」中调整顺序",
             })),
         )
-            .into_response()
+        .into_response()
     })
 }
 
@@ -303,14 +398,32 @@ async fn proxy_responses_inner(
     let shared_only = !caller.owner_trusted;
     // Cursor models are served by the Cursor upstream (api2.cursor.sh), not Codex.
     if payload_is_cursor(&payload) {
-        return serve_cursor(&state, CursorFormat::Responses, &user_id, &payload, shared_only)
+        return serve_cursor(
+            &state,
+            CursorFormat::Responses,
+            &user_id,
+            &payload,
+            shared_only,
+            None,
+            None,
+        )
             .await
             .into_response(cursor_no_account_response());
     }
     // `ollama/*` models route to a local ollama, peer to the paid providers.
     if payload_is_ollama(&payload) {
         let wants_stream = payload.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
-        let outcome = serve_ollama(&state, CursorFormat::Responses, &user_id, &payload, wants_stream, shared_only).await;
+        let outcome = serve_ollama(
+            &state,
+            CursorFormat::Responses,
+            &user_id,
+            &payload,
+            wants_stream,
+            shared_only,
+            None,
+            None,
+        )
+        .await;
         return outcome.into_response(ollama_no_account_response());
     }
     // The local client now sends its REAL ChatGPT token (we no longer rewrite
@@ -325,10 +438,14 @@ async fn proxy_responses_inner(
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let decision = {
+        let model = payload.get("model").and_then(|v| v.as_str()).unwrap_or("");
+        state.model_routing.read().await.resolve(ChainSlot::Codex, model)
+    };
     ensure_codex_payload_defaults(&mut payload);
     // Route through the Codex priority chain (default `[codex]`; may degrade to
     // GLM / ollama / cursor per the gateway's `/v1/provider/chains` config).
-    serve_with_chain(&state, ChainSlot::Codex, CursorFormat::Responses, &user_id, &payload, client_wants_stream, shared_only).await
+    serve_with_chain(&state, ChainSlot::Codex, CursorFormat::Responses, &user_id, &payload, client_wants_stream, shared_only, decision).await
 }
 
 pub(crate) async fn proxy_claude_messages(
@@ -352,13 +469,31 @@ async fn proxy_claude_messages_inner(
     let user_id = caller.id;
     let shared_only = !caller.owner_trusted;
     if payload_is_cursor(&payload) {
-        return serve_cursor(&state, CursorFormat::Claude, &user_id, &payload, shared_only)
+        return serve_cursor(
+            &state,
+            CursorFormat::Claude,
+            &user_id,
+            &payload,
+            shared_only,
+            None,
+            None,
+        )
             .await
             .into_response(cursor_no_account_response());
     }
     if payload_is_ollama(&payload) {
         let wants_stream = payload.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
-        let outcome = serve_ollama(&state, CursorFormat::Claude, &user_id, &payload, wants_stream, shared_only).await;
+        let outcome = serve_ollama(
+            &state,
+            CursorFormat::Claude,
+            &user_id,
+            &payload,
+            wants_stream,
+            shared_only,
+            None,
+            None,
+        )
+        .await;
         return outcome.into_response(ollama_no_account_response());
     }
     sanitize_claude_messages_payload(&mut payload);
@@ -368,9 +503,13 @@ async fn proxy_claude_messages_inner(
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let decision = {
+        let model = payload.get("model").and_then(|v| v.as_str()).unwrap_or("");
+        state.model_routing.read().await.resolve(ChainSlot::Claude, model)
+    };
     // Route through the Claude priority chain (default `[claude]`; may degrade to
     // GLM (Anthropic-compatible) / ollama / cursor per the gateway config).
-    serve_with_chain(&state, ChainSlot::Claude, CursorFormat::Claude, &user_id, &payload, client_wants_stream, shared_only).await
+    serve_with_chain(&state, ChainSlot::Claude, CursorFormat::Claude, &user_id, &payload, client_wants_stream, shared_only, decision).await
 }
 
 /// OpenAI Chat Completions entrypoint. Reserved for cursor-backed models;
@@ -396,13 +535,31 @@ async fn proxy_chat_completions_inner(
     let user_id = caller.id;
     let shared_only = !caller.owner_trusted;
     if payload_is_cursor(&payload) {
-        return serve_cursor(&state, CursorFormat::OpenAI, &user_id, &payload, shared_only)
+        return serve_cursor(
+            &state,
+            CursorFormat::OpenAI,
+            &user_id,
+            &payload,
+            shared_only,
+            None,
+            None,
+        )
             .await
             .into_response(cursor_no_account_response());
     }
     if payload_is_ollama(&payload) {
         let wants_stream = payload.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
-        let outcome = serve_ollama(&state, CursorFormat::OpenAI, &user_id, &payload, wants_stream, shared_only).await;
+        let outcome = serve_ollama(
+            &state,
+            CursorFormat::OpenAI,
+            &user_id,
+            &payload,
+            wants_stream,
+            shared_only,
+            None,
+            None,
+        )
+        .await;
         return outcome.into_response(ollama_no_account_response());
     }
     (
@@ -463,6 +620,8 @@ async fn serve_cursor(
     user_id: &str,
     payload: &Value,
     shared_only: bool,
+    resolved_model: Option<&str>,
+    routing_rule: Option<&str>,
 ) -> ProviderOutcome {
     use crate::provider::cursor;
 
@@ -472,7 +631,7 @@ async fn serve_cursor(
     };
 
     let raw_model = payload.get("model").and_then(|v| v.as_str()).unwrap_or("cursor");
-    let upstream_model = cursor::cursor_canonical_model(raw_model);
+    let upstream_model = cursor_upstream_model(raw_model, resolved_model);
 
     let req = match cursor::extract_request(payload) {
         Ok(v) => v,
@@ -579,8 +738,17 @@ async fn serve_cursor(
         reset_backoff(state, &account.id).await;
         let output_chars = result.text.chars().count();
         write_proxy_audit(
-            state, user_id, &account, "cursor", &upstream_model, prompt_chars, output_chars,
-            "success", TokenUsage::default(),
+            state,
+            user_id,
+            &account,
+            "cursor",
+            &upstream_model,
+            raw_model,
+            routing_rule,
+            prompt_chars,
+            output_chars,
+            "success",
+            TokenUsage::default(),
         )
         .await;
 
@@ -602,8 +770,17 @@ async fn serve_cursor(
     if last_error.is_some() {
         if let Some((account, status_label)) = pending_failure_audit {
             write_proxy_audit(
-                state, user_id, &account, "cursor", &upstream_model, prompt_chars, 0,
-                &status_label, TokenUsage::default(),
+                state,
+                user_id,
+                &account,
+                "cursor",
+                &upstream_model,
+                raw_model,
+                routing_rule,
+                prompt_chars,
+                0,
+                &status_label,
+                TokenUsage::default(),
             )
             .await;
         }
@@ -662,6 +839,8 @@ async fn serve_ollama(
     payload: &Value,
     client_wants_stream: bool,
     shared_only: bool,
+    resolved_model: Option<&str>,
+    routing_rule: Option<&str>,
 ) -> ProviderOutcome {
     use crate::provider::cursor::{build_buffered_body, build_sse_body, estimate_request_tokens, extract_request};
 
@@ -677,11 +856,7 @@ async fn serve_ollama(
     let raw_model = payload.get("model").and_then(|v| v.as_str()).unwrap_or("ollama");
     // Direct `ollama/<name>` → that model; fallback (a paid model name) → the
     // configured default ollama model.
-    let upstream_model = if crate::provider::ollama::is_ollama_model(raw_model) {
-        ollama_canonical_model(raw_model)
-    } else {
-        ollama_canonical_model("ollama")
-    };
+    let upstream_model = ollama_upstream_model(raw_model, resolved_model);
     let request_id = Uuid::new_v4().to_string();
     let request_json_chars = payload.to_string().chars().count();
     let estimated_input = estimate_request_tokens(&req);
@@ -753,8 +928,17 @@ async fn serve_ollama(
             estimated_input
         };
         write_proxy_audit(
-            state, user_id, &account, "ollama", &upstream_model, request_json_chars, result.text.len(),
-            "success", result.usage,
+            state,
+            user_id,
+            &account,
+            "ollama",
+            &upstream_model,
+            raw_model,
+            routing_rule,
+            request_json_chars,
+            result.text.len(),
+            "success",
+            result.usage,
         )
         .await;
 
@@ -810,6 +994,10 @@ async fn serve_openai_tool_compat(
     payload: &Value,
     client_wants_stream: bool,
     shared_only: bool,
+    // Literal upstream model selected by model routing. When absent, preserve
+    // the Provider's normal canonical mapping.
+    resolved_model: Option<&str>,
+    routing_rule: Option<&str>,
 ) -> ProviderOutcome {
     debug_assert!(matches!(provider, "glm" | "kimi"));
     // Only the Codex / Responses path is wired through the OpenAI surface.
@@ -828,14 +1016,15 @@ async fn serve_openai_tool_compat(
     };
 
     let raw_model = payload.get("model").and_then(|v| v.as_str()).unwrap_or(provider);
-    // Model rewriting per provider: each provider's `canonical_model` knows
-    // its own tier rewrite (GLM / Kimi fall back to a single built-in id).
-    // The OpenAI path sends this id verbatim to the upstream — the converters
-    // don't touch `model`.
-    let upstream_model = match provider {
-        "glm" => glm::glm_canonical_model(raw_model),
-        "kimi" => kimi::kimi_canonical_model(raw_model),
-        _ => raw_model.to_string(),
+    // A matched route supplies a literal model. Without one, retain the
+    // Provider's existing canonical mapping.
+    let upstream_model = match resolved_model {
+        Some(m) => m.to_string(),
+        None => match provider {
+            "glm" => glm::glm_canonical_model(raw_model),
+            "kimi" => kimi::kimi_canonical_model(raw_model),
+            _ => raw_model.to_string(),
+        },
     };
 
     let max_attempts = provider_attempt_budget(state, provider).await;
@@ -991,8 +1180,17 @@ async fn serve_openai_tool_compat(
         let output_tokens = usage.output_tokens;
         let reasoning_tokens = usage.reasoning_tokens;
         write_proxy_audit(
-            state, user_id, &account, provider, &effective_model,
-            request_json_chars, text.len(), "success", usage,
+            state,
+            user_id,
+            &account,
+            provider,
+            &upstream_model,
+            raw_model,
+            routing_rule,
+            request_json_chars,
+            text.len(),
+            "success",
+            usage,
         )
         .await;
 
@@ -1070,6 +1268,8 @@ async fn serve_openai_tool_compat(
                         user_id.to_string(),
                         provider.to_string(),
                         raw_model.to_string(),
+                        upstream_model.clone(),
+                        routing_rule.map(str::to_string),
                         upstream_resp,
                         request_json_chars,
                     )
@@ -1146,6 +1346,10 @@ async fn serve_minimax_responses_passthrough(
     payload: &Value,
     client_wants_stream: bool,
     shared_only: bool,
+    // Literal upstream model selected by model routing. When absent, preserve
+    // MiniMax's normal canonical mapping.
+    resolved_model: Option<&str>,
+    routing_rule: Option<&str>,
 ) -> ProviderOutcome {
     let owned_only = match crate::quota::enforce_user_quota(state, "minimax", user_id, !shared_only).await {
         Ok(v) => v,
@@ -1153,7 +1357,10 @@ async fn serve_minimax_responses_passthrough(
     };
 
     let raw_model = payload.get("model").and_then(|v| v.as_str()).unwrap_or("minimax");
-    let upstream_model = minimax::minimax_canonical_model(raw_model);
+    let upstream_model = match resolved_model {
+        Some(m) => m.to_string(),
+        None => minimax::minimax_canonical_model(raw_model),
+    };
 
     let max_attempts = provider_attempt_budget(state, "minimax").await;
     let mut excluded: HashSet<String> = HashSet::new();
@@ -1169,6 +1376,7 @@ async fn serve_minimax_responses_passthrough(
     let mut payload_owned = payload.clone();
     crate::provider::model_config::apply_effort_mapping(&mut payload_owned, "minimax");
     let mut stripped_sensitive = false;
+    let mut normalized_strict = false;
 
     for _ in 0..max_attempts {
         let now = Utc::now();
@@ -1232,6 +1440,16 @@ async fn serve_minimax_responses_passthrough(
                 excluded.remove(&account.id);
                 info!(
                     "minimax_sensitive_image on {}; stripped input_image and retrying",
+                    account.account_label,
+                );
+                continue;
+            }
+            if !normalized_strict && minimax::is_strict_input_error(&detail) {
+                normalized_strict = true;
+                payload_owned = minimax::normalize_codex_payload(&payload_owned);
+                excluded.remove(&account.id);
+                info!(
+                    "minimax_strict_input on {}; normalized input items and retrying",
                     account.account_label,
                 );
                 continue;
@@ -1327,8 +1545,17 @@ async fn serve_minimax_responses_passthrough(
             // shape the client expects).
             reset_backoff(state, &account.id).await;
             write_proxy_audit(
-                state, user_id, &account, "minimax", raw_model,
-                request_json_chars, body.len(), "success", usage,
+                state,
+                user_id,
+                &account,
+                "minimax",
+                &upstream_model,
+                raw_model,
+                routing_rule,
+                request_json_chars,
+                body.len(),
+                "success",
+                usage,
             )
             .await;
 
@@ -1361,6 +1588,8 @@ async fn serve_minimax_responses_passthrough(
             account.clone(),
             user_id.to_string(),
             raw_model.to_string(),
+            upstream_model.clone(),
+            routing_rule.map(str::to_string),
             upstream,
             request_json_chars,
             retry_after,
@@ -1392,6 +1621,8 @@ async fn stream_minimax_responses_passthrough(
     account: UpstreamAccount,
     user_id: String,
     raw_model: String,
+    upstream_model: String,
+    routing_rule: Option<String>,
     upstream: reqwest::Response,
     request_json_chars: usize,
     _retry_after: Option<i64>,
@@ -1620,7 +1851,9 @@ async fn stream_minimax_responses_passthrough(
                 &user_id_for_task,
                 &account_for_task,
                 &provider_for_task,
+                &upstream_model,
                 &raw_model_for_task,
+                routing_rule.as_deref(),
                 request_json_chars,
                 raw_response_bytes,
                 &format!("upstream_stream_error: {} ({})", msg, code),
@@ -1637,7 +1870,9 @@ async fn stream_minimax_responses_passthrough(
                 &user_id_for_task,
                 &account_for_task,
                 &provider_for_task,
+                &upstream_model,
                 &raw_model_for_task,
+                routing_rule.as_deref(),
                 request_json_chars,
                 raw_response_bytes,
                 "upstream_empty_stream",
@@ -1651,7 +1886,9 @@ async fn stream_minimax_responses_passthrough(
                 &user_id_for_task,
                 &account_for_task,
                 &provider_for_task,
+                &upstream_model,
                 &raw_model_for_task,
+                routing_rule.as_deref(),
                 request_json_chars,
                 raw_response_bytes,
                 "success",
@@ -1689,6 +1926,10 @@ async fn serve_deepseek_responses_passthrough(
     payload: &Value,
     client_wants_stream: bool,
     shared_only: bool,
+    // Literal upstream model selected by model routing. When absent, preserve
+    // DeepSeek's normal canonical mapping.
+    resolved_model: Option<&str>,
+    routing_rule: Option<&str>,
 ) -> ProviderOutcome {
     let owned_only = match crate::quota::enforce_user_quota(state, "deepseek", user_id, !shared_only).await {
         Ok(v) => v,
@@ -1706,7 +1947,10 @@ async fn serve_deepseek_responses_passthrough(
     // the reasoner flavor by setting `DEEPSEEK_DEFAULT_MODEL=deepseek-reasoner`.
     // Foreign names from the Claude chain (e.g. `claude-sonnet-4-5`) land on
     // the default slot here, same as the Anthropic path's tier rewrite.
-    let upstream_model = deepseek::deepseek_canonical_model(raw_model);
+    let upstream_model = match resolved_model {
+        Some(m) => m.to_string(),
+        None => deepseek::deepseek_canonical_model(raw_model),
+    };
 
     let max_attempts = provider_attempt_budget(state, "deepseek").await;
     let mut excluded: HashSet<String> = HashSet::new();
@@ -1851,8 +2095,17 @@ async fn serve_deepseek_responses_passthrough(
             // shape the client expects).
             reset_backoff(state, &account.id).await;
             write_proxy_audit(
-                state, user_id, &account, "deepseek", raw_model,
-                request_json_chars, body.len(), "success", usage,
+                state,
+                user_id,
+                &account,
+                "deepseek",
+                &upstream_model,
+                raw_model,
+                routing_rule,
+                request_json_chars,
+                body.len(),
+                "success",
+                usage,
             )
             .await;
 
@@ -1885,6 +2138,8 @@ async fn serve_deepseek_responses_passthrough(
             account.clone(),
             user_id.to_string(),
             raw_model.to_string(),
+            upstream_model.clone(),
+            routing_rule.map(str::to_string),
             upstream,
             request_json_chars,
             retry_after,
@@ -1916,6 +2171,8 @@ async fn stream_deepseek_responses_passthrough(
     account: UpstreamAccount,
     user_id: String,
     raw_model: String,
+    upstream_model: String,
+    routing_rule: Option<String>,
     upstream: reqwest::Response,
     request_json_chars: usize,
     _retry_after: Option<i64>,
@@ -2075,7 +2332,9 @@ async fn stream_deepseek_responses_passthrough(
                 &user_id_for_task,
                 &account_for_task,
                 &provider_for_task,
+                &upstream_model,
                 &raw_model_for_task,
+                routing_rule.as_deref(),
                 request_json_chars,
                 raw_response_bytes,
                 &format!("upstream_stream_error: {} ({})", msg, code),
@@ -2092,7 +2351,9 @@ async fn stream_deepseek_responses_passthrough(
                 &user_id_for_task,
                 &account_for_task,
                 &provider_for_task,
+                &upstream_model,
                 &raw_model_for_task,
+                routing_rule.as_deref(),
                 request_json_chars,
                 raw_response_bytes,
                 "upstream_empty_stream",
@@ -2106,7 +2367,9 @@ async fn stream_deepseek_responses_passthrough(
                 &user_id_for_task,
                 &account_for_task,
                 &provider_for_task,
+                &upstream_model,
                 &raw_model_for_task,
+                routing_rule.as_deref(),
                 request_json_chars,
                 raw_response_bytes,
                 "success",
@@ -2224,6 +2487,8 @@ async fn stream_openai_to_responses_sse(
     user_id: String,
     provider: String,
     raw_model: String,
+    upstream_model: String,
+    routing_rule: Option<String>,
     upstream: reqwest::Response,
     request_json_chars: usize,
 ) -> Response {
@@ -2250,7 +2515,9 @@ async fn stream_openai_to_responses_sse(
                     &user_id_for_task,
                     &account_for_task,
                     &provider_for_task,
+                    &upstream_model,
                     &raw_model_for_task,
+                    routing_rule.as_deref(),
                     request_json_chars,
                     text.len(),
                     "success",
@@ -2302,7 +2569,9 @@ async fn stream_openai_to_responses_sse(
                     &user_id_for_task,
                     &account_for_task,
                     &provider_for_task,
+                    &upstream_model,
                     &raw_model_for_task,
+                    routing_rule.as_deref(),
                     request_json_chars,
                     0,
                     &status_label,
@@ -3019,6 +3288,10 @@ async fn serve_native_provider(
     payload: Value,
     client_wants_stream: bool,
     shared_only: bool,
+    // Literal upstream model selected by model routing. When absent, preserve
+    // each Provider's normal canonical mapping.
+    resolved_model: Option<&str>,
+    routing_rule: Option<&str>,
 ) -> ProviderOutcome {
     // Anthropic server tools (`web_search_20250305`, `code_execution_*`, …) only
     // work on first-party Anthropic. Strip them before anything else touches the
@@ -3027,6 +3300,11 @@ async fn serve_native_provider(
     // claude": Codex speaks the Responses format, whose ordinary function tools
     // legitimately carry `type: "function"` and must not be stripped.
     let mut payload = payload;
+    let requested_model = payload
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     // Codex speaks the Responses format; map the client's reasoning effort (or
     // inject the default) before the payload reaches the upstream.
     if provider == "codex" {
@@ -3162,6 +3440,11 @@ async fn serve_native_provider(
         // system-block injection + metadata + tool-name obfuscation (restored on
         // the buffered response below).
         let mut attempt_payload = payload.clone();
+        if let Some(model) = resolved_model {
+            if let Some(obj) = attempt_payload.as_object_mut() {
+                obj.insert("model".to_string(), Value::String(model.to_string()));
+            }
+        }
         let mut tool_reverse: HashMap<String, String> = HashMap::new();
         if provider == "claude" && account.access_token.trim().starts_with("sk-ant-oat") {
             crate::fingerprint::claude::inject_request(&mut attempt_payload, &account, &user_id);
@@ -3172,6 +3455,9 @@ async fn serve_native_provider(
             "codex" => send_codex_upstream_with_refresh(&state, &account, &attempt_payload).await,
             // GLM rides its Anthropic-compatible endpoint for Claude-format
             // traffic: raw passthrough, no OAuth refresh, no Claude fingerprint.
+            // The dispatch site already set the payload's `model` to the
+            // resolved upstream id (or to a canonically-mapped fallback), so
+            // we forward the payload as-is.
             "glm" => glm::send_glm_anthropic(&account, &attempt_payload)
                 .await
                 .map(|resp| (resp, account.clone())),
@@ -3184,17 +3470,18 @@ async fn serve_native_provider(
             // Trae rides the local trae2anthropic sidecar's `/v1/messages` — the
             // only path it has. Same raw passthrough, and deliberately no Claude
             // fingerprint (the upstream is Trae's agent API, not Anthropic).
-            "trae" => trae::send_trae_anthropic(&account, &attempt_payload)
+            // A matched model route is forwarded literally.
+            "trae" => trae::send_trae_anthropic(&account, resolved_model, &attempt_payload)
                 .await
                 .map(|resp| (resp, account.clone())),
             // MiniMax / DeepSeek: same raw Anthropic passthrough, and deliberately
             // no Claude fingerprint — neither is Anthropic, so injecting the Claude
             // Code system blocks / obfuscated tool names would only corrupt the
-            // request. `send_*_anthropic` rewrites `model` to a real upstream id.
-            "minimax" => minimax::send_minimax_anthropic(&account, &attempt_payload)
+            // request. A matched model route is forwarded literally.
+            "minimax" => minimax::send_minimax_anthropic(&account, resolved_model, &attempt_payload)
                 .await
                 .map(|resp| (resp, account.clone())),
-            "deepseek" => deepseek::send_deepseek_anthropic(&account, &attempt_payload)
+            "deepseek" => deepseek::send_deepseek_anthropic(&account, resolved_model, &attempt_payload)
                 .await
                 .map(|resp| (resp, account.clone())),
             _ => send_claude_upstream_with_refresh(&state, &account, &attempt_payload).await,
@@ -3338,13 +3625,15 @@ async fn serve_native_provider(
             // response body is the only place that truth appears; the derived
             // mapping is the fallback for bodies that don't echo it.
             let effective_model = crate::usage::tokens::parse_response_model(&body_str)
-                .unwrap_or_else(|| effective_model_fallback(&payload, provider));
+                .unwrap_or_else(|| effective_model_fallback(&payload, provider, resolved_model));
             write_proxy_audit(
                 &state,
                 &user_id,
                 &account_for_request,
                 provider,
                 &effective_model,
+                &requested_model,
+                routing_rule,
                 request_json_chars,
                 body.len(),
                 "success",
@@ -3474,7 +3763,9 @@ async fn serve_native_provider(
                 &user_id,
                 &account,
                 provider,
-                &effective_model_fallback(&payload, provider),
+                &effective_model_fallback(&payload, provider, resolved_model),
+                &requested_model,
+                routing_rule,
                 request_json_chars,
                 output_len,
                 &status_label,
@@ -3625,7 +3916,14 @@ fn apply_passthrough_headers(response: &mut Response, headers: &[(String, Header
 /// the client's model verbatim (claude/codex/GLM/Kimi Anthropic) or mutates
 /// its own clone (Trae/MiniMax/DeepSeek), so the caller's `payload` is
 /// always the client's raw request.
-fn effective_model_fallback(payload: &Value, provider: &str) -> String {
+fn effective_model_fallback(
+    payload: &Value,
+    provider: &str,
+    resolved_model: Option<&str>,
+) -> String {
+    if let Some(model) = resolved_model {
+        return model.to_string();
+    }
     let raw = payload.get("model").and_then(|v| v.as_str()).unwrap_or("");
     crate::provider::normalize_model_for_provider(raw, provider)
 }
@@ -3638,7 +3936,9 @@ async fn write_proxy_audit(
     user_id: &str,
     account: &UpstreamAccount,
     provider: &str,
-    model: &str,
+    upstream_model: &str,
+    requested_model: &str,
+    routing_rule: Option<&str>,
     prompt_length: usize,
     output_length: usize,
     status_label: &str,
@@ -3647,7 +3947,10 @@ async fn write_proxy_audit(
     let audit = AuditRecord {
         request_id: Uuid::new_v4().to_string(),
         user_id: user_id.to_string(),
-        model: model.to_string(),
+        requested_model: requested_model.to_string(),
+        upstream_model: upstream_model.to_string(),
+        routing_rule: routing_rule.map(str::to_string),
+        model: upstream_model.to_string(),
         routed_provider: provider.to_string(),
         upstream_account_id: account.id.clone(),
         upstream_owner_user_id: account.owner_user_id.clone(),
@@ -3671,6 +3974,77 @@ async fn write_proxy_audit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::model_routing::RouteDecision;
+
+    fn decision_with(upstream_model: &str) -> RouteDecision {
+        RouteDecision {
+            rule_id: "test-rule".to_string(),
+            requested_model: "gpt-5".to_string(),
+            provider: crate::provider::Provider::Minimax,
+            upstream_model: upstream_model.to_string(),
+        }
+    }
+
+    #[test]
+    fn resolved_route_model_uses_literal_value() {
+        let decision = decision_with("MiniMax-M3");
+        assert_eq!(resolved_route_model(Some(&decision)), Some("MiniMax-M3"));
+    }
+
+    #[test]
+    fn resolved_route_model_returns_none_without_route() {
+        assert_eq!(resolved_route_model(None), None);
+    }
+
+    #[test]
+    fn luna_route_keeps_requested_and_upstream_models_distinct() {
+        let decision = RouteDecision {
+            rule_id: "gpt-5.6-luna".to_string(),
+            requested_model: "gpt-5.6-luna".to_string(),
+            provider: crate::provider::Provider::Minimax,
+            upstream_model: "MiniMax-M3".to_string(),
+        };
+        assert_eq!(decision.requested_model, "gpt-5.6-luna");
+        assert_eq!(decision.rule_id, "gpt-5.6-luna");
+        assert_eq!(resolved_route_model(Some(&decision)), Some("MiniMax-M3"));
+    }
+
+    #[test]
+    fn effective_model_fallback_prefers_resolved_route_model() {
+        let payload = json!({"model": "gpt-5.6-luna"});
+        assert_eq!(
+            effective_model_fallback(&payload, "minimax", Some("literal-model")),
+            "literal-model"
+        );
+        assert_eq!(
+            effective_model_fallback(&payload, "minimax", None),
+            crate::provider::minimax::minimax_canonical_model("gpt-5.6-luna")
+        );
+    }
+
+    #[test]
+    fn cursor_upstream_model_honors_resolved_override() {
+        assert_eq!(
+            cursor_upstream_model("cursor/some-client-alias", Some("literal-upstream-id")),
+            "literal-upstream-id"
+        );
+        assert_eq!(
+            cursor_upstream_model("cursor/some-client-alias", None),
+            crate::provider::cursor::cursor_canonical_model("cursor/some-client-alias")
+        );
+    }
+
+    #[test]
+    fn ollama_upstream_model_honors_resolved_override() {
+        assert_eq!(
+            ollama_upstream_model("gpt-5.6-luna", Some("qwen3:32b")),
+            "qwen3:32b"
+        );
+        assert_eq!(
+            ollama_upstream_model("ollama/qwen3:8b", None),
+            crate::provider::ollama::ollama_canonical_model("ollama/qwen3:8b")
+        );
+    }
 
     #[test]
     fn parse_openai_error_message_nested() {

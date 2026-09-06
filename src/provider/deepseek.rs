@@ -294,15 +294,40 @@ pub(crate) async fn send_deepseek_responses_streaming(
 // Anthropic-compatible upstream call (passthrough, used for Claude-format traffic)
 // ---------------------------------------------------------------------------
 
+/// Pure selection helper: decide what model id to forward to DeepSeek's
+/// Anthropic-compatible endpoint.
+///
+/// `resolved_model` is the literal upstream id selected by model routing. When
+/// present, `deepseek_canonical_model` is bypassed. Otherwise we read `payload`'s
+/// `model` and let the canonical mapping produce the right DeepSeek id (this
+/// is the legacy global-chain path; DeepSeek would remap an unknown name to
+/// the flash tier on its own, but doing it here keeps the audit ledger
+/// honest about which model actually ran).
+pub(crate) fn pick_deepseek_model(resolved_model: Option<&str>, payload: &serde_json::Map<String, Value>) -> String {
+    match resolved_model {
+        Some(m) => m.to_string(),
+        None => {
+            let requested = payload
+                .get("model")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            deepseek_canonical_model(&requested)
+        }
+    }
+}
+
 /// Send an Anthropic-shaped payload to DeepSeek's `/v1/messages` and return the
 /// upstream response for the caller to buffer.
 ///
-/// The payload is forwarded as-is except for `model`, which is resolved to a real
-/// DeepSeek id first. DeepSeek's backend would remap an unknown name to the flash
-/// tier on its own, but doing it here keeps the audit ledger honest about which
-/// model actually ran.
+/// The payload is forwarded as-is except for `model`. A matched model route is
+/// sent literally; without one, canonical rewriting still runs so a Claude
+/// Code `claude-*` name degrades onto the right DeepSeek slot. DeepSeek's
+/// backend would remap an unknown name to the flash tier on its own, but doing
+/// it here keeps the audit ledger honest about which model actually ran.
 pub(crate) async fn send_deepseek_anthropic(
     account: &UpstreamAccount,
+    resolved_model: Option<&str>,
     payload: &Value,
 ) -> Result<reqwest::Response, String> {
     let base = deepseek_anthropic_base(account);
@@ -315,10 +340,11 @@ pub(crate) async fn send_deepseek_anthropic(
     }
 
     let mut body = payload.clone();
-    let requested = body.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let upstream_model = deepseek_canonical_model(&requested);
     if let Some(obj) = body.as_object_mut() {
-        obj.insert("model".to_string(), Value::String(upstream_model));
+        obj.insert(
+            "model".to_string(),
+            Value::String(pick_deepseek_model(resolved_model, obj)),
+        );
     }
 
     let url = format!("{}/v1/messages", base);
@@ -584,5 +610,27 @@ mod tests {
         // Explicit alt wins, trailing slash stripped.
         acc.base_url_alt = "https://api.deepseek.com/anthropic/".into();
         assert_eq!(deepseek_anthropic_base(&acc), "https://api.deepseek.com/anthropic");
+    }
+
+    #[test]
+    fn pick_deepseek_model_returns_resolved_verbatim_without_synthetic_prefix() {
+        // A model route must be forwarded exactly as-is.
+        let mut obj = serde_json::Map::new();
+        obj.insert("model".into(), json!("claude-sonnet-4-5"));
+        assert_eq!(pick_deepseek_model(Some("deepseek-chat"), &obj), "deepseek-chat");
+        assert_eq!(pick_deepseek_model(Some("deepseek/M3"), &obj), "deepseek/M3");
+        assert_eq!(pick_deepseek_model(Some("deepseek-v3.2"), &obj), "deepseek-v3.2");
+    }
+
+    #[test]
+    fn pick_deepseek_model_falls_back_to_canonical_when_unresolved() {
+        let mut obj = serde_json::Map::new();
+        obj.insert("model".into(), json!("claude-sonnet-4-5"));
+        assert_eq!(
+            pick_deepseek_model(None, &obj),
+            deepseek_canonical_model("claude-sonnet-4-5")
+        );
+        let empty = serde_json::Map::new();
+        assert_eq!(pick_deepseek_model(None, &empty), deepseek_canonical_model(""));
     }
 }

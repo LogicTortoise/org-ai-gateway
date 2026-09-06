@@ -222,16 +222,38 @@ fn with_optional_auth(req: reqwest::RequestBuilder, account: &UpstreamAccount) -
     }
 }
 
+/// Pure selection helper: decide what model id to forward to the sidecar.
+///
+/// `resolved_model` is the literal upstream id selected by model routing. When
+/// present, `trae_canonical_model` is bypassed. Otherwise we read `payload`'s
+/// `model` and let the canonical mapping produce the right Trae id (this is
+/// the legacy global-chain path). Extracted from `send_trae_anthropic` so the
+/// dispatch contract is unit-testable without standing up the sidecar.
+pub(crate) fn pick_trae_model(resolved_model: Option<&str>, payload: &serde_json::Map<String, Value>) -> String {
+    match resolved_model {
+        Some(m) => m.to_string(),
+        None => {
+            let requested = payload
+                .get("model")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            trae_canonical_model(&requested)
+        }
+    }
+}
+
 /// Send an Anthropic-shaped payload to the sidecar's `/v1/messages` and return
 /// the upstream response for the caller to buffer.
 ///
-/// The payload is forwarded as-is except for `model`: the sidecar resolves ids
-/// against its own catalog, so a foreign name (typically `claude-*`, since this
-/// provider exists as a Claude fallback) is rewritten to the canonical Trae model
-/// first. No fingerprint injection — Trae is not Anthropic, so the Claude Code
-/// system blocks / tool obfuscation must NOT be applied.
+/// The payload is forwarded as-is except for `model`. A matched model route is
+/// sent literally; without one, canonical rewriting still runs so a Claude
+/// Code `claude-*` name degrades onto
+/// the right Trae slot. No fingerprint injection: Trae is not Anthropic, so the
+/// Claude Code system blocks / tool obfuscation must NOT be applied.
 pub(crate) async fn send_trae_anthropic(
     account: &UpstreamAccount,
+    resolved_model: Option<&str>,
     payload: &Value,
 ) -> Result<reqwest::Response, String> {
     let base = trae_base(account);
@@ -239,10 +261,11 @@ pub(crate) async fn send_trae_anthropic(
         return Err("trae account has no sidecar base_url".to_string());
     }
     let mut body = payload.clone();
-    let requested = body.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let upstream_model = trae_canonical_model(&requested);
     if let Some(obj) = body.as_object_mut() {
-        obj.insert("model".to_string(), Value::String(upstream_model));
+        obj.insert(
+            "model".to_string(),
+            Value::String(pick_trae_model(resolved_model, obj)),
+        );
     }
 
     let url = format!("{}/v1/messages", base);
@@ -442,5 +465,32 @@ mod tests {
             trae_base(&account_with("http://127.0.0.1:9999/")),
             "http://127.0.0.1:9999"
         );
+    }
+
+    #[test]
+    fn pick_trae_model_returns_resolved_verbatim_without_synthetic_prefix() {
+        // A model route must be forwarded exactly as-is.
+        let mut obj = serde_json::Map::new();
+        obj.insert("model".into(), json!("trae/gpt-5.4"));
+        assert_eq!(pick_trae_model(Some("gpt-5.4"), &obj), "gpt-5.4");
+        assert_eq!(pick_trae_model(Some("trae/gpt-5.4"), &obj), "trae/gpt-5.4");
+        assert_eq!(pick_trae_model(Some("kimi-k2.5"), &obj), "kimi-k2.5");
+    }
+
+    #[test]
+    fn pick_trae_model_falls_back_to_canonical_when_unresolved() {
+        let mut obj = serde_json::Map::new();
+        obj.insert("model".into(), json!("trae/gpt-5.4"));
+        assert_eq!(
+            pick_trae_model(None, &obj),
+            trae_canonical_model("trae/gpt-5.4")
+        );
+        obj.insert("model".into(), json!("claude-sonnet-4-5"));
+        assert_eq!(
+            pick_trae_model(None, &obj),
+            trae_canonical_model("claude-sonnet-4-5")
+        );
+        let empty = serde_json::Map::new();
+        assert_eq!(pick_trae_model(None, &empty), trae_canonical_model(""));
     }
 }

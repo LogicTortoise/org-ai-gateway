@@ -28,8 +28,8 @@ Codex CLI  / Claude Code / Cursor / IDE 插件
 │        OrgAI Gateway         │   ← 客户端写到这里
 │     反向代理 / 路由器          │
 │                              │
-│  按 data/provider_chains.json│
-│  把请求路由到不同上游          │
+│  model routing 按模型覆盖      │
+│  未命中再走 provider chains    │
 └──────────────────────────────┘
    │           │           │
    ▼           ▼           ▼
@@ -222,7 +222,7 @@ Trae 不是直连的云端 API：Trae IDE 用的是私有的 `api/agent/v3` agen
 - **Claude 路径**（`/v1/messages`）：原样透传 Anthropic 形状 payload，tool_use 走原生通道完整保留。
 - **Codex 路径**（`/v1/responses`）：**网关是透明管道**，不做任何改写。DeepSeek 官方 Codex 接入面就是 `/v1/responses`（见 `api-docs.deepseek.com/.../quick_start/agent_integrations/codex`），Codex CLI 用 `wire_api = "responses"` 直接对得上。整库 gadgets（`function_call` / `function_call_output` / `tools` / `reasoning` 块）都按 Responses 协议透传，不再走之前的 "Responses ↔ Chat Completions" 适配层。
 
-**模型路由**：
+**DeepSeek 模型映射**：
 - **Codex / Responses 路径**——客户端发的 model id 直接透传（`deepseek-chat` / `deepseek-reasoner` 走 DeepSeek 的 Responses catalog 原样）；从 Claude 链降级过来的 `claude-*` 名字落到 `DEEPSEEK_DEFAULT_MODEL`（独立项，跟 Anthropic 路径的 tier 改写分开）。
 - **Anthropic 路径**按 Claude Code 的 3 档 tier 改写：`claude-opus-*` → `DEEPSEEK_OPUS_MODEL`；`claude-sonnet-*` 和 `claude-haiku-*`（`claude-haiku-4-5-*` / `claude-3-5-haiku-*` 两种写法都认）→ `DEEPSEEK_SONNET_MODEL`（**haiku 合并到 sonnet** —— 两个 tier 共享一个上游目标）；`claude-fable-*` → `DEEPSEEK_FABLE_MODEL`；裸 `deepseek` slug 或其它未知名 → `DEEPSEEK_DEFAULT_MODEL`（独立项）。想要 1M 上下文就把 `DEEPSEEK_OPUS_MODEL` / `DEEPSEEK_SONNET_MODEL` 设成 `deepseek-v4-pro[1m]`。
 
@@ -249,6 +249,57 @@ Trae 不是直连的云端 API：Trae IDE 用的是私有的 `api/agent/v3` agen
 ## 系统变量（仅读取，无需手动设）
 
 `HOME`、`USER`、`APPDATA` —— 用于定位本机凭据/配置路径。
+
+---
+
+## 相关：按模型覆盖 Provider 和上游 model
+
+`data/model_provider_routing.json` 可以在同一个协议入口内，按客户端请求的
+`model` 选择一个 Provider，并显式指定发送给该 Provider 的上游 model。
+
+当前机器只让 Luna 走 MiniMax，其余 Codex 模型保持原样走 Codex：
+
+```json
+{
+  "version": 1,
+  "slots": {
+    "codex": {
+      "rules": {
+        "gpt-5.6-luna": {
+          "provider": "minimax",
+          "model": "MiniMax-M3"
+        }
+      }
+    }
+  }
+}
+```
+
+路由优先级固定为：
+
+1. 显式 namespace，例如 `cursor/*`、`ollama/*`。
+2. 当前 slot 的大小写不敏感精确 model 规则。
+3. `data/provider_chains.json` 中的正常 chain。
+
+命中规则后，只使用规则指定的 Provider，并把 `model` 按字面值发送给上游；
+不会继续回退全局 chain。未命中规则时，完全沿用原有 chain 和 Provider model
+mapping。为了保证“只有 Luna 走 MiniMax”，Codex 全局 chain 也必须只包含
+`codex`，否则其他模型仍可能按 chain 进入别的 Provider。
+
+管理 API：
+
+- `GET /v1/provider/model-routing`：返回 `{ "routing": ..., "allowed": ... }`。
+- `PUT /v1/provider/model-routing`：完整替换 v1 文档；非法 Provider、空上游
+  model、重复规则、空规则名或不支持的版本返回 `400`。
+
+启动时同样执行整文档严格校验；任一规则无效都会拒绝整份 routing 配置、记录
+warning，并回退到全局 chain，不做逐规则部分恢复。
+
+规则仅应用于 HTTP `/v1/responses` 和 `/v1/messages`。Codex WebSocket 与旧
+`/v1/gateway/relay` 不使用 model routing。WebUI 中的 model catalog 只提供
+提示，不限制保存未列出的模型名。
+
+完整设计与取舍见 `docs/adr/0001-model-aware-provider-routing.md`。
 
 ---
 

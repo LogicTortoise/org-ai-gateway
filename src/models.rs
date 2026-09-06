@@ -142,10 +142,21 @@ pub(crate) struct UpstreamCallError {
     pub(crate) rate_limit_snapshot: Option<RateLimitSnapshot>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct AuditRecord {
     pub(crate) request_id: String,
     pub(crate) user_id: String,
+    /// Model name supplied by the client before routing.
+    #[serde(default)]
+    pub(crate) requested_model: String,
+    /// Model id selected for the actual upstream request.
+    #[serde(default)]
+    pub(crate) upstream_model: String,
+    /// Canonical exact-match model-routing rule id. Global chains, direct
+    /// routes, relay, and WebSocket requests leave this unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) routing_rule: Option<String>,
+    /// Existing effective-model field retained for stats/API compatibility.
     pub(crate) model: String,
     pub(crate) routed_provider: String,
     pub(crate) upstream_account_id: String,
@@ -290,3 +301,56 @@ pub(crate) struct ModelInfo {
     pub(crate) display_name: String,
 }
 
+#[cfg(test)]
+mod audit_record_tests {
+    use super::*;
+
+    #[test]
+    fn audit_record_serializes_routing_models_and_rule() {
+        let record = AuditRecord {
+            request_id: "req-1".into(),
+            user_id: "user-1".into(),
+            requested_model: "gpt-5.6-luna".into(),
+            upstream_model: "MiniMax-M3".into(),
+            routing_rule: Some("gpt-5.6-luna".into()),
+            model: "MiniMax-M3".into(),
+            routed_provider: "minimax".into(),
+            upstream_account_id: "account-1".into(),
+            upstream_owner_user_id: "owner-1".into(),
+            prompt_length: 10,
+            output_length: 20,
+            status: "success".into(),
+            created_at: Utc::now(),
+            tokens: TokenUsage::default(),
+            origin: "codex_cli".into(),
+        };
+        let value = serde_json::to_value(record).expect("serialize audit record");
+        assert_eq!(value["requested_model"], "gpt-5.6-luna");
+        assert_eq!(value["upstream_model"], "MiniMax-M3");
+        assert_eq!(value["routing_rule"], "gpt-5.6-luna");
+        assert_eq!(value["model"], "MiniMax-M3");
+    }
+
+    #[test]
+    fn audit_record_defaults_new_fields_for_old_rows() {
+        let value = serde_json::json!({
+            "request_id": "req-old",
+            "user_id": "user-old",
+            "model": "gpt-5",
+            "routed_provider": "codex",
+            "upstream_account_id": "account-old",
+            "upstream_owner_user_id": "owner-old",
+            "prompt_length": 1,
+            "output_length": 2,
+            "status": "success",
+            "created_at": Utc::now(),
+            "tokens": {},
+            "origin": "codex_cli"
+        });
+        let record: AuditRecord =
+            serde_json::from_value(value).expect("deserialize legacy audit row");
+        assert!(record.requested_model.is_empty());
+        assert!(record.upstream_model.is_empty());
+        assert_eq!(record.routing_rule, None);
+    }
+}

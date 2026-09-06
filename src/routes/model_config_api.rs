@@ -507,15 +507,15 @@ async fn dispatch_test_request(
             })
         }
         "minimax" => {
-            let resp = crate::provider::minimax::send_minimax_anthropic(account, body).await?;
+            let resp = crate::provider::minimax::send_minimax_anthropic(account, None, body).await?;
             collect_test_response(resp, "minimax").await
         }
         "trae" => {
-            let resp = crate::provider::trae::send_trae_anthropic(account, body).await?;
+            let resp = crate::provider::trae::send_trae_anthropic(account, None, body).await?;
             collect_test_response(resp, "trae").await
         }
         "deepseek" => {
-            let resp = crate::provider::deepseek::send_deepseek_anthropic(account, body).await?;
+            let resp = crate::provider::deepseek::send_deepseek_anthropic(account, None, body).await?;
             collect_test_response(resp, "deepseek").await
         }
         other => Err(format!("test not wired for provider '{}'", other)),

@@ -194,6 +194,11 @@
                 <!-- Rendered by renderChains() -->
             </div>
 
+            <!-- Per-slot model → provider routing -->
+            <div id="routingPanel" class="mb-6 bg-white p-5 rounded-xl border border-gray-200 shadow-sm">
+                <!-- Rendered by renderRouting() -->
+            </div>
+
             <!-- Filters -->
             <div class="flex gap-4 mb-6 bg-white p-4 rounded-xl border border-gray-200 shadow-sm">
                 <div class="flex-1 relative">
@@ -549,7 +554,7 @@
     <div id="minimaxModal" class="fixed inset-0 z-50 hidden items-center justify-center bg-black/40 p-4">
         <div class="bg-white rounded-xl shadow-2xl w-full max-w-lg p-6">
             <h3 class="text-lg font-semibold text-gray-900 mb-1" data-i18n="minimaxModalTitle">连接 MiniMax 账号</h3>
-            <p class="text-xs text-gray-500 mb-4" data-i18n="minimaxHint">只需填 MiniMax 开放平台 API Key，端点默认指向官方 Anthropic 兼容地址。只作为 Claude Code（/v1/messages）的降级账号。</p>
+            <p class="text-xs text-gray-500 mb-4" data-i18n="minimaxHint">只需填 MiniMax 开放平台 API Key。是否承接 Codex / Claude 流量由优先级链路和模型路由决定。</p>
             <div class="space-y-3">
                 <div>
                     <label class="block text-xs font-medium text-gray-600 mb-1" data-i18n="minimaxApiKey">API Key</label>
@@ -669,7 +674,7 @@
                 importMinimax: '连接 MiniMax', minimaxModalTitle: '连接 MiniMax 账号', minimaxApiKey: 'API Key', minimaxLabel: '备注名（可选）',
                 minimaxBaseUrl: 'Anthropic 兼容 base_url', minimaxAdvanced: '高级：自定义端点（留空用官方默认）',
                 minimaxShareEnabled: '加入共享池', minimaxSkipProbe: '跳过连通性探测',
-                minimaxHint: '只需填 MiniMax 开放平台 API Key，端点默认指向官方 Anthropic 兼容地址。只作为 Claude Code（/v1/messages）的降级账号。', minimaxConnected: 'MiniMax 账号已连接',
+                minimaxHint: '只需填 MiniMax 开放平台 API Key。是否承接 Codex / Claude 流量由优先级链路和模型路由决定。', minimaxConnected: 'MiniMax 账号已连接',
                 importDeepseek: '连接 DeepSeek', deepseekModalTitle: '连接 DeepSeek 账号', deepseekApiKey: 'API Key', deepseekLabel: '备注名（可选）',
                 deepseekBaseUrl: 'Anthropic 兼容 base_url', deepseekAdvanced: '高级：自定义端点（留空用官方默认）',
                 deepseekShareEnabled: '加入共享池', deepseekSkipProbe: '跳过连通性探测',
@@ -679,6 +684,12 @@
                 chainCodex: 'Codex 入口 (/v1/responses)', chainClaude: 'Claude 入口 (/v1/messages)',
                 modeFailover: '依次降级', modeRoundRobin: '循环使用', addProvider: '+ 添加 provider', saveChains: '保存链路',
                 chainsSaved: '优先级链路已保存', moveUp: '上移', moveDown: '下移', removeItem: '移除',
+                routingTitle: '模型路由',
+                routingRules: '精确 model 规则', routingAddRule: '添加规则', routingModelPh: '入口 model（如 gpt-5.6-luna）',
+                routingRuleModel: '入口 model', routingTargetProvider: 'Provider', routingTargetModel: '上游 model',
+                routingTargetModelHint: '必填；该值按字面发送给选中的 Provider',
+                routingRemoveRule: '删除规则', routingEmpty: '还没有模型规则', routingSave: '保存路由', routingSaved: '模型路由已保存',
+                routingDuplicateRule: '已存在同名 model 规则', routingNoProvider: '该 slot 没有可用 provider',
                 modelMapMatches: '匹配', modelMapEnv: '环境变量', modelMapBuiltin: '内置默认',
                 modelMapOverridePh: '留空 = 用下面的默认值', modelMapEffective: '实际生效',
                 srcOverride: '手改', srcEnv: '环境变量', srcBuiltin: '内置', srcLive: '上游拉取',
@@ -848,7 +859,7 @@
                 importMinimax: 'Connect MiniMax', minimaxModalTitle: 'Connect a MiniMax account', minimaxApiKey: 'API Key', minimaxLabel: 'Label (optional)',
                 minimaxBaseUrl: 'Anthropic-compatible base_url', minimaxAdvanced: 'Advanced: custom endpoint (blank = official default)',
                 minimaxShareEnabled: 'Add to shared pool', minimaxSkipProbe: 'Skip reachability probe',
-                minimaxHint: 'Just a MiniMax platform API key; the endpoint defaults to their official Anthropic-compatible URL. Claude Code (/v1/messages) fallback only.', minimaxConnected: 'MiniMax account connected',
+                minimaxHint: 'Provide a MiniMax platform API key. Provider chains and model routing decide whether it serves Codex or Claude traffic.', minimaxConnected: 'MiniMax account connected',
                 importDeepseek: 'Connect DeepSeek', deepseekModalTitle: 'Connect a DeepSeek account', deepseekApiKey: 'API Key', deepseekLabel: 'Label (optional)',
                 deepseekBaseUrl: 'Anthropic-compatible base_url', deepseekAdvanced: 'Advanced: custom endpoint (blank = official default)',
                 deepseekShareEnabled: 'Add to shared pool', deepseekSkipProbe: 'Skip reachability probe',
@@ -858,6 +869,12 @@
                 chainCodex: 'Codex entrypoint (/v1/responses)', chainClaude: 'Claude entrypoint (/v1/messages)',
                 modeFailover: 'Failover', modeRoundRobin: 'Round-robin', addProvider: '+ Add provider', saveChains: 'Save chains',
                 chainsSaved: 'Provider chains saved', moveUp: 'Move up', moveDown: 'Move down', removeItem: 'Remove',
+                routingTitle: 'Model Routing',
+                routingRules: 'Exact model rules', routingAddRule: 'Add rule', routingModelPh: 'request model (e.g. gpt-5.6-luna)',
+                routingRuleModel: 'Request model', routingTargetProvider: 'Provider', routingTargetModel: 'Upstream model',
+                routingTargetModelHint: 'Required; sent literally to the selected Provider',
+                routingRemoveRule: 'Remove rule', routingEmpty: 'No model rules yet', routingSave: 'Save routing', routingSaved: 'Model routing saved',
+                routingDuplicateRule: 'A rule for this model already exists', routingNoProvider: 'No provider is available for this slot',
                 modelMapMatches: 'Matches', modelMapEnv: 'Env var', modelMapBuiltin: 'Built-in default',
                 modelMapOverridePh: 'leave empty = fall through to the default below', modelMapEffective: 'In effect',
                 srcOverride: 'override', srcEnv: 'env var', srcBuiltin: 'built-in', srcLive: 'live /models',
@@ -1016,7 +1033,7 @@
 
         function rerenderCurrent() {
             const tab = window.__currentTab;
-            if (tab === 'upstreams') { loadAccounts(); loadChains(); }
+            if (tab === 'upstreams') { loadAccounts(); loadChains(); loadRouting(); }
             else if (tab === 'modelmap') loadModelMap();
             else if (tab === 'stats') loadStats();
             else if (tab === 'capacity') loadCapacity();
@@ -1286,6 +1303,7 @@
             if (tabId === 'upstreams') {
                 loadAccounts();
                 loadChains();
+                loadRouting();
             } else if (tabId === 'modelmap') {
                 loadModelMap();
             } else if (tabId === 'stats') {
@@ -2738,6 +2756,183 @@
             } catch (e) { showToast(e.message, 'error'); }
         }
 
+        // ==================== Per-model provider routing ====================
+        window.__routing = null;            // {version:1,slots:{codex:{rules},claude:{rules}}}
+        window.__routingAllowed = { codex: [], claude: [] };
+        window.__routingCatalog = { codex: [], claude: [] };   // advisory request-model ids
+
+        function emptyRouting() {
+            return { version: 1, slots: {} };
+        }
+
+        function routingSlot(slot) {
+            if (!window.__routing) window.__routing = emptyRouting();
+            if (!window.__routing.slots) window.__routing.slots = {};
+            if (!window.__routing.slots[slot]) {
+                window.__routing.slots[slot] = { rules: {} };
+            }
+            if (!window.__routing.slots[slot].rules) {
+                window.__routing.slots[slot].rules = {};
+            }
+            return window.__routing.slots[slot];
+        }
+
+        function routingToken(value) {
+            return encodeURIComponent(value).replace(/'/g, '%27');
+        }
+
+        function renderRouting() {
+            const el = document.getElementById('routingPanel');
+            if (!el || !window.__routing) return;
+            el.innerHTML = `
+                <div class="flex items-center justify-between mb-4">
+                    <h3 class="text-base font-semibold text-gray-900">${t('routingTitle')}</h3>
+                    <button onclick="saveRouting()" class="px-3 py-1.5 text-sm rounded-md text-white bg-indigo-600 hover:bg-indigo-700">${t('routingSave')}</button>
+                </div>
+                <div class="flex flex-col md:flex-row gap-8">
+                    ${renderRoutingSlot('codex')}
+                    ${renderRoutingSlot('claude')}
+                </div>`;
+        }
+
+        function renderRoutingSlot(slot) {
+            const cfg = routingSlot(slot);
+            const allowed = window.__routingAllowed[slot] || [];
+            const catalog = window.__routingCatalog[slot] || [];
+            const datalist = catalog.map(m => `<option value="${escapeHtml(m)}">`).join('');
+
+            const rules = Object.entries(cfg.rules || {});
+            const ruleRows = rules.length
+                ? rules.map(([model, route]) => renderRoutingRule(slot, model, route, allowed)).join('')
+                : `<p class="text-xs text-gray-400 py-3">${t('routingEmpty')}</p>`;
+
+            return `
+                <div class="flex-1 min-w-0">
+                    <h4 class="text-sm font-semibold text-gray-800 mb-3">${slot}</h4>
+                    <div class="text-xs font-medium text-gray-600 mb-1">${t('routingRules')}</div>
+                    <div>${ruleRows}</div>
+                    <div class="flex items-center gap-2 mt-3">
+                        <input id="routingAdd-model-${slot}" list="routingModels-${slot}" type="text" placeholder="${escapeAttr(t('routingModelPh'))}" class="flex-1 min-w-0 bg-gray-50 border border-gray-200 rounded-md px-2 py-1.5 text-sm font-mono">
+                        <datalist id="routingModels-${slot}">${datalist}</datalist>
+                        <button onclick="routingAddRule('${slot}')" class="px-3 py-1.5 text-sm rounded-md border border-gray-300 text-gray-700 hover:bg-gray-100">${t('routingAddRule')}</button>
+                    </div>
+                </div>`;
+        }
+
+        function renderRoutingRule(slot, model, route, allowed) {
+            const token = routingToken(model);
+            const options = allowed
+                .map(provider => `<option value="${provider}" ${provider === route.provider ? 'selected' : ''}>${CHAIN_PROVIDER_NAMES[provider] || provider}</option>`)
+                .join('');
+            return `
+                <div class="py-3 border-b border-gray-100 last:border-b-0">
+                    <div class="grid grid-cols-1 sm:grid-cols-[minmax(0,1fr)_9rem_minmax(0,1fr)_auto] items-start gap-2">
+                        <div class="flex-1 min-w-0">
+                            <label class="text-[11px] text-gray-400 block mb-1">${t('routingRuleModel')}</label>
+                            <input type="text" value="${escapeHtml(model)}" onchange="routingRenameRule('${slot}','${token}',this.value)" class="w-full bg-gray-50 border border-gray-200 text-gray-700 rounded-md px-2 py-1.5 text-sm font-mono">
+                        </div>
+                        <div>
+                            <label class="text-[11px] text-gray-400 block mb-1">${t('routingTargetProvider')}</label>
+                            <select onchange="routingSetRoute('${slot}','${token}','provider',this.value)" class="w-full bg-white border border-gray-200 rounded-md px-2 py-1.5 text-sm">
+                                ${options}
+                            </select>
+                        </div>
+                        <div class="min-w-0">
+                            <label class="text-[11px] text-gray-400 block mb-1">${t('routingTargetModel')}</label>
+                            <input type="text" value="${escapeHtml(route.model || '')}" title="${escapeAttr(t('routingTargetModelHint'))}" onchange="routingSetRoute('${slot}','${token}','model',this.value)" class="w-full bg-white border border-gray-200 rounded-md px-2 py-1.5 text-sm font-mono">
+                        </div>
+                        <button onclick="routingRemoveRule('${slot}','${token}')" class="sm:mt-5 px-2 py-1.5 text-xs text-red-600 border border-red-200 rounded-md hover:bg-red-50">${t('routingRemoveRule')}</button>
+                    </div>
+                </div>`;
+        }
+
+        function routingAddRule(slot) {
+            const input = document.getElementById('routingAdd-model-' + slot);
+            if (!input) return;
+            const model = (input.value || '').trim().toLowerCase();
+            if (!model) return;
+            const cfg = routingSlot(slot);
+            if (Object.keys(cfg.rules).some(key => key.toLowerCase() === model)) {
+                showToast(t('routingDuplicateRule'), 'error');
+                return;
+            }
+            const allowed = window.__routingAllowed[slot] || [];
+            if (!allowed.length) {
+                showToast(t('routingNoProvider'), 'error');
+                return;
+            }
+            cfg.rules[model] = { provider: allowed[0], model };
+            input.value = '';
+            renderRouting();
+        }
+
+        function routingRenameRule(slot, token, value) {
+            const cfg = routingSlot(slot);
+            const current = decodeURIComponent(token);
+            const next = (value || '').trim().toLowerCase();
+            if (!next || next === current) {
+                renderRouting();
+                return;
+            }
+            if (Object.keys(cfg.rules).some(key => key !== current && key.toLowerCase() === next)) {
+                showToast(t('routingDuplicateRule'), 'error');
+                renderRouting();
+                return;
+            }
+            cfg.rules[next] = cfg.rules[current];
+            delete cfg.rules[current];
+            renderRouting();
+        }
+
+        function routingRemoveRule(slot, token) {
+            delete routingSlot(slot).rules[decodeURIComponent(token)];
+            renderRouting();
+        }
+
+        function routingSetRoute(slot, token, field, value) {
+            const route = routingSlot(slot).rules[decodeURIComponent(token)];
+            if (!route) return;
+            if (field === 'model') {
+                route.model = (value || '').trim();
+            } else {
+                route.provider = value;
+            }
+            renderRouting();
+        }
+
+        async function loadRouting() {
+            try {
+                const headers = { 'Authorization': `Bearer ${gatewayToken()}` };
+                const [cfgRes, codexCat, claudeCat] = await Promise.all([
+                    fetch('/v1/provider/model-routing', { headers }),
+                    fetch('/v1/provider/models/codex', { headers }).then(r => r.ok ? r.json() : { models: [] }).catch(() => ({ models: [] })),
+                    fetch('/v1/provider/models/claude', { headers }).then(r => r.ok ? r.json() : { models: [] }).catch(() => ({ models: [] })),
+                ]);
+                if (!cfgRes.ok) return;
+                const d = await cfgRes.json();
+                window.__routing = d.routing || emptyRouting();
+                window.__routingAllowed = d.allowed || { codex: [], claude: [] };
+                window.__routingCatalog = {
+                    codex: (codexCat.models || []).map(m => m.slug || m.id || m.name).filter(Boolean),
+                    claude: (claudeCat.models || []).map(m => m.slug || m.id || m.name).filter(Boolean),
+                };
+                renderRouting();
+            } catch (e) { showToast(e.message, 'error'); }
+        }
+
+        async function saveRouting() {
+            try {
+                const res = await fetch('/v1/provider/model-routing', {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${gatewayToken()}` },
+                    body: JSON.stringify(window.__routing),
+                });
+                const d = await res.json();
+                if (res.ok) { window.__routing = d.routing; renderRouting(); showToast(t('routingSaved')); }
+                else { showToast(d.error || t('fetchModelsFailed'), 'error'); }
+            } catch (e) { showToast(e.message, 'error'); }
+        }
+
         // ==================== Provider model mapping ====================
         // Rows come straight from GET /v1/provider/model-map, which already
         // resolved override > env > built-in and tagged each value with its
@@ -3234,6 +3429,7 @@ function cssEscape(s) {
         })();
         loadAccounts();
         loadChains();
+        loadRouting();
     </script>
 </body>
 </html>

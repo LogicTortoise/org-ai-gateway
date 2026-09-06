@@ -102,9 +102,11 @@ async fn main() {
     let api_key_file = PathBuf::from("./data/api_keys.ndjson");
     let chain_file = PathBuf::from("./data/provider_chains.json");
     let model_config_file = PathBuf::from("./data/provider_models.json");
+    let model_routing_file = PathBuf::from("./data/model_provider_routing.json");
     let initial_accounts = load_accounts(&account_file).await;
     let initial_capacity = crate::capacity::load_capacity_history(&capacity_file).await;
     let initial_chains = crate::provider::chains::load_chains(&chain_file).await;
+    let initial_model_routing = crate::provider::model_routing::load_model_routing(&model_routing_file).await;
     crate::provider::model_config::load_model_config(&model_config_file).await;
     crate::apikey::init(crate::apikey::load(&api_key_file).await);
     let state = AppState {
@@ -114,6 +116,8 @@ async fn main() {
         capacity_file,
         chain_file,
         model_config_file,
+        model_routing_file,
+        model_routing: Arc::new(RwLock::new(initial_model_routing)),
         accounts: Arc::new(RwLock::new(initial_accounts)),
         rate_limits: Arc::new(RwLock::new(HashMap::new())),
         capacity_history: Arc::new(RwLock::new(initial_capacity)),
@@ -194,6 +198,11 @@ async fn main() {
         .route(
             "/v1/provider/chains",
             get(get_chains).put(update_chains),
+        )
+        .route(
+            "/v1/provider/model-routing",
+            get(crate::routes::model_routing_api::get_model_routing)
+                .put(crate::routes::model_routing_api::update_model_routing),
         )
         .route(
             "/v1/provider/model-map",

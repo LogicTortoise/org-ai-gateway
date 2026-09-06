@@ -367,6 +367,11 @@ pub(crate) fn is_sensitive_image_error(msg: &str) -> bool {
     lower.contains("image is sensitive") || lower.contains("new_sensitive")
 }
 
+/// Whether MiniMax rejected a legacy Codex Responses input shape.
+pub(crate) fn is_strict_input_error(msg: &str) -> bool {
+    msg.contains("input is neither string nor array of items")
+}
+
 /// Rewrite a Responses payload so every `input_image` content block inside an
 /// `input` array's `message` items is replaced by an `input_text` placeholder.
 /// MiniMax's content filter rejects the whole request when any image is
@@ -406,18 +411,76 @@ pub(crate) fn strip_sensitive_images(payload: &Value) -> Value {
     out
 }
 
+/// Normalize legacy message items for MiniMax's strict Responses schema.
+pub(crate) fn normalize_codex_payload(payload: &Value) -> Value {
+    let mut out = payload.clone();
+    let Some(obj) = out.as_object_mut() else {
+        return out;
+    };
+    let Some(input) = obj.get_mut("input").and_then(|v| v.as_array_mut()) else {
+        return out;
+    };
+    for item in input.iter_mut() {
+        let Some(item_obj) = item.as_object_mut() else {
+            continue;
+        };
+        let item_type = item_obj.get("type").and_then(|t| t.as_str());
+        if !matches!(item_type, Some("message") | None) {
+            continue;
+        }
+        if item_obj.get("type").is_none() {
+            item_obj.insert("type".to_string(), Value::String("message".to_string()));
+        }
+        if let Some(content) = item_obj.get_mut("content") {
+            if let Some(text) = content.as_str() {
+                *content = json!([{
+                    "type": "input_text",
+                    "text": text,
+                }]);
+            }
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Anthropic-compatible upstream call (passthrough, used for Claude-format traffic)
 // ---------------------------------------------------------------------------
 
+/// Pure selection helper: decide what model id to forward to MiniMax's
+/// Anthropic-compatible endpoint.
+///
+/// `resolved_model` is the literal upstream id selected by model routing. When
+/// present, `minimax_canonical_model` is bypassed. Otherwise we read `payload`'s
+/// `model` and let the canonical mapping produce the right MiniMax id (this is
+/// the legacy global-chain path; MiniMax resolves ids against its own catalog
+/// and rejects foreign `claude-*` names, so the canonical step is mandatory
+/// for non-MiniMax client input).
+pub(crate) fn pick_minimax_model(resolved_model: Option<&str>, payload: &serde_json::Map<String, Value>) -> String {
+    match resolved_model {
+        Some(m) => m.to_string(),
+        None => {
+            let requested = payload
+                .get("model")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            minimax_canonical_model(&requested)
+        }
+    }
+}
+
 /// Send an Anthropic-shaped payload to MiniMax's `/v1/messages` and return the
 /// upstream response for the caller to buffer.
 ///
-/// The payload is forwarded as-is except for `model`: MiniMax resolves ids
-/// against its own catalog, so a foreign name (typically `claude-*`, since this
-/// provider exists as a Claude fallback) is rewritten first.
+/// The payload is forwarded as-is except for `model`. A matched model route is
+/// sent literally; without one, canonical rewriting still runs so a Claude
+/// Code `claude-*` name degrades onto the right MiniMax slot. MiniMax resolves
+/// ids against its own catalog, so a foreign name (typically `claude-*`, since
+/// this provider exists as a Claude fallback) is rewritten first.
 pub(crate) async fn send_minimax_anthropic(
     account: &UpstreamAccount,
+    resolved_model: Option<&str>,
     payload: &Value,
 ) -> Result<reqwest::Response, String> {
     let base = minimax_anthropic_base(account);
@@ -430,10 +493,11 @@ pub(crate) async fn send_minimax_anthropic(
     }
 
     let mut body = payload.clone();
-    let requested = body.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let upstream_model = minimax_canonical_model(&requested);
     if let Some(obj) = body.as_object_mut() {
-        obj.insert("model".to_string(), Value::String(upstream_model));
+        obj.insert(
+            "model".to_string(),
+            Value::String(pick_minimax_model(resolved_model, obj)),
+        );
     }
 
     let url = format!("{}/v1/messages", base);
@@ -746,6 +810,19 @@ mod tests {
     }
 
     #[test]
+    fn strict_input_error_detection() {
+        assert!(is_strict_input_error(
+            "Invalid request: input is neither string nor array of items: Mismatch type string with value..."
+        ));
+        assert!(is_strict_input_error(
+            "upstream says: input is neither string nor array of items"
+        ));
+        assert!(!is_strict_input_error(""));
+        assert!(!is_strict_input_error("rate limited"));
+        assert!(!is_strict_input_error("input must be an array"));
+    }
+
+    #[test]
     fn strip_sensitive_images_replaces_input_image_blocks() {
         let payload = json!({
             "model": "MiniMax-M3",
@@ -790,5 +867,66 @@ mod tests {
             "input": [{"type": "message", "role": "user", "content": "plain text"}],
         });
         assert_eq!(strip_sensitive_images(&string_content), string_content);
+    }
+
+    #[test]
+    fn normalize_codex_payload_wraps_string_content_and_adds_type() {
+        let payload = json!({
+            "input": [
+                {"role": "user", "content": "plain legacy string"},
+                {"type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}"},
+            ],
+        });
+        let normalized = normalize_codex_payload(&payload);
+        assert_eq!(normalized.pointer("/input/0/type").unwrap(), "message");
+        assert_eq!(
+            normalized.pointer("/input/0/content").unwrap(),
+            &json!([{"type": "input_text", "text": "plain legacy string"}])
+        );
+        assert_eq!(
+            normalized.pointer("/input/1/type").unwrap(),
+            "function_call"
+        );
+        assert!(payload.pointer("/input/0/content").unwrap().is_string());
+    }
+
+    #[test]
+    fn normalize_codex_payload_leaves_valid_or_unrelated_shapes_alone() {
+        let valid = json!({
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "already valid"}]
+            }]
+        });
+        assert_eq!(normalize_codex_payload(&valid), valid);
+
+        let no_input = json!({"model": "MiniMax-M3"});
+        assert_eq!(normalize_codex_payload(&no_input), no_input);
+
+        let string_input = json!({"input": "raw text"});
+        assert_eq!(normalize_codex_payload(&string_input), string_input);
+    }
+
+    #[test]
+    fn pick_minimax_model_returns_resolved_verbatim_without_synthetic_prefix() {
+        // A model route must be forwarded exactly as-is.
+        let mut obj = serde_json::Map::new();
+        obj.insert("model".into(), json!("claude-sonnet-4-5"));
+        assert_eq!(pick_minimax_model(Some("MiniMax-M3"), &obj), "MiniMax-M3");
+        assert_eq!(pick_minimax_model(Some("minimax/MiniMax-M3"), &obj), "minimax/MiniMax-M3");
+        assert_eq!(pick_minimax_model(Some("minimax-test"), &obj), "minimax-test");
+    }
+
+    #[test]
+    fn pick_minimax_model_falls_back_to_canonical_when_unresolved() {
+        let mut obj = serde_json::Map::new();
+        obj.insert("model".into(), json!("claude-sonnet-4-5"));
+        assert_eq!(
+            pick_minimax_model(None, &obj),
+            minimax_canonical_model("claude-sonnet-4-5")
+        );
+        let empty = serde_json::Map::new();
+        assert_eq!(pick_minimax_model(None, &empty), minimax_canonical_model(""));
     }
 }

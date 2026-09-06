@@ -3,6 +3,22 @@ use crate::auth::extract_user_id;
 use crate::pool::storage::read_audit_records;
 use crate::usage::short_status;
 
+/// Logical model name used by client-facing statistics. New audit rows carry
+/// `requested_model`; old rows only have `model`, so retain that as a fallback.
+fn audit_model_name(r: &Value) -> &str {
+    r.get("requested_model")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            r.get("model")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or("")
+}
+
 /// Return (input, output) token counts for an audit record, preferring the real
 /// `tokens` object and falling back to the char-length fields for old records.
 fn audit_token_counts(r: &Value) -> (u64, u64) {
@@ -129,7 +145,7 @@ pub(crate) async fn get_stats(State(state): State<AppState>, headers: HeaderMap)
         prompt_tokens += ptok;
         billable_tokens += btok;
 
-        let model = r.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let model = audit_model_name(r).to_string();
         let provider = r.get("routed_provider").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let user = r.get("user_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let acct = r
@@ -225,7 +241,7 @@ pub(crate) async fn get_stats(State(state): State<AppState>, headers: HeaderMap)
                         .cloned()
                         .unwrap_or(aid)
                 },
-                model: r.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                model: audit_model_name(r).to_string(),
                 status: short_status(r.get("status").and_then(|v| v.as_str()).unwrap_or("")),
                 input_tokens: input_tokens as usize,
                 output_tokens: output_tokens as usize,
@@ -308,4 +324,30 @@ pub(crate) struct RecentEntry {
     pub(crate) status: String,
     pub(crate) input_tokens: usize,
     pub(crate) output_tokens: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audit_model_prefers_requested_model() {
+        let row = json!({
+            "model": "MiniMax-M3",
+            "requested_model": "gpt-5.6-luna"
+        });
+        assert_eq!(audit_model_name(&row), "gpt-5.6-luna");
+    }
+
+    #[test]
+    fn audit_model_falls_back_for_legacy_or_empty_requested_model() {
+        let legacy = json!({ "model": "gpt-5.5" });
+        assert_eq!(audit_model_name(&legacy), "gpt-5.5");
+
+        let empty_new_field = json!({
+            "model": "gpt-5.5",
+            "requested_model": "   "
+        });
+        assert_eq!(audit_model_name(&empty_new_field), "gpt-5.5");
+    }
 }

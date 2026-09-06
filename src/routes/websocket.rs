@@ -357,6 +357,9 @@ async fn write_ws_audit(
     let record = AuditRecord {
         request_id: Uuid::new_v4().to_string(),
         user_id: user_id.to_string(),
+        requested_model: model.clone(),
+        upstream_model: model.clone(),
+        routing_rule: None,
         model,
         routed_provider: "codex".to_string(),
         upstream_account_id: account_id.to_string(),

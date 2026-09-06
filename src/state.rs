@@ -13,6 +13,8 @@ pub(crate) struct AppState {
     /// Runtime model-mapping overrides file (`provider_models.json`) — the
     /// operator's live edits that sit on top of the model env vars.
     pub(crate) model_config_file: PathBuf,
+    pub(crate) model_routing_file: PathBuf,
+    pub(crate) model_routing: Arc<RwLock<crate::provider::model_routing::ModelRouting>>,
     pub(crate) accounts: Arc<RwLock<Vec<UpstreamAccount>>>,
     /// Latest real rate-limit snapshot per account internal id, captured from the
     /// `x-codex-*` response headers ChatGPT returns on each `responses` call.

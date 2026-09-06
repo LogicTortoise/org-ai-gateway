@@ -64,6 +64,9 @@ pub(crate) async fn relay(
             let failed_audit = AuditRecord {
                 request_id: request_id.clone(),
                 user_id: user_id.clone(),
+                requested_model: payload.model.clone(),
+                upstream_model: effective_model.clone(),
+                routing_rule: None,
                 model: effective_model.clone(),
                 routed_provider: routed_provider.clone(),
                 upstream_account_id: selected_account.id.clone(),
@@ -89,6 +92,9 @@ pub(crate) async fn relay(
     let audit = AuditRecord {
         request_id: request_id.clone(),
         user_id: user_id.clone(),
+        requested_model: payload.model.clone(),
+        upstream_model: effective_model.clone(),
+        routing_rule: None,
         model: effective_model.clone(),
         routed_provider: routed_provider.clone(),
         upstream_account_id: selected_account.id.clone(),
@@ -161,5 +167,4 @@ fn relay_origin(headers: &HeaderMap) -> String {
     }
     crate::auth::ORIGIN_UNKNOWN.to_string()
 }
-
 
