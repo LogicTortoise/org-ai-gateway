@@ -1250,7 +1250,7 @@
                 ${code('# Claude Code\nexport ANTHROPIC_BASE_URL='+base+'\n# '+(zh?'无边缘时用自报身份':'self-asserted identity when there is no edge')+'\nexport ANTHROPIC_AUTH_TOKEN="user:koltyu"')}
                 <p class="text-sm text-gray-700 mt-3 mb-1">${zh?'兼容端点（OpenAI / Anthropic 协议）：':'Compatible endpoints (OpenAI / Anthropic protocols):'}</p>
                 ${li([
-                    `<code>${v1}/responses</code> · <code>${v1}/chat/completions</code> · <code>${v1}/models</code>`,
+                    `<code>${v1}/responses</code> · <code>${v1}/images/generations</code> · <code>${v1}/chat/completions</code> · <code>${v1}/models</code>`,
                     `<code>${v1}/messages</code> (Anthropic)`,
                     `<code>${v1}/gateway/relay</code> (${zh?'统一入口':'unified entry'})`,
                 ])}

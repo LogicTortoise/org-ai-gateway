@@ -39,6 +39,8 @@
 //! `usage.input_tokens_details.cached_tokens`.
 use crate::prelude::*;
 use crate::util::truncate_text;
+use base64::Engine;
+use std::io::Cursor;
 
 /// Built-in default upstream model, used when neither the runtime override nor
 /// `MINIMAX_DEFAULT_MODEL` supplies one. Also the built-in for all three Claude
@@ -96,6 +98,13 @@ const BUILTIN_OPENAI_BASE: &str = "https://api.minimaxi.com";
 /// content is empty"}}` shape (because the Chat Completions adapter on top of
 /// the Responses endpoint can't parse a Responses-shaped request).
 const MINIMAX_RESPONSES_PATH: &str = "/v1/responses";
+
+/// MiniMax image generation is not OpenAI-wire-compatible. The gateway's
+/// `/v1/images/generations` route translates to this endpoint and normalizes
+/// the result back into an OpenAI Images response.
+const MINIMAX_IMAGE_PATH: &str = "/v1/image_generation";
+const MINIMAX_IMAGE_MODEL: &str = "image-01";
+const MAX_MINIMAX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 
 /// Built-in MiniMax Anthropic-compatible endpoint (mainland site). Used when
 /// neither the account nor `MINIMAX_ANTHROPIC_BASE_URL` supplies one.
@@ -314,6 +323,166 @@ pub(crate) async fn send_minimax_responses_streaming(
         .send()
         .await
         .map_err(|e| format!("minimax streaming request failed ({}): {}", url, e))
+}
+
+/// Convert an OpenAI Images generation payload into MiniMax's image-01 shape.
+/// Unsupported semantics return an error so the route can fall through to the
+/// native Codex/OpenAI image provider without silently changing the request.
+pub(crate) fn build_minimax_image_request(payload: &Value) -> Result<Value, String> {
+    let obj = payload
+        .as_object()
+        .ok_or_else(|| "image request body must be a JSON object".to_string())?;
+    let prompt = obj
+        .get("prompt")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "image request is missing `prompt`".to_string())?;
+    if prompt.chars().count() > 1500 {
+        return Err("MiniMax image prompts are limited to 1500 characters".to_string());
+    }
+    if obj.get("background").and_then(Value::as_str) == Some("transparent") {
+        return Err("MiniMax image-01 does not support transparent backgrounds".to_string());
+    }
+
+    let requested_model = obj.get("model").and_then(Value::as_str).unwrap_or("");
+    let image_model = if requested_model.eq_ignore_ascii_case("image-01-live")
+        || requested_model.eq_ignore_ascii_case("minimax/image-01-live")
+    {
+        "image-01-live"
+    } else {
+        MINIMAX_IMAGE_MODEL
+    };
+    let n = obj.get("n").and_then(Value::as_u64).unwrap_or(1);
+    if !(1..=9).contains(&n) {
+        return Err("MiniMax image count must be between 1 and 9".to_string());
+    }
+
+    let mut body = json!({
+        "model": image_model,
+        "prompt": prompt,
+        "response_format": "base64",
+        "n": n,
+        "prompt_optimizer": false,
+        "aigc_watermark": false,
+    });
+    let body_obj = body.as_object_mut().expect("image body is an object");
+    match obj.get("size").and_then(Value::as_str).unwrap_or("auto") {
+        "auto" => {
+            body_obj.insert("aspect_ratio".to_string(), Value::String("1:1".to_string()));
+        }
+        raw => {
+            let (width, height) = parse_minimax_image_size(raw)?;
+            body_obj.insert("width".to_string(), json!(width));
+            body_obj.insert("height".to_string(), json!(height));
+        }
+    }
+    if let Some(seed) = obj.get("seed").and_then(Value::as_i64) {
+        body_obj.insert("seed".to_string(), json!(seed));
+    }
+    Ok(body)
+}
+
+fn parse_minimax_image_size(raw: &str) -> Result<(u32, u32), String> {
+    let (width, height) = raw
+        .split_once('x')
+        .ok_or_else(|| format!("unsupported MiniMax image size `{}`", raw))?;
+    let width = width
+        .parse::<u32>()
+        .map_err(|_| format!("unsupported MiniMax image size `{}`", raw))?;
+    let height = height
+        .parse::<u32>()
+        .map_err(|_| format!("unsupported MiniMax image size `{}`", raw))?;
+    if !(512..=2048).contains(&width)
+        || !(512..=2048).contains(&height)
+        || width % 8 != 0
+        || height % 8 != 0
+    {
+        return Err(format!("unsupported MiniMax image size `{}`", raw));
+    }
+    Ok((width, height))
+}
+
+pub(crate) async fn send_minimax_image_generation(
+    account: &UpstreamAccount,
+    payload: &Value,
+) -> Result<reqwest::Response, String> {
+    let base = minimax_openai_base(account);
+    if base.is_empty() {
+        return Err("minimax account has no image-generation base_url".to_string());
+    }
+    let api_key = account.bearer();
+    if api_key.is_empty() {
+        return Err("minimax account has empty api key".to_string());
+    }
+    let url = format!("{}{}", base, MINIMAX_IMAGE_PATH);
+    minimax_http_client()
+        .post(&url)
+        .bearer_auth(api_key)
+        .header("Accept", "application/json")
+        .header(CONTENT_TYPE, "application/json")
+        .json(payload)
+        .send()
+        .await
+        .map_err(|e| format!("minimax image request failed ({}): {}", url, e))
+}
+
+/// Normalize MiniMax's `{data.image_base64[]}` response into the OpenAI Images
+/// `{data:[{b64_json}]}` contract. MiniMax currently returns JPEG bytes; Codex
+/// saves built-in image results as `.png`, so transcode every result to a real
+/// PNG instead of emitting a misleading extension.
+pub(crate) fn normalize_minimax_image_response(body: &[u8]) -> Result<Value, String> {
+    if body.len() > MAX_MINIMAX_IMAGE_BYTES {
+        return Err("MiniMax image response exceeded the 32 MiB limit".to_string());
+    }
+    let parsed: Value = serde_json::from_slice(body)
+        .map_err(|e| format!("invalid MiniMax image response: {}", e))?;
+    let status_code = parsed
+        .pointer("/base_resp/status_code")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    if status_code != 0 {
+        let message = parsed
+            .pointer("/base_resp/status_msg")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown MiniMax image error");
+        return Err(format!("MiniMax image error {}: {}", status_code, message));
+    }
+    let images = parsed
+        .pointer("/data/image_base64")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "MiniMax image response is missing data.image_base64".to_string())?;
+    if images.is_empty() {
+        return Err("MiniMax image response contained no images".to_string());
+    }
+
+    let mut data = Vec::with_capacity(images.len());
+    let mut response_size: Option<String> = None;
+    for encoded in images {
+        let encoded = encoded
+            .as_str()
+            .ok_or_else(|| "MiniMax image response contained a non-string image".to_string())?;
+        let encoded = encoded.rsplit_once(',').map(|(_, data)| data).unwrap_or(encoded);
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|e| format!("invalid MiniMax image base64: {}", e))?;
+        let decoded = image::load_from_memory(&bytes)
+            .map_err(|e| format!("invalid MiniMax image bytes: {}", e))?;
+        response_size.get_or_insert_with(|| format!("{}x{}", decoded.width(), decoded.height()));
+        let mut png = Cursor::new(Vec::new());
+        decoded
+            .write_to(&mut png, image::ImageFormat::Png)
+            .map_err(|e| format!("failed to encode MiniMax image as PNG: {}", e))?;
+        data.push(json!({
+            "b64_json": base64::engine::general_purpose::STANDARD.encode(png.into_inner())
+        }));
+    }
+    Ok(json!({
+        "created": Utc::now().timestamp(),
+        "data": data,
+        "output_format": "png",
+        "size": response_size.unwrap_or_default(),
+    }))
 }
 
 /// Pull a human-readable error out of a MiniMax error body. Two shapes
@@ -653,6 +822,7 @@ async fn probe_minimax_anthropic(account: &UpstreamAccount, base: &str) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::{DynamicImage, ImageBuffer, ImageFormat, Rgb};
 
     #[test]
     fn model_detection() {
@@ -664,6 +834,64 @@ mod tests {
         assert!(!is_minimax_model("deepseek-v4-pro"));
         assert!(!is_minimax_model("kimi-k2.5"));
         assert!(!is_minimax_model("gpt-5"));
+    }
+
+    #[test]
+    fn openai_image_payload_maps_to_minimax_image_01() {
+        let body = build_minimax_image_request(&json!({
+            "model": "gpt-image-2",
+            "prompt": "draw a small orange robot",
+            "size": "1024x1536",
+            "n": 2,
+            "quality": "high",
+        }))
+        .unwrap();
+        assert_eq!(body["model"], "image-01");
+        assert_eq!(body["response_format"], "base64");
+        assert_eq!(body["width"], 1024);
+        assert_eq!(body["height"], 1536);
+        assert_eq!(body["n"], 2);
+        assert_eq!(body["aigc_watermark"], false);
+        assert!(body.get("quality").is_none());
+    }
+
+    #[test]
+    fn unsupported_minimax_image_semantics_fall_through() {
+        assert!(build_minimax_image_request(&json!({
+            "prompt": "transparent icon",
+            "background": "transparent",
+        }))
+        .is_err());
+        assert!(build_minimax_image_request(&json!({
+            "prompt": "oversized",
+            "size": "3840x2160",
+        }))
+        .is_err());
+        assert!(build_minimax_image_request(&json!({
+            "prompt": "too many",
+            "n": 10,
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn minimax_jpeg_response_becomes_openai_png_response() {
+        let source = DynamicImage::ImageRgb8(ImageBuffer::from_pixel(8, 8, Rgb([255, 128, 0])));
+        let mut jpeg = Cursor::new(Vec::new());
+        source.write_to(&mut jpeg, ImageFormat::Jpeg).unwrap();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(jpeg.into_inner());
+        let upstream = serde_json::to_vec(&json!({
+            "data": {"image_base64": [encoded]},
+            "base_resp": {"status_code": 0, "status_msg": "success"},
+        }))
+        .unwrap();
+        let normalized = normalize_minimax_image_response(&upstream).unwrap();
+        let png = base64::engine::general_purpose::STANDARD
+            .decode(normalized["data"][0]["b64_json"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+        assert_eq!(normalized["output_format"], "png");
+        assert_eq!(normalized["size"], "8x8");
     }
 
     #[test]

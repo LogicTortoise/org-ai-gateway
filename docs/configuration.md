@@ -49,7 +49,7 @@ Codex CLI  / Claude Code / Cursor / IDE 插件
   - glm / kimi / deepseek 上游：自家 Anthropic 兼容端点
 - **Cursor slot**：cursor 上游自有协议
 
-Gateway 在每条转发链上的角色是**透明管道**：客户端按 OpenAI Responses / Anthropic Messages 协议发请求，Gateway 按 chain 选目标上游、上游按自家实现的兼容端点接请求、返回的 wire format 原样回给客户端。Gateway 在流上做的 side-channel 解析（解析 `response.completed` 拿真实 usage、检测内嵌 error chunk / 空流合成 `response.failed`）都是**纯附加**，不改写任何 wire 字节。
+Gateway 在文本请求转发链上的角色是**透明管道**：客户端按 OpenAI Responses / Anthropic Messages 协议发请求，Gateway 按 chain 选目标上游、上游按自家实现的兼容端点接请求、返回的 wire format 原样回给客户端。Gateway 在流上做的 side-channel 解析（解析 `response.completed` 拿真实 usage、检测内嵌 error chunk / 空流合成 `response.failed`）都是**纯附加**，不改写任何 wire 字节。图片生成是唯一例外：MiniMax 没有 OpenAI Images 兼容端点，因此 `/v1/images/generations` 会做显式协议转换。
 
 ### ⚠ minimax 官网接法 ≠ Gateway 接入方式
 
@@ -175,7 +175,7 @@ Trae 不是直连的云端 API：Trae IDE 用的是私有的 `api/agent/v3` agen
 
 ### MiniMax（开放平台，API Key）
 
-直连 MiniMax 官方的 **Anthropic 兼容端点**（`/anthropic/v1/messages`）和 **OpenAI 兼容端点**（`/v1/text/chatcompletion_v2`），不需要 sidecar，只要一把 API Key。Anthropic 路径同时发 `Authorization: Bearer` 和 `x-api-key`，两种鉴权风格都能接住。
+直连 MiniMax 官方的 **Anthropic 兼容端点**（`/anthropic/v1/messages`）、**OpenAI Responses 兼容端点**（`/v1/responses`）和图片生成端点（`/v1/image_generation`），不需要 sidecar，只要一把 API Key。Anthropic 路径同时发 `Authorization: Bearer` 和 `x-api-key`，两种鉴权风格都能接住。
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
@@ -195,6 +195,14 @@ Trae 不是直连的云端 API：Trae IDE 用的是私有的 `api/agent/v3` agen
 **双协议都接：**
 - **Claude 路径**（`/v1/messages`）：原样透传 Anthropic 形状 payload，tool_use 走原生通道完整保留。
 - **Codex 路径**（`/v1/responses`）：**网关是透明管道**，不做任何改写。MiniMax 官方 Codex 接入面就是 `/v1/responses`（见 `platform.minimaxi.com/docs/token-plan/codex`），Codex CLI 直接用 `wire_api = "responses"` 就跟它对得上。整库 gadgets（`function_call` / `function_call_output` / `tools` / `reasoning` 块）都按 Responses 协议透传，不再走之前的 "Responses ↔ Chat Completions" 适配层。
+
+**图片生成入口：**
+
+- Codex 内置 `image_gen` 请求网关的 `POST /v1/images/generations`。
+- 图片 provider 顺序取 Codex chain 中真正支持生图的成员（目前为 `minimax`、`codex`），其它 provider 自动跳过；无论 chain 是否显式包含 `codex`，官方 Codex 图片端点都会追加为最终兜底。
+- MiniMax 请求会转换成 `POST /v1/image_generation` + `image-01`，返回的 JPEG/Base64 会转码成真实 PNG，再包装成 OpenAI Images API 的 `data[].b64_json`。
+- MiniMax 不支持的语义（例如透明背景、超出 512–2048 且非 8 倍数的尺寸、超过 1500 字的提示词）不会被静默降级参数，而是直接跳过 MiniMax、透传到官方 Codex 图片端点。
+- 显式传 `model=image-01` 或 `model=minimax/image-01[-live]` 会优先选择 MiniMax；常规 `gpt-image-*` 请求按 Codex chain 排序。
 
 **模型名大小写会自动修正**：MiniMax 的官方 id 是混合大小写（`MiniMax-M3`），客户端传小写 `minimax-m3` 会被 400；网关按内置目录把已知 id 的大小写还原回去。裸 `minimax` 走默认档，从 Claude 链降级过来的 `claude-*` 名字按 3 档改写到对应 `MINIMAX_*_MODEL`。
 

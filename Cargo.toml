@@ -18,6 +18,7 @@ webpki-roots = "1"
 tower-http = { version = "0.6.11", features = ["trace"] }
 toml_edit = "0.22"
 base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 sha2 = "0.10"
 twox-hash = "1.6"
 futures-util = "0.3"

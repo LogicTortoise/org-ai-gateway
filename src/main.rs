@@ -52,6 +52,7 @@ use crate::routes::health::health;
 use crate::routes::health::index_html;
 use crate::routes::health::donate_script;
 use crate::routes::health::whoami;
+use crate::routes::images::proxy_image_generations;
 use crate::routes::mock_auth::mock_auth_refresh;
 use crate::routes::mock_auth::mock_auth_session;
 use crate::routes::models_api::get_claude_models;
@@ -232,6 +233,7 @@ async fn main() {
         .route("/v1/gateway/relay", post(relay))
         .route("/v1/client/codex/bootstrap", post(codex_bootstrap))
         .route("/v1/responses", post(proxy_responses))
+        .route("/v1/images/generations", post(proxy_image_generations))
         .route("/v1/messages", post(proxy_claude_messages))
         .route("/v1/chat/completions", post(proxy_chat_completions))
         .route("/backend-api/codex/responses", post(proxy_responses))

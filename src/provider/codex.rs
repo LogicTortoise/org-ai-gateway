@@ -12,6 +12,7 @@ use crate::util::truncate_text;
 
 const DEFAULT_CODEX_CLIENT_VERSION: &str = "0.153.4";
 const CODEX_MODELS_URL: &str = "https://chatgpt.com/backend-api/codex/models";
+const CODEX_IMAGES_URL: &str = "https://chatgpt.com/backend-api/codex/images/generations";
 
 fn codex_models_client_version(requested: Option<&str>) -> String {
     requested
@@ -379,6 +380,30 @@ pub(crate) async fn send_codex_upstream_with_refresh(
     Ok((retried, refreshed))
 }
 
+/// Send an OpenAI Images API payload through the ChatGPT Codex image bridge.
+///
+/// Codex's built-in image extension appends `images/generations` to the active
+/// model provider base URL. When the gateway is that provider, this endpoint
+/// is where the request must ultimately land to retain ChatGPT/Codex-plan
+/// billing rather than requiring a Platform API key.
+pub(crate) async fn send_codex_images_upstream_with_refresh(
+    state: &AppState,
+    account: &UpstreamAccount,
+    payload: &Value,
+) -> Result<(reqwest::Response, UpstreamAccount), String> {
+    let first = send_codex_images_upstream(account, payload).await?;
+    if first.status() != StatusCode::UNAUTHORIZED || !codex_account_refreshable(account) {
+        return Ok((first, account.clone()));
+    }
+    let refreshed = refresh_codex_account_tokens(state, account).await?;
+    info!(
+        "codex token refreshed for account {}, retrying image request",
+        refreshed.account_label
+    );
+    let retried = send_codex_images_upstream(&refreshed, payload).await?;
+    Ok((retried, refreshed))
+}
+
 
 /// Refresh a Codex account's OAuth tokens and persist the result. The
 /// single-flight / mark-dead / persist mechanics live in the shared
@@ -504,6 +529,30 @@ pub(crate) async fn send_codex_upstream(
     req.send()
         .await
         .map_err(|e| format!("failed to call codex upstream: {}", e))
+}
+
+async fn send_codex_images_upstream(
+    account: &UpstreamAccount,
+    payload: &Value,
+) -> Result<reqwest::Response, String> {
+    let client = codex_http_client();
+    let bearer = account.bearer();
+    if bearer.is_empty() {
+        return Err("connected codex account has empty access token".to_string());
+    }
+    let mut req = crate::fingerprint::codex::apply_codex_fingerprint(
+        client
+            .post(CODEX_IMAGES_URL)
+            .bearer_auth(bearer)
+            .header("Accept", "application/json"),
+    )
+    .json(payload);
+    if !account.account_id.trim().is_empty() {
+        req = req.header("ChatGPT-Account-ID", account.account_id.trim());
+    }
+    req.send()
+        .await
+        .map_err(|e| format!("failed to call codex image upstream: {}", e))
 }
 
 
