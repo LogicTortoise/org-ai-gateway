@@ -26,7 +26,7 @@
 
 团队里总有人有 Codex、Claude、Cursor 的订阅，也总有人临时需要却没有。OrgAI Gateway 让有订阅的人**一行命令捐出账号**，其余人无需自己付费，直接通过网关使用 —— 网关在多个账号间智能调度、预测容量、统计用量，并把每个人的身份和配额管得清清楚楚。
 
-它是一个用 **Rust** 写的单二进制服务，原生转发 Codex (`/v1/responses`)、Claude (`/v1/messages`) 与 Cursor 的真实上游协议，并为 Codex 内置生图提供 OpenAI 兼容的 `/v1/images/generations` 入口。
+它是一个用 **Rust** 写的单二进制服务，原生转发 Codex (`/v1/responses`)、Claude (`/v1/messages`) 与 Cursor 的真实上游协议，并为 Codex 内置生图与图片编辑提供 OpenAI 兼容的 `/v1/images/generations` 与 `/v1/images/edits` 入口。
 
 ### 核心特性
 
@@ -108,7 +108,7 @@ HTTP 代理路径（`/v1/messages` 等）会把上游响应**整体缓冲后回�
 
 Someone on your team always has a Codex, Claude, or Cursor subscription — and someone always needs one but doesn't. OrgAI Gateway lets subscribers **donate their account with one command**, so everyone else uses it through the gateway without paying. The gateway schedules across accounts intelligently, forecasts capacity, tracks usage, and keeps every user's identity and quota clearly accounted for.
 
-It's a single **Rust** binary that natively forwards the real upstream protocols of Codex (`/v1/responses`), Claude (`/v1/messages`), and Cursor, and exposes an OpenAI-compatible `/v1/images/generations` entrypoint for Codex's built-in image generation.
+It's a single **Rust** binary that natively forwards the real upstream protocols of Codex (`/v1/responses`), Claude (`/v1/messages`), and Cursor, and exposes OpenAI-compatible `/v1/images/generations` and `/v1/images/edits` entrypoints for Codex's built-in image generation and editing.
 
 ### Highlights
 

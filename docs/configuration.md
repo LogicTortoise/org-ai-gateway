@@ -204,6 +204,14 @@ Trae 不是直连的云端 API：Trae IDE 用的是私有的 `api/agent/v3` agen
 - MiniMax 不支持的语义（例如透明背景、超出 512–2048 且非 8 倍数的尺寸、超过 1500 字的提示词）不会被静默降级参数，而是直接跳过 MiniMax、透传到官方 Codex 图片端点。
 - 显式传 `model=image-01` 或 `model=minimax/image-01[-live]` 会优先选择 MiniMax；常规 `gpt-image-*` 请求按 Codex chain 排序。
 
+**图片编辑入口：**
+
+- `POST /v1/images/edits` 接 OpenAI 公开协议（`multipart/form-data`，字段 `image[]` / `mask` / `prompt` / `n` / `size` / `model` / `response_format` / `quality` / `background`）。
+- 仅走 codex 上游（`https://chatgpt.com/backend-api/codex/images/edits`）：Gateway 解析 multipart 后把 `image[]` / `mask` 转 base64 data URL，再拼成 codex 上游 JSON（`{prompt, model, images:[{image_url}], mask?, size?, n?, response_format?, quality?, background?}`）转发。Codex 上游**不是 multipart**，不接受字节级透传。
+- **不接 minimax**：MiniMax `image_generation` 的 `subject_reference[]` 是单人参考图（≤10MB），不是 mask/inpainting、也不是任意参考图编辑；强行走 minimax 只会让请求必败。Edits 路由不做 chain failover，没有 minimax 兜底。
+- Codex 不识别的字段（如 `input_fidelity`、`output_compression`、`partial_images`、`stream`、`user`）直接丢弃；OpenAI `n` 透传（Codex 上限 1–10）；客户端传的 `model` 默认为 `gpt-image-2`，非 `image-01*` 的 minimax 命名不会被路由到 minimax。
+- 错误响应：缺 `prompt` / 缺 `image` 返回 `400 invalid_request_error`；没有可用 codex 账号返回 `503 image_provider_unavailable`（与 generations 路径同 shape）。Audit 与 generations 一样写入 `data/audit.ndjson`，`routed_provider=codex`，`origin` 因 image handler 未包 `with_request_origin` 而 fallback 到 `codex-imagegen`（已知 gap，chat/responses 路由已修复）。
+
 **模型名大小写会自动修正**：MiniMax 的官方 id 是混合大小写（`MiniMax-M3`），客户端传小写 `minimax-m3` 会被 400；网关按内置目录把已知 id 的大小写还原回去。裸 `minimax` 走默认档，从 Claude 链降级过来的 `claude-*` 名字按 3 档改写到对应 `MINIMAX_*_MODEL`。
 
 **老账号迁移提示**：早期版本 `MINIMAX_BASE_URL` 默认指向 Anthropic 端（`https://api.minimaxi.com/anthropic`）。新版本该 env 默认改回 OpenAI 端。如果你的账号还在用老的 Anthropic URL，请在 WebUI 把 `base_url` 改成 `https://api.minimaxi.com/anthropic`，**或者**导出 `MINIMAX_ANTHROPIC_BASE_URL=https://api.minimaxi.com/anthropic`（新 env 显式覆盖 Anthropic 端点），把 `MINIMAX_BASE_URL` 留默认。

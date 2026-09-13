@@ -4,6 +4,13 @@
 //! the active model-provider base URL. MiniMax exposes equivalent capability
 //! through a different endpoint and schema, so this route translates MiniMax
 //! attempts and falls back to the native ChatGPT Codex image bridge.
+//!
+//! `/v1/images/edits` (OpenAI multipart shape) is also routed here. The
+//! Codex backend exposes `/backend-api/codex/images/edits` as a JSON endpoint
+//! that takes `{prompt, images:[{image_url}], mask?, ...}`, so the multipart
+//! fields are unpacked into that shape. There is no minimax fallback: MiniMax
+//! has no mask/inpainting capability and its `subject_reference` is a
+//! single-character reference, not a generic image edit.
 
 use crate::auth::identify_caller;
 use crate::pool::account_visible_to_user;
@@ -17,6 +24,7 @@ use crate::retry::{
     apply_account_failure, eligible_accounts, parse_retry_after, prefer_near_expiry,
     provider_attempt_budget, reset_backoff, ErrorClass,
 };
+use base64::Engine;
 use std::collections::HashSet;
 
 pub(crate) async fn proxy_image_generations(
@@ -84,6 +92,317 @@ pub(crate) async fn proxy_image_generations(
             "no usable MiniMax or Codex image provider account",
         )
     })
+}
+
+enum ImageEditField {
+    Prompt,
+    Image,
+    Mask,
+    N,
+    Size,
+    Model,
+    ResponseFormat,
+}
+
+fn classify_image_edit_field(name: &str) -> Option<ImageEditField> {
+    match name {
+        "prompt" => Some(ImageEditField::Prompt),
+        "image" | "image[]" => Some(ImageEditField::Image),
+        "mask" => Some(ImageEditField::Mask),
+        "n" => Some(ImageEditField::N),
+        "size" => Some(ImageEditField::Size),
+        "model" => Some(ImageEditField::Model),
+        "response_format" => Some(ImageEditField::ResponseFormat),
+        _ => None,
+    }
+}
+
+async fn read_field_data_url(
+    field: axum::extract::multipart::Field<'_>,
+) -> Result<String, String> {
+    let mime = field
+        .content_type()
+        .map(|m| m.to_string())
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+    let bytes = field
+        .bytes()
+        .await
+        .map_err(|e| format!("failed reading multipart field: {}", e))?;
+    if bytes.is_empty() {
+        return Err("multipart field has no bytes".to_string());
+    }
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Ok(format!("data:{};base64,{}", mime, encoded))
+}
+
+pub(crate) async fn proxy_image_edits(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    mut multipart: axum::extract::Multipart,
+) -> Response {
+    let caller = identify_caller(&headers);
+    let user_id = caller.id;
+    let shared_only = !caller.owner_trusted;
+
+    let mut prompt: Option<String> = None;
+    let mut image_data_urls: Vec<String> = Vec::new();
+    let mut mask_data_url: Option<String> = None;
+    let mut n_value: Option<u32> = None;
+    let mut size_value: Option<String> = None;
+    let mut model_value: Option<String> = None;
+    let mut response_format_value: Option<String> = None;
+
+    while let Some(field) = match multipart.next_field().await {
+        Ok(field) => field,
+        Err(error) => {
+            return openai_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                &format!("malformed multipart body: {}", error),
+            )
+        }
+    } {
+        let name = field.name().unwrap_or("").to_string();
+        let kind = match classify_image_edit_field(&name) {
+            Some(kind) => kind,
+            None => continue,
+        };
+        match kind {
+            ImageEditField::Prompt => {
+                if let Ok(text) = field.text().await {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        prompt = Some(trimmed.to_string());
+                    }
+                }
+            }
+            ImageEditField::Image => match read_field_data_url(field).await {
+                Ok(url) => image_data_urls.push(url),
+                Err(message) => {
+                    return openai_error(StatusCode::BAD_REQUEST, "invalid_request_error", &message)
+                }
+            },
+            ImageEditField::Mask => match read_field_data_url(field).await {
+                Ok(url) => mask_data_url = Some(url),
+                Err(message) => {
+                    return openai_error(StatusCode::BAD_REQUEST, "invalid_request_error", &message)
+                }
+            },
+            ImageEditField::N => {
+                if let Ok(text) = field.text().await {
+                    if let Ok(parsed) = text.trim().parse::<u32>() {
+                        n_value = Some(parsed);
+                    }
+                }
+            }
+            ImageEditField::Size => {
+                if let Ok(text) = field.text().await {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        size_value = Some(trimmed.to_string());
+                    }
+                }
+            }
+            ImageEditField::Model => {
+                if let Ok(text) = field.text().await {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        model_value = Some(trimmed.to_string());
+                    }
+                }
+            }
+            ImageEditField::ResponseFormat => {
+                if let Ok(text) = field.text().await {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        response_format_value = Some(trimmed.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    let prompt = match prompt {
+        Some(p) => p,
+        None => {
+            return openai_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "Missing required parameter: 'prompt'.",
+            )
+        }
+    };
+    if image_data_urls.is_empty() {
+        return openai_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "Missing required parameter: 'image'.",
+        );
+    }
+    let requested_model = model_value.unwrap_or_else(|| "gpt-image-2".to_string());
+
+    let payload = build_codex_edits_payload(
+        &prompt,
+        &image_data_urls,
+        mask_data_url.as_deref(),
+        n_value,
+        size_value.as_deref(),
+        &requested_model,
+        response_format_value.as_deref(),
+    );
+
+    let owner_trusted = !shared_only;
+    let owned_only =
+        match crate::quota::enforce_user_quota(&state, "codex", &user_id, owner_trusted).await {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+
+    let budget = provider_attempt_budget(&state, "codex").await;
+    let mut excluded = HashSet::new();
+    let mut last_error: Option<Response> = None;
+    for _ in 0..budget {
+        let Some(account) =
+            select_image_account(&state, "codex", &user_id, owned_only, shared_only, &excluded).await
+        else {
+            break;
+        };
+        excluded.insert(account.id.clone());
+        let (response, account) = match codex::send_codex_image_edits_upstream_with_refresh(
+            &state, &account, &payload,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(message) => {
+                warn!("Codex image edits transport failed: {}", message);
+                last_error = Some(openai_error(
+                    StatusCode::BAD_GATEWAY,
+                    "upstream_error",
+                    "Codex image edits provider transport failed",
+                ));
+                continue;
+            }
+        };
+        let status = response.status();
+        let retry_after = parse_retry_after(response.headers());
+        let request_id = response
+            .headers()
+            .get("x-request-id")
+            .or_else(|| response.headers().get("request-id"))
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let body = match response.bytes().await {
+            Ok(body) => body,
+            Err(error) => {
+                warn!("failed reading Codex image edits response: {}", error);
+                last_error = Some(openai_error(
+                    StatusCode::BAD_GATEWAY,
+                    "upstream_error",
+                    "failed reading Codex image edits response",
+                ));
+                continue;
+            }
+        };
+        if status.is_success() {
+            reset_backoff(&state, &account.id).await;
+            write_image_audit(
+                &state,
+                &user_id,
+                &account,
+                "codex",
+                &requested_model,
+                &requested_model,
+                prompt.chars().count(),
+                "success",
+            )
+            .await;
+            let mut client_response = Response::builder()
+                .status(status)
+                .header(CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(body))
+                .unwrap_or_else(|_| {
+                    openai_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "gateway_error",
+                        "failed building image edits response",
+                    )
+                });
+            if let Some(request_id) =
+                request_id.and_then(|value| HeaderValue::from_str(&value).ok())
+            {
+                client_response
+                    .headers_mut()
+                    .insert("x-request-id", request_id);
+            }
+            return client_response;
+        }
+
+        let class = ErrorClass::from_status(status.as_u16());
+        warn!(
+            "Codex image edits upstream returned {}: {}",
+            status.as_u16(),
+            crate::util::truncate_text(&String::from_utf8_lossy(&body), 500)
+        );
+        apply_account_failure(&state, &account.id, class, None, retry_after, false).await;
+        last_error = Some(openai_error(
+            status,
+            "upstream_error",
+            &format!(
+                "Codex image edits provider returned status {}",
+                status.as_u16()
+            ),
+        ));
+        if !class.is_retryable() {
+            break;
+        }
+    }
+
+    last_error.unwrap_or_else(|| {
+        openai_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "image_provider_unavailable",
+            "no usable Codex image edits provider account",
+        )
+    })
+}
+
+fn build_codex_edits_payload(
+    prompt: &str,
+    images: &[String],
+    mask: Option<&str>,
+    n: Option<u32>,
+    size: Option<&str>,
+    model: &str,
+    response_format: Option<&str>,
+) -> Value {
+    let images_value: Vec<Value> = images
+        .iter()
+        .map(|url| json!({ "image_url": url }))
+        .collect();
+    let mut payload = json!({
+        "prompt": prompt,
+        "model": model,
+        "images": images_value,
+    });
+    if let Some(obj) = payload.as_object_mut() {
+        if let Some(n_value) = n {
+            obj.insert("n".to_string(), json!(n_value));
+        }
+        if let Some(size_value) = size {
+            obj.insert("size".to_string(), Value::String(size_value.to_string()));
+        }
+        if let Some(mask_value) = mask {
+            obj.insert("mask".to_string(), Value::String(mask_value.to_string()));
+        }
+        if let Some(format_value) = response_format {
+            obj.insert(
+                "response_format".to_string(),
+                Value::String(format_value.to_string()),
+            );
+        }
+    }
+    payload
 }
 
 enum ImageProviderOutcome {
@@ -481,7 +800,7 @@ async fn write_image_audit(
 
 #[cfg(test)]
 mod tests {
-    use super::{codex_image_payload, image_prompt, ordered_image_providers};
+    use super::{build_codex_edits_payload, codex_image_payload, image_prompt, ordered_image_providers};
     use crate::provider::chains::{ChainCfg, ChainMode};
     use serde_json::json;
 
@@ -540,5 +859,72 @@ mod tests {
             codex_image_payload(&json!({"prompt":"draw"}))["model"],
             "gpt-image-2"
         );
+    }
+
+    #[test]
+    fn build_codex_edits_payload_serializes_single_image_as_images_array() {
+        let payload = build_codex_edits_payload(
+            "add a red hat",
+            &["data:image/png;base64,AAAA".to_string()],
+            None,
+            None,
+            None,
+            "gpt-image-2",
+            None,
+        );
+        assert_eq!(payload["prompt"], "add a red hat");
+        assert_eq!(payload["model"], "gpt-image-2");
+        let images = payload["images"].as_array().expect("images array");
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0]["image_url"], "data:image/png;base64,AAAA");
+        assert!(payload.get("mask").is_none());
+        assert!(payload.get("n").is_none());
+        assert!(payload.get("size").is_none());
+    }
+
+    #[test]
+    fn build_codex_edits_payload_omits_mask_when_absent() {
+        let payload = build_codex_edits_payload(
+            "draw",
+            &["data:image/png;base64,AAAA".to_string()],
+            None,
+            Some(2),
+            Some("1024x1024"),
+            "gpt-image-2",
+            Some("b64_json"),
+        );
+        assert_eq!(payload["n"], 2);
+        assert_eq!(payload["size"], "1024x1024");
+        assert_eq!(payload["response_format"], "b64_json");
+        assert!(payload.get("mask").is_none());
+    }
+
+    #[test]
+    fn build_codex_edits_payload_keeps_mask_data_url_when_present() {
+        let payload = build_codex_edits_payload(
+            "draw",
+            &["data:image/png;base64,AAAA".to_string()],
+            Some("data:image/png;base64,BBBB"),
+            None,
+            None,
+            "gpt-image-2",
+            None,
+        );
+        assert_eq!(payload["mask"], "data:image/png;base64,BBBB");
+    }
+
+    #[test]
+    fn build_codex_edits_payload_defaults_model_to_gpt_image_2() {
+        let payload = build_codex_edits_payload(
+            "draw",
+            &["data:image/png;base64,AAAA".to_string()],
+            None,
+            None,
+            None,
+            "gpt-image-2",
+            None,
+        );
+        assert_eq!(payload["model"], "gpt-image-2");
+        assert!(payload.get("n").is_none());
     }
 }
