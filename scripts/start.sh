@@ -17,9 +17,15 @@ LOG_DIR="data"
 OUT_LOG="${LOG_DIR}/gateway.out.log"
 ERR_LOG="${LOG_DIR}/gateway.err.log"
 PID_FILE="${LOG_DIR}/gateway.pid"
+HEALTH_URL="http://127.0.0.1:${GATEWAY_BIND_ADDR##*:}/health"
+
+running_pids() {
+  # `[t]arget` keeps pgrep from matching the pgrep command itself.
+  pgrep -f "[t]arget/release/org-ai-gateway" || true
+}
 
 # 已在运行则不重复启动（重启请用 scripts/restart.sh）
-if RUNNING="$(pgrep -f "${BIN}" || true)"; [[ -n "$RUNNING" ]]; then
+if RUNNING="$(running_pids)"; [[ -n "$RUNNING" ]]; then
   echo "OrgAI Gateway 已在运行 (PID: $(echo "$RUNNING" | tr '\n' ' '))。"
   echo "如需重启，请用: scripts/restart.sh"
   exit 0
@@ -38,13 +44,24 @@ nohup "$BIN" >>"$OUT_LOG" 2>>"$ERR_LOG" &
 PID=$!
 echo "$PID" >"$PID_FILE"
 
-# 确认进程存活（启动失败时给出日志路径）
-sleep 1
-if kill -0 "$PID" 2>/dev/null; then
-  echo "已启动 (PID: ${PID})。"
-  echo "  日志: ${OUT_LOG} / ${ERR_LOG}"
-  echo "  健康检查: curl http://127.0.0.1:${GATEWAY_BIND_ADDR##*:}/health"
-else
-  echo "启动失败，请查看日志: ${ERR_LOG}" >&2
-  exit 1
-fi
+# 不只检查 PID：进程短暂存活并不表示它已成功监听端口。最多等 10 秒，
+# 直到健康接口真正可用才报告启动成功。
+for _ in $(seq 1 20); do
+  if curl --fail --silent --show-error --max-time 1 "$HEALTH_URL" >/dev/null 2>&1; then
+    echo "已启动 (PID: ${PID})。"
+    echo "  日志: ${OUT_LOG} / ${ERR_LOG}"
+    echo "  健康检查: curl ${HEALTH_URL}"
+    exit 0
+  fi
+  if ! kill -0 "$PID" 2>/dev/null; then
+    break
+  fi
+  sleep 0.5
+done
+
+echo "Gateway 未在 10 秒内通过健康检查: ${HEALTH_URL}" >&2
+echo "--- 最近标准输出 ---" >&2
+tail -n 50 "$OUT_LOG" >&2 || true
+echo "--- 最近标准错误 ---" >&2
+tail -n 50 "$ERR_LOG" >&2 || true
+exit 1

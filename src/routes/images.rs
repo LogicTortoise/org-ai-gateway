@@ -102,6 +102,8 @@ enum ImageEditField {
     Size,
     Model,
     ResponseFormat,
+    Quality,
+    Background,
 }
 
 fn classify_image_edit_field(name: &str) -> Option<ImageEditField> {
@@ -113,13 +115,13 @@ fn classify_image_edit_field(name: &str) -> Option<ImageEditField> {
         "size" => Some(ImageEditField::Size),
         "model" => Some(ImageEditField::Model),
         "response_format" => Some(ImageEditField::ResponseFormat),
+        "quality" => Some(ImageEditField::Quality),
+        "background" => Some(ImageEditField::Background),
         _ => None,
     }
 }
 
-async fn read_field_data_url(
-    field: axum::extract::multipart::Field<'_>,
-) -> Result<String, String> {
+async fn read_field_data_url(field: multer::Field<'_>) -> Result<String, String> {
     let mime = field
         .content_type()
         .map(|m| m.to_string())
@@ -135,14 +137,87 @@ async fn read_field_data_url(
     Ok(format!("data:{};base64,{}", mime, encoded))
 }
 
+/// The standard extractor rejects a malformed `Content-Type` before the
+/// handler runs. Some image clients send a valid multipart body while omitting
+/// or corrupting that header's boundary, so recover the delimiter from the
+/// first body line when it is safe to do so.
+fn multipart_boundary_from_body(body: &[u8]) -> Option<String> {
+    let line_end = body.iter().position(|byte| *byte == b'\n')?;
+    let line = body[..line_end]
+        .strip_suffix(b"\r")
+        .unwrap_or(&body[..line_end]);
+    let boundary = line.strip_prefix(b"--")?;
+    if boundary.is_empty() || boundary.len() > 70 || !boundary.iter().all(u8::is_ascii_graphic) {
+        return None;
+    }
+    std::str::from_utf8(boundary).ok().map(str::to_string)
+}
+
+fn image_edit_boundary(headers: &HeaderMap, body: &[u8]) -> Result<String, String> {
+    let content_type = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| "Missing Content-Type: multipart/form-data".to_string())?;
+    let media_type = content_type.split(';').next().unwrap_or("").trim();
+    if !media_type.eq_ignore_ascii_case("multipart/form-data") {
+        return Err("Content-Type must be multipart/form-data".to_string());
+    }
+
+    let header_boundary = multer::parse_boundary(content_type).ok();
+    let body_boundary = multipart_boundary_from_body(body);
+    match (header_boundary, body_boundary) {
+        (Some(header), Some(body)) if header == body => Ok(header),
+        (Some(_), Some(body)) => {
+            warn!(
+                "image edits multipart boundary disagreed with body; recovered boundary from body"
+            );
+            Ok(body)
+        }
+        (None, Some(body)) => {
+            warn!("image edits multipart request had an invalid boundary header; recovered boundary from body");
+            Ok(body)
+        }
+        (Some(header), None) => Ok(header),
+        (None, None) => Err("Invalid boundary for multipart/form-data request".to_string()),
+    }
+}
+
+fn image_edit_request_limit() -> usize {
+    std::env::var("GATEWAY_MAX_REQUEST_BYTES")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(64 * 1024 * 1024)
+}
+
 pub(crate) async fn proxy_image_edits(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    mut multipart: axum::extract::Multipart,
+    request: Request<axum::body::Body>,
 ) -> Response {
+    let (parts, body) = request.into_parts();
+    let headers = parts.headers;
     let caller = identify_caller(&headers);
     let user_id = caller.id;
     let shared_only = !caller.owner_trusted;
+
+    let body = match axum::body::to_bytes(body, image_edit_request_limit()).await {
+        Ok(body) => body,
+        Err(error) => {
+            return openai_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "invalid_request_error",
+                &format!("failed reading multipart body: {}", error),
+            )
+        }
+    };
+    let boundary = match image_edit_boundary(&headers, &body) {
+        Ok(boundary) => boundary,
+        Err(message) => {
+            return openai_error(StatusCode::BAD_REQUEST, "invalid_request_error", &message)
+        }
+    };
+    let stream = futures_util::stream::once(async move { Ok::<_, std::convert::Infallible>(body) });
+    let mut multipart = multer::Multipart::new(stream, boundary);
 
     let mut prompt: Option<String> = None;
     let mut image_data_urls: Vec<String> = Vec::new();
@@ -151,6 +226,8 @@ pub(crate) async fn proxy_image_edits(
     let mut size_value: Option<String> = None;
     let mut model_value: Option<String> = None;
     let mut response_format_value: Option<String> = None;
+    let mut quality_value: Option<String> = None;
+    let mut background_value: Option<String> = None;
 
     while let Some(field) = match multipart.next_field().await {
         Ok(field) => field,
@@ -219,6 +296,22 @@ pub(crate) async fn proxy_image_edits(
                     }
                 }
             }
+            ImageEditField::Quality => {
+                if let Ok(text) = field.text().await {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        quality_value = Some(trimmed.to_string());
+                    }
+                }
+            }
+            ImageEditField::Background => {
+                if let Ok(text) = field.text().await {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        background_value = Some(trimmed.to_string());
+                    }
+                }
+            }
         }
     }
 
@@ -249,6 +342,8 @@ pub(crate) async fn proxy_image_edits(
         size_value.as_deref(),
         &requested_model,
         response_format_value.as_deref(),
+        quality_value.as_deref(),
+        background_value.as_deref(),
     );
 
     let owner_trusted = !shared_only;
@@ -262,28 +357,34 @@ pub(crate) async fn proxy_image_edits(
     let mut excluded = HashSet::new();
     let mut last_error: Option<Response> = None;
     for _ in 0..budget {
-        let Some(account) =
-            select_image_account(&state, "codex", &user_id, owned_only, shared_only, &excluded).await
+        let Some(account) = select_image_account(
+            &state,
+            "codex",
+            &user_id,
+            owned_only,
+            shared_only,
+            &excluded,
+        )
+        .await
         else {
             break;
         };
         excluded.insert(account.id.clone());
-        let (response, account) = match codex::send_codex_image_edits_upstream_with_refresh(
-            &state, &account, &payload,
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(message) => {
-                warn!("Codex image edits transport failed: {}", message);
-                last_error = Some(openai_error(
-                    StatusCode::BAD_GATEWAY,
-                    "upstream_error",
-                    "Codex image edits provider transport failed",
-                ));
-                continue;
-            }
-        };
+        let (response, account) =
+            match codex::send_codex_image_edits_upstream_with_refresh(&state, &account, &payload)
+                .await
+            {
+                Ok(result) => result,
+                Err(message) => {
+                    warn!("Codex image edits transport failed: {}", message);
+                    last_error = Some(openai_error(
+                        StatusCode::BAD_GATEWAY,
+                        "upstream_error",
+                        "Codex image edits provider transport failed",
+                    ));
+                    continue;
+                }
+            };
         let status = response.status();
         let retry_after = parse_retry_after(response.headers());
         let request_id = response
@@ -375,6 +476,8 @@ fn build_codex_edits_payload(
     size: Option<&str>,
     model: &str,
     response_format: Option<&str>,
+    quality: Option<&str>,
+    background: Option<&str>,
 ) -> Value {
     let images_value: Vec<Value> = images
         .iter()
@@ -399,6 +502,18 @@ fn build_codex_edits_payload(
             obj.insert(
                 "response_format".to_string(),
                 Value::String(format_value.to_string()),
+            );
+        }
+        if let Some(quality_value) = quality {
+            obj.insert(
+                "quality".to_string(),
+                Value::String(quality_value.to_string()),
+            );
+        }
+        if let Some(background_value) = background {
+            obj.insert(
+                "background".to_string(),
+                Value::String(background_value.to_string()),
             );
         }
     }
@@ -800,8 +915,12 @@ async fn write_image_audit(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_codex_edits_payload, codex_image_payload, image_prompt, ordered_image_providers};
+    use super::{
+        build_codex_edits_payload, codex_image_payload, image_edit_boundary, image_prompt,
+        ordered_image_providers,
+    };
     use crate::provider::chains::{ChainCfg, ChainMode};
+    use axum::http::{header::CONTENT_TYPE, HeaderMap, HeaderValue};
     use serde_json::json;
 
     #[test]
@@ -871,6 +990,8 @@ mod tests {
             None,
             "gpt-image-2",
             None,
+            None,
+            None,
         );
         assert_eq!(payload["prompt"], "add a red hat");
         assert_eq!(payload["model"], "gpt-image-2");
@@ -892,6 +1013,8 @@ mod tests {
             Some("1024x1024"),
             "gpt-image-2",
             Some("b64_json"),
+            None,
+            None,
         );
         assert_eq!(payload["n"], 2);
         assert_eq!(payload["size"], "1024x1024");
@@ -909,6 +1032,8 @@ mod tests {
             None,
             "gpt-image-2",
             None,
+            None,
+            None,
         );
         assert_eq!(payload["mask"], "data:image/png;base64,BBBB");
     }
@@ -923,8 +1048,45 @@ mod tests {
             None,
             "gpt-image-2",
             None,
+            None,
+            None,
         );
         assert_eq!(payload["model"], "gpt-image-2");
         assert!(payload.get("n").is_none());
+    }
+
+    #[test]
+    fn image_edit_recovers_missing_boundary_from_a_valid_body() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("multipart/form-data"),
+        );
+        let body = b"--client-boundary\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\ndraw\r\n--client-boundary--\r\n";
+        assert_eq!(
+            image_edit_boundary(&headers, body).unwrap(),
+            "client-boundary"
+        );
+    }
+
+    #[test]
+    fn image_edit_recovers_a_boundary_that_disagrees_with_the_body() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("multipart/form-data; boundary=incorrect"),
+        );
+        let body = b"--actual-boundary\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\ndraw\r\n--actual-boundary--\r\n";
+        assert_eq!(
+            image_edit_boundary(&headers, body).unwrap(),
+            "actual-boundary"
+        );
+    }
+
+    #[test]
+    fn image_edit_rejects_non_multipart_requests() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        assert!(image_edit_boundary(&headers, b"{}").is_err());
     }
 }
