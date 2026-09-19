@@ -206,11 +206,11 @@ Trae 不是直连的云端 API：Trae IDE 用的是私有的 `api/agent/v3` agen
 
 **图片编辑入口：**
 
-- `POST /v1/images/edits` 接 OpenAI 公开协议（`multipart/form-data`，字段 `image[]` / `mask` / `prompt` / `n` / `size` / `model` / `response_format` / `quality` / `background`）。
-- 仅走 codex 上游（`https://chatgpt.com/backend-api/codex/images/edits`）：Gateway 解析 multipart 后把 `image[]` / `mask` 转 base64 data URL，再拼成 codex 上游 JSON（`{prompt, model, images:[{image_url}], mask?, size?, n?, response_format?, quality?, background?}`）转发。Codex 上游**不是 multipart**，不接受字节级透传。
+- `POST /v1/images/edits` 接 [OpenAI Images API](https://developers.openai.com/api/reference/resources/images#create-image-edit) 的两种编辑请求：新版 `application/json`（`images[].image_url/file_id`）和 `multipart/form-data` 文件上传。
+- 仅走 codex 上游（`https://chatgpt.com/backend-api/codex/images/edits`）：Gateway 原样透传 JSON 或 multipart body；multipart 会校正为与 body 一致的 boundary，其他 `Content-Type` 原样透传，只替换上游鉴权头。上游响应的状态码、body、`Content-Type` 和 request id 也原样返回。
 - **不接 minimax**：MiniMax `image_generation` 的 `subject_reference[]` 是单人参考图（≤10MB），不是 mask/inpainting、也不是任意参考图编辑；强行走 minimax 只会让请求必败。Edits 路由不做 chain failover，没有 minimax 兜底。
-- Codex 不识别的字段（如 `input_fidelity`、`output_compression`、`partial_images`、`stream`、`user`）直接丢弃；OpenAI `n` 透传（Codex 上限 1–10）；客户端传的 `model` 默认为 `gpt-image-2`，非 `image-01*` 的 minimax 命名不会被路由到 minimax。
-- 错误响应：缺 `prompt` / 缺 `image` 返回 `400 invalid_request_error`；没有可用 codex 账号返回 `503 image_provider_unavailable`（与 generations 路径同 shape）。Audit 与 generations 一样写入 `data/audit.ndjson`，`routed_provider=codex`，`origin` 因 image handler 未包 `with_request_origin` 而 fallback 到 `codex-imagegen`（已知 gap，chat/responses 路由已修复）。
+- Gateway 不再维护图片编辑字段白名单；`input_fidelity`、`output_compression`、`partial_images`、`stream`、`user` 以及 OpenAI 后续新增字段都交给 codex 上游按当前协议解释。客户端未传 `model` 时，仅审计记录使用 `gpt-image-2` 作为显示默认值，不会改写请求体。
+- 错误响应：请求到达上游后，Gateway 原样返回上游的协议/参数校验错误；没有可用 codex 账号时返回 `503 image_provider_unavailable`。Audit 与 generations 一样写入 `data/audit.ndjson`，`routed_provider=codex`，`origin` 因 image handler 未包 `with_request_origin` 而 fallback 到 `codex-imagegen`（已知 gap，chat/responses 路由已修复）。
 
 **模型名大小写会自动修正**：MiniMax 的官方 id 是混合大小写（`MiniMax-M3`），客户端传小写 `minimax-m3` 会被 400；网关按内置目录把已知 id 的大小写还原回去。裸 `minimax` 走默认档，从 Claude 链降级过来的 `claude-*` 名字按 3 档改写到对应 `MINIMAX_*_MODEL`。
 

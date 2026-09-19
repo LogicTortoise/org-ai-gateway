@@ -405,18 +405,16 @@ pub(crate) async fn send_codex_images_upstream_with_refresh(
     Ok((retried, refreshed))
 }
 
-/// Send an OpenAI Images API edits payload through the ChatGPT Codex image
-/// bridge. Codex's image-edit endpoint (`/backend-api/codex/images/edits`)
-/// accepts a JSON body — the public OpenAI multipart shape has to be
-/// unpacked into `{prompt, images:[{image_url}], mask?, ...}` upstream by
-/// the caller; this function only handles the transport + fingerprint +
-/// auth + ChatGPT-Account-ID headers.
+/// Send an OpenAI Images API edits request through the ChatGPT Codex image
+/// bridge. The JSON or multipart body and Content-Type are forwarded unchanged;
+/// only gateway/upstream authentication differs.
 pub(crate) async fn send_codex_image_edits_upstream_with_refresh(
     state: &AppState,
     account: &UpstreamAccount,
-    payload: &Value,
+    content_type: Option<&HeaderValue>,
+    body: &axum::body::Bytes,
 ) -> Result<(reqwest::Response, UpstreamAccount), String> {
-    let first = send_codex_image_edits_upstream(account, payload).await?;
+    let first = send_codex_image_edits_upstream(account, content_type, body).await?;
     if first.status() != StatusCode::UNAUTHORIZED || !codex_account_refreshable(account) {
         return Ok((first, account.clone()));
     }
@@ -425,7 +423,7 @@ pub(crate) async fn send_codex_image_edits_upstream_with_refresh(
         "codex token refreshed for account {}, retrying image edit request",
         refreshed.account_label
     );
-    let retried = send_codex_image_edits_upstream(&refreshed, payload).await?;
+    let retried = send_codex_image_edits_upstream(&refreshed, content_type, body).await?;
     Ok((retried, refreshed))
 }
 
@@ -580,25 +578,25 @@ async fn send_codex_images_upstream(
         .map_err(|e| format!("failed to call codex image upstream: {}", e))
 }
 
-/// Send an OpenAI Images API edits payload (already converted to Codex's
-/// JSON shape by the caller) to `/backend-api/codex/images/edits`. Mirrors
-/// `send_codex_images_upstream` but targets the edits endpoint.
+/// Send the original OpenAI JSON or multipart body to Codex's edits endpoint.
 async fn send_codex_image_edits_upstream(
     account: &UpstreamAccount,
-    payload: &Value,
+    content_type: Option<&HeaderValue>,
+    body: &axum::body::Bytes,
 ) -> Result<reqwest::Response, String> {
     let client = codex_http_client();
     let bearer = account.bearer();
     if bearer.is_empty() {
         return Err("connected codex account has empty access token".to_string());
     }
-    let mut req = crate::fingerprint::codex::apply_codex_fingerprint(
-        client
-            .post(CODEX_IMAGE_EDITS_URL)
-            .bearer_auth(bearer)
-            .header("Accept", "application/json"),
-    )
-    .json(payload);
+    let mut upstream = client
+        .post(CODEX_IMAGE_EDITS_URL)
+        .bearer_auth(bearer)
+        .header("Accept", "application/json");
+    if let Some(content_type) = content_type {
+        upstream = upstream.header(CONTENT_TYPE, content_type.clone());
+    }
+    let mut req = crate::fingerprint::codex::apply_codex_fingerprint(upstream).body(body.clone());
     if !account.account_id.trim().is_empty() {
         req = req.header("ChatGPT-Account-ID", account.account_id.trim());
     }

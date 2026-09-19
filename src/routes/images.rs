@@ -5,12 +5,12 @@
 //! through a different endpoint and schema, so this route translates MiniMax
 //! attempts and falls back to the native ChatGPT Codex image bridge.
 //!
-//! `/v1/images/edits` (OpenAI multipart shape) is also routed here. The
-//! Codex backend exposes `/backend-api/codex/images/edits` as a JSON endpoint
-//! that takes `{prompt, images:[{image_url}], mask?, ...}`, so the multipart
-//! fields are unpacked into that shape. There is no minimax fallback: MiniMax
-//! has no mask/inpainting capability and its `subject_reference` is a
-//! single-character reference, not a generic image edit.
+//! `/v1/images/edits` is a byte-for-byte passthrough to Codex's matching
+//! image-edit endpoint. OpenAI supports both JSON image references and
+//! multipart file uploads; keeping either original body intact also keeps
+//! future fields working without gateway changes. There is no
+//! MiniMax fallback: MiniMax documents only a single-character reference for
+//! `image-01`, not OpenAI-compatible generic edits or mask/inpainting.
 
 use crate::auth::identify_caller;
 use crate::pool::account_visible_to_user;
@@ -24,7 +24,6 @@ use crate::retry::{
     apply_account_failure, eligible_accounts, parse_retry_after, prefer_near_expiry,
     provider_attempt_budget, reset_backoff, ErrorClass,
 };
-use base64::Engine;
 use std::collections::HashSet;
 
 pub(crate) async fn proxy_image_generations(
@@ -94,49 +93,6 @@ pub(crate) async fn proxy_image_generations(
     })
 }
 
-enum ImageEditField {
-    Prompt,
-    Image,
-    Mask,
-    N,
-    Size,
-    Model,
-    ResponseFormat,
-    Quality,
-    Background,
-}
-
-fn classify_image_edit_field(name: &str) -> Option<ImageEditField> {
-    match name {
-        "prompt" => Some(ImageEditField::Prompt),
-        "image" | "image[]" => Some(ImageEditField::Image),
-        "mask" => Some(ImageEditField::Mask),
-        "n" => Some(ImageEditField::N),
-        "size" => Some(ImageEditField::Size),
-        "model" => Some(ImageEditField::Model),
-        "response_format" => Some(ImageEditField::ResponseFormat),
-        "quality" => Some(ImageEditField::Quality),
-        "background" => Some(ImageEditField::Background),
-        _ => None,
-    }
-}
-
-async fn read_field_data_url(field: multer::Field<'_>) -> Result<String, String> {
-    let mime = field
-        .content_type()
-        .map(|m| m.to_string())
-        .unwrap_or_else(|| "application/octet-stream".to_string());
-    let bytes = field
-        .bytes()
-        .await
-        .map_err(|e| format!("failed reading multipart field: {}", e))?;
-    if bytes.is_empty() {
-        return Err("multipart field has no bytes".to_string());
-    }
-    let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
-    Ok(format!("data:{};base64,{}", mime, encoded))
-}
-
 /// The standard extractor rejects a malformed `Content-Type` before the
 /// handler runs. Some image clients send a valid multipart body while omitting
 /// or corrupting that header's boundary, so recover the delimiter from the
@@ -190,6 +146,125 @@ fn image_edit_request_limit() -> usize {
         .unwrap_or(64 * 1024 * 1024)
 }
 
+fn image_edit_upstream_content_type(boundary: &str) -> Result<HeaderValue, String> {
+    let escaped = boundary.replace('\\', "\\\\").replace('"', "\\\"");
+    HeaderValue::from_str(&format!(
+        "multipart/form-data; boundary=\"{}\"",
+        escaped
+    ))
+    .map_err(|e| format!("invalid multipart boundary: {}", e))
+}
+
+struct ImageEditMetadata {
+    prompt_length: usize,
+    requested_model: String,
+}
+
+/// Read only the fields needed for routing/audit from a cheap clone of the
+/// buffered body. The original bytes are never rebuilt and are what the
+/// upstream receives. Malformed fields are left for the upstream API to
+/// validate so the gateway remains transport-transparent.
+async fn multipart_image_edit_metadata(
+    body: axum::body::Bytes,
+    boundary: String,
+) -> ImageEditMetadata {
+    let stream = futures_util::stream::once(async move {
+        Ok::<_, std::convert::Infallible>(body)
+    });
+    let mut multipart = multer::Multipart::new(stream, boundary);
+    let mut prompt_length = 0;
+    let mut requested_model = None;
+
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(error) => {
+                warn!("could not inspect image edits multipart metadata: {}", error);
+                break;
+            }
+        };
+        match field.name() {
+            Some("prompt") => {
+                if let Ok(text) = field.text().await {
+                    prompt_length = text.chars().count();
+                }
+            }
+            Some("model") => {
+                if let Ok(text) = field.text().await {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        requested_model = Some(trimmed.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    ImageEditMetadata {
+        prompt_length,
+        requested_model: requested_model.unwrap_or_else(|| "gpt-image-2".to_string()),
+    }
+}
+
+fn json_image_edit_metadata(body: &[u8]) -> ImageEditMetadata {
+    let payload = serde_json::from_slice::<Value>(body).ok();
+    let prompt_length = payload
+        .as_ref()
+        .and_then(|value| value.get("prompt"))
+        .and_then(Value::as_str)
+        .map(|prompt| prompt.chars().count())
+        .unwrap_or(0);
+    let requested_model = payload
+        .as_ref()
+        .and_then(|value| value.get("model"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .unwrap_or("gpt-image-2")
+        .to_string();
+    ImageEditMetadata {
+        prompt_length,
+        requested_model,
+    }
+}
+
+/// Preserve the caller's media type. Multipart requests get one narrow repair:
+/// if the declared boundary is missing or disagrees with the body, forward the
+/// effective body boundary. JSON and future media types pass through untouched.
+fn image_edit_transport(
+    headers: &HeaderMap,
+    body: &[u8],
+) -> (Option<HeaderValue>, Option<String>) {
+    let Some(content_type) = headers.get(CONTENT_TYPE).cloned() else {
+        return (None, None);
+    };
+    let is_multipart = content_type
+        .to_str()
+        .ok()
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .map(|media_type| media_type.eq_ignore_ascii_case("multipart/form-data"))
+        .unwrap_or(false);
+    if !is_multipart {
+        return (Some(content_type), None);
+    }
+    match image_edit_boundary(headers, body) {
+        Ok(boundary) => match image_edit_upstream_content_type(&boundary) {
+            Ok(content_type) => (Some(content_type), Some(boundary)),
+            Err(error) => {
+                warn!("could not normalize image edits multipart Content-Type: {}", error);
+                (Some(content_type), None)
+            }
+        },
+        Err(error) => {
+            warn!("forwarding malformed image edits Content-Type for upstream validation: {}", error);
+            (Some(content_type), None)
+        }
+    }
+}
+
 pub(crate) async fn proxy_image_edits(
     State(state): State<AppState>,
     request: Request<axum::body::Body>,
@@ -206,145 +281,17 @@ pub(crate) async fn proxy_image_edits(
             return openai_error(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "invalid_request_error",
-                &format!("failed reading multipart body: {}", error),
+                &format!("failed reading image edits body: {}", error),
             )
         }
     };
-    let boundary = match image_edit_boundary(&headers, &body) {
-        Ok(boundary) => boundary,
-        Err(message) => {
-            return openai_error(StatusCode::BAD_REQUEST, "invalid_request_error", &message)
-        }
+    let (upstream_content_type, multipart_boundary) = image_edit_transport(&headers, &body);
+    let metadata = match multipart_boundary {
+        Some(boundary) => multipart_image_edit_metadata(body.clone(), boundary).await,
+        None => json_image_edit_metadata(&body),
     };
-    let stream = futures_util::stream::once(async move { Ok::<_, std::convert::Infallible>(body) });
-    let mut multipart = multer::Multipart::new(stream, boundary);
-
-    let mut prompt: Option<String> = None;
-    let mut image_data_urls: Vec<String> = Vec::new();
-    let mut mask_data_url: Option<String> = None;
-    let mut n_value: Option<u32> = None;
-    let mut size_value: Option<String> = None;
-    let mut model_value: Option<String> = None;
-    let mut response_format_value: Option<String> = None;
-    let mut quality_value: Option<String> = None;
-    let mut background_value: Option<String> = None;
-
-    while let Some(field) = match multipart.next_field().await {
-        Ok(field) => field,
-        Err(error) => {
-            return openai_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                &format!("malformed multipart body: {}", error),
-            )
-        }
-    } {
-        let name = field.name().unwrap_or("").to_string();
-        let kind = match classify_image_edit_field(&name) {
-            Some(kind) => kind,
-            None => continue,
-        };
-        match kind {
-            ImageEditField::Prompt => {
-                if let Ok(text) = field.text().await {
-                    let trimmed = text.trim();
-                    if !trimmed.is_empty() {
-                        prompt = Some(trimmed.to_string());
-                    }
-                }
-            }
-            ImageEditField::Image => match read_field_data_url(field).await {
-                Ok(url) => image_data_urls.push(url),
-                Err(message) => {
-                    return openai_error(StatusCode::BAD_REQUEST, "invalid_request_error", &message)
-                }
-            },
-            ImageEditField::Mask => match read_field_data_url(field).await {
-                Ok(url) => mask_data_url = Some(url),
-                Err(message) => {
-                    return openai_error(StatusCode::BAD_REQUEST, "invalid_request_error", &message)
-                }
-            },
-            ImageEditField::N => {
-                if let Ok(text) = field.text().await {
-                    if let Ok(parsed) = text.trim().parse::<u32>() {
-                        n_value = Some(parsed);
-                    }
-                }
-            }
-            ImageEditField::Size => {
-                if let Ok(text) = field.text().await {
-                    let trimmed = text.trim();
-                    if !trimmed.is_empty() {
-                        size_value = Some(trimmed.to_string());
-                    }
-                }
-            }
-            ImageEditField::Model => {
-                if let Ok(text) = field.text().await {
-                    let trimmed = text.trim();
-                    if !trimmed.is_empty() {
-                        model_value = Some(trimmed.to_string());
-                    }
-                }
-            }
-            ImageEditField::ResponseFormat => {
-                if let Ok(text) = field.text().await {
-                    let trimmed = text.trim();
-                    if !trimmed.is_empty() {
-                        response_format_value = Some(trimmed.to_string());
-                    }
-                }
-            }
-            ImageEditField::Quality => {
-                if let Ok(text) = field.text().await {
-                    let trimmed = text.trim();
-                    if !trimmed.is_empty() {
-                        quality_value = Some(trimmed.to_string());
-                    }
-                }
-            }
-            ImageEditField::Background => {
-                if let Ok(text) = field.text().await {
-                    let trimmed = text.trim();
-                    if !trimmed.is_empty() {
-                        background_value = Some(trimmed.to_string());
-                    }
-                }
-            }
-        }
-    }
-
-    let prompt = match prompt {
-        Some(p) => p,
-        None => {
-            return openai_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                "Missing required parameter: 'prompt'.",
-            )
-        }
-    };
-    if image_data_urls.is_empty() {
-        return openai_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "Missing required parameter: 'image'.",
-        );
-    }
-    let requested_model = model_value.unwrap_or_else(|| "gpt-image-2".to_string());
-
-    let payload = build_codex_edits_payload(
-        &prompt,
-        &image_data_urls,
-        mask_data_url.as_deref(),
-        n_value,
-        size_value.as_deref(),
-        &requested_model,
-        response_format_value.as_deref(),
-        quality_value.as_deref(),
-        background_value.as_deref(),
-    );
+    let requested_model = metadata.requested_model;
+    let prompt_length = metadata.prompt_length;
 
     let owner_trusted = !shared_only;
     let owned_only =
@@ -370,23 +317,28 @@ pub(crate) async fn proxy_image_edits(
             break;
         };
         excluded.insert(account.id.clone());
-        let (response, account) =
-            match codex::send_codex_image_edits_upstream_with_refresh(&state, &account, &payload)
-                .await
-            {
-                Ok(result) => result,
-                Err(message) => {
-                    warn!("Codex image edits transport failed: {}", message);
-                    last_error = Some(openai_error(
-                        StatusCode::BAD_GATEWAY,
-                        "upstream_error",
-                        "Codex image edits provider transport failed",
-                    ));
-                    continue;
-                }
-            };
+        let (response, account) = match codex::send_codex_image_edits_upstream_with_refresh(
+            &state,
+            &account,
+            upstream_content_type.as_ref(),
+            &body,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(message) => {
+                warn!("Codex image edits transport failed: {}", message);
+                last_error = Some(openai_error(
+                    StatusCode::BAD_GATEWAY,
+                    "upstream_error",
+                    "Codex image edits provider transport failed",
+                ));
+                continue;
+            }
+        };
         let status = response.status();
         let retry_after = parse_retry_after(response.headers());
+        let response_content_type = response.headers().get(CONTENT_TYPE).cloned();
         let request_id = response
             .headers()
             .get("x-request-id")
@@ -414,29 +366,16 @@ pub(crate) async fn proxy_image_edits(
                 "codex",
                 &requested_model,
                 &requested_model,
-                prompt.chars().count(),
+                prompt_length,
                 "success",
             )
             .await;
-            let mut client_response = Response::builder()
-                .status(status)
-                .header(CONTENT_TYPE, "application/json")
-                .body(axum::body::Body::from(body))
-                .unwrap_or_else(|_| {
-                    openai_error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "gateway_error",
-                        "failed building image edits response",
-                    )
-                });
-            if let Some(request_id) =
-                request_id.and_then(|value| HeaderValue::from_str(&value).ok())
-            {
-                client_response
-                    .headers_mut()
-                    .insert("x-request-id", request_id);
-            }
-            return client_response;
+            return image_edit_upstream_response(
+                status,
+                response_content_type,
+                request_id.as_deref(),
+                body,
+            );
         }
 
         let class = ErrorClass::from_status(status.as_u16());
@@ -446,13 +385,11 @@ pub(crate) async fn proxy_image_edits(
             crate::util::truncate_text(&String::from_utf8_lossy(&body), 500)
         );
         apply_account_failure(&state, &account.id, class, None, retry_after, false).await;
-        last_error = Some(openai_error(
+        last_error = Some(image_edit_upstream_response(
             status,
-            "upstream_error",
-            &format!(
-                "Codex image edits provider returned status {}",
-                status.as_u16()
-            ),
+            response_content_type,
+            request_id.as_deref(),
+            body,
         ));
         if !class.is_retryable() {
             break;
@@ -468,56 +405,30 @@ pub(crate) async fn proxy_image_edits(
     })
 }
 
-fn build_codex_edits_payload(
-    prompt: &str,
-    images: &[String],
-    mask: Option<&str>,
-    n: Option<u32>,
-    size: Option<&str>,
-    model: &str,
-    response_format: Option<&str>,
-    quality: Option<&str>,
-    background: Option<&str>,
-) -> Value {
-    let images_value: Vec<Value> = images
-        .iter()
-        .map(|url| json!({ "image_url": url }))
-        .collect();
-    let mut payload = json!({
-        "prompt": prompt,
-        "model": model,
-        "images": images_value,
-    });
-    if let Some(obj) = payload.as_object_mut() {
-        if let Some(n_value) = n {
-            obj.insert("n".to_string(), json!(n_value));
-        }
-        if let Some(size_value) = size {
-            obj.insert("size".to_string(), Value::String(size_value.to_string()));
-        }
-        if let Some(mask_value) = mask {
-            obj.insert("mask".to_string(), Value::String(mask_value.to_string()));
-        }
-        if let Some(format_value) = response_format {
-            obj.insert(
-                "response_format".to_string(),
-                Value::String(format_value.to_string()),
-            );
-        }
-        if let Some(quality_value) = quality {
-            obj.insert(
-                "quality".to_string(),
-                Value::String(quality_value.to_string()),
-            );
-        }
-        if let Some(background_value) = background {
-            obj.insert(
-                "background".to_string(),
-                Value::String(background_value.to_string()),
-            );
+fn image_edit_upstream_response(
+    status: StatusCode,
+    content_type: Option<HeaderValue>,
+    request_id: Option<&str>,
+    body: axum::body::Bytes,
+) -> Response {
+    let mut builder = Response::builder().status(status);
+    if let Some(content_type) = content_type {
+        builder = builder.header(CONTENT_TYPE, content_type);
+    }
+    if let Some(request_id) = request_id {
+        if let Ok(value) = HeaderValue::from_str(request_id) {
+            builder = builder.header("x-request-id", value);
         }
     }
-    payload
+    builder
+        .body(axum::body::Body::from(body))
+        .unwrap_or_else(|_| {
+            openai_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "gateway_error",
+                "failed building image edits response",
+            )
+        })
 }
 
 enum ImageProviderOutcome {
@@ -916,9 +827,11 @@ async fn write_image_audit(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_codex_edits_payload, codex_image_payload, image_edit_boundary, image_prompt,
-        ordered_image_providers,
+        codex_image_payload, image_edit_boundary, image_edit_transport,
+        image_edit_upstream_content_type, image_prompt, json_image_edit_metadata,
+        multipart_image_edit_metadata, ordered_image_providers,
     };
+    use axum::body::Bytes;
     use crate::provider::chains::{ChainCfg, ChainMode};
     use axum::http::{header::CONTENT_TYPE, HeaderMap, HeaderValue};
     use serde_json::json;
@@ -980,79 +893,49 @@ mod tests {
         );
     }
 
-    #[test]
-    fn build_codex_edits_payload_serializes_single_image_as_images_array() {
-        let payload = build_codex_edits_payload(
-            "add a red hat",
-            &["data:image/png;base64,AAAA".to_string()],
-            None,
-            None,
-            None,
-            "gpt-image-2",
-            None,
-            None,
-            None,
+    #[tokio::test]
+    async fn image_edit_metadata_ignores_unknown_fields_without_rebuilding_body() {
+        let body = Bytes::from_static(
+            b"--test-boundary\r\nContent-Disposition: form-data; name=\"future_field\"\r\n\r\nkeep-me\r\n--test-boundary\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nadd a red hat\r\n--test-boundary\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ngpt-image-next\r\n--test-boundary--\r\n",
         );
-        assert_eq!(payload["prompt"], "add a red hat");
-        assert_eq!(payload["model"], "gpt-image-2");
-        let images = payload["images"].as_array().expect("images array");
-        assert_eq!(images.len(), 1);
-        assert_eq!(images[0]["image_url"], "data:image/png;base64,AAAA");
-        assert!(payload.get("mask").is_none());
-        assert!(payload.get("n").is_none());
-        assert!(payload.get("size").is_none());
+        let original = body.clone();
+        let metadata = multipart_image_edit_metadata(body, "test-boundary".to_string()).await;
+        assert_eq!(metadata.prompt_length, "add a red hat".chars().count());
+        assert_eq!(metadata.requested_model, "gpt-image-next");
+        assert!(String::from_utf8_lossy(&original).contains("future_field"));
+        assert!(String::from_utf8_lossy(&original).contains("keep-me"));
     }
 
     #[test]
-    fn build_codex_edits_payload_omits_mask_when_absent() {
-        let payload = build_codex_edits_payload(
-            "draw",
-            &["data:image/png;base64,AAAA".to_string()],
-            None,
-            Some(2),
-            Some("1024x1024"),
-            "gpt-image-2",
-            Some("b64_json"),
-            None,
-            None,
-        );
-        assert_eq!(payload["n"], 2);
-        assert_eq!(payload["size"], "1024x1024");
-        assert_eq!(payload["response_format"], "b64_json");
-        assert!(payload.get("mask").is_none());
+    fn json_image_edit_metadata_reads_openai_reference_shape() {
+        let body = br#"{"images":[{"image_url":"data:image/png;base64,AAAA"}],"prompt":"paint it blue","model":"gpt-image-2"}"#;
+        let metadata = json_image_edit_metadata(body);
+        assert_eq!(metadata.prompt_length, "paint it blue".chars().count());
+        assert_eq!(metadata.requested_model, "gpt-image-2");
     }
 
     #[test]
-    fn build_codex_edits_payload_keeps_mask_data_url_when_present() {
-        let payload = build_codex_edits_payload(
-            "draw",
-            &["data:image/png;base64,AAAA".to_string()],
-            Some("data:image/png;base64,BBBB"),
-            None,
-            None,
-            "gpt-image-2",
-            None,
-            None,
-            None,
+    fn image_edit_transport_preserves_json_content_type() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/json; charset=utf-8"),
         );
-        assert_eq!(payload["mask"], "data:image/png;base64,BBBB");
+        let (content_type, boundary) = image_edit_transport(&headers, b"{}");
+        assert_eq!(
+            content_type.unwrap(),
+            HeaderValue::from_static("application/json; charset=utf-8")
+        );
+        assert!(boundary.is_none());
     }
 
     #[test]
-    fn build_codex_edits_payload_defaults_model_to_gpt_image_2() {
-        let payload = build_codex_edits_payload(
-            "draw",
-            &["data:image/png;base64,AAAA".to_string()],
-            None,
-            None,
-            None,
-            "gpt-image-2",
-            None,
-            None,
-            None,
+    fn image_edit_content_type_keeps_the_effective_boundary() {
+        let content_type = image_edit_upstream_content_type("client-boundary").unwrap();
+        assert_eq!(
+            content_type.to_str().unwrap(),
+            "multipart/form-data; boundary=\"client-boundary\""
         );
-        assert_eq!(payload["model"], "gpt-image-2");
-        assert!(payload.get("n").is_none());
     }
 
     #[test]
@@ -1084,7 +967,7 @@ mod tests {
     }
 
     #[test]
-    fn image_edit_rejects_non_multipart_requests() {
+    fn multipart_boundary_parser_rejects_non_multipart_requests() {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         assert!(image_edit_boundary(&headers, b"{}").is_err());
